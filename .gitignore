@@ -1,0 +1,219 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# C extensions
+*.o
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+.python-version
+
+# pipenv
+.Python
+ Pipfile.lock
+
+# PEP 582
+__pypackages__/
+
+# Celery stuff
+celerybeat-schedule
+celerybeat.pid
+
+# SageMath parsed files
+*.sage.py
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# Spyder project settings
+.spyderproject
+.spyproject
+
+# Rope project settings
+.ropeproject
+
+# mkdocs documentation
+/site
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/
+
+# IDEs
+.vscode/
+.idea/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+log/
+
+# Data directories
+data/
+datasets/
+
+# Pretrained models
+pretrained/
+
+# Checkpoints and model outputs
+checkpoints/
+model/
+*.pth
+*.pt
+*.ckpt
+*.bin
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Configuration backups
+*.backup
+*.bak
+*.old
+
+# Virtual environment
+venv/
+env/
+ENV/
+
+# Conda environments
+envs/
+
+# Custom ignores for this project
+# Ignore dataset folders
+datasets/CUHK-PEDES/
+datasets/ICFG-PEDES/
+datasets/RSTPReid/
+
+# Ignore pretrained model files
+pretrained/bert-base-uncased/
+pretrained/vit-base-patch16-224/
+
+# Ignore log directories
+log/
+logs/
+
+# Ignore any large data files
+*.jsonl
+*.csv
+*.txt
+*.xml
+*.tar
+*.gz
+*.zip
+*.rar
+*.7z
+
+# Ignore model checkpoints
+**/checkpoint_*.pth
+**/best_*.pth
+**/model_*.pth
+
+# Ignore temporary training files
+**/temp_*.pth
+**/temp_*.pt
+**/temp_*.ckpt
+
+# Ignore cache directories
+**/__pycache__/
+**/.cache/
+**/cache/
+
+# Ignore system files
+.DS_Store
+Thumbs.db

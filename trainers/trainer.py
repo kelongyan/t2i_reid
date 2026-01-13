@@ -1,0 +1,281 @@
+# src/trainer/trainer.py
+import logging
+import torch
+from pathlib import Path
+from tqdm import tqdm
+from losses.loss import Loss
+from evaluators.evaluator import Evaluator
+from utils.serialization import save_checkpoint
+from utils.meters import AverageMeter
+
+class Trainer:
+    def __init__(self, model, args, monitor=None):
+        # 初始化训练器，设置模型、参数和设备
+        self.model = model
+        self.args = args
+        self.monitor = monitor  # 添加监控器
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        # 定义默认损失权重
+        default_loss_weights = {
+            'info_nce': 1.0, 'cls': 1.0, 'cloth': 0.5, 'cloth_adv': 0.1,
+            'cloth_match': 1.0, 'decouple': 0.2, 'gate': 0.01,
+            'projection_l2': 1e-4, 'uniformity': 0.01
+        }
+        # 从配置文件获取损失权重，合并默认值
+        loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
+        # 确保所有必要的键都存在
+        for key, value in default_loss_weights.items():
+            if key not in loss_weights:
+                loss_weights[key] = value
+        self.combined_loss = Loss(temperature=0.1, weights=loss_weights).to(self.device)
+        self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
+        if args.fp16 and self.device.type != 'cuda':
+            logging.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
+
+    def run(self, inputs, epoch, batch_idx, total_batches):
+        # 执行单次训练步骤，计算所有损失
+        image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
+        image = image.to(self.device)
+        pid = pid.to(self.device)
+        cam_id = cam_id.to(self.device) if cam_id is not None else None
+        is_matched = is_matched.to(self.device)
+
+        # 验证输入格式
+        if batch_idx == 0:
+            if not isinstance(cloth_captions, (list, tuple)) or not all(isinstance(c, str) for c in cloth_captions):
+                raise ValueError("cloth_captions must be a list of strings")
+            if not isinstance(id_captions, (list, tuple)) or not all(isinstance(c, str) for c in id_captions):
+                raise ValueError("id_captions must be a list of strings")
+
+        with torch.amp.autocast('cuda', enabled=self.args.fp16):
+            # 训练时不需要注意力图，return_attention=False（默认值）
+            outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
+
+            # 训练时模型返回 10 个输出（不包含注意力图）
+            if len(outputs) != 10:
+                raise ValueError(f"Expected 10 model outputs during training, got {len(outputs)}")
+
+            image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
+            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights = outputs
+
+            loss_dict = self.combined_loss(
+                image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
+                id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
+                cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
+                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate
+            )
+
+        # 记录模型内部状态信息
+        if self.monitor and batch_idx % 200 == 0:  # 每200个批次记录一次详细信息
+            self.monitor.log_feature_statistics(image_feats, "image_features")
+            self.monitor.log_feature_statistics(id_text_feats, "id_text_features")
+            self.monitor.log_feature_statistics(fused_feats, "fused_features")
+            self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
+            self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
+            self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_features")
+            self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_features")
+
+            if gate is not None:
+                self.monitor.log_gate_weights(gate, "disentangle_gate")
+            if gate_weights is not None:
+                self.monitor.log_gate_weights(gate_weights, "fusion_gate")
+
+            self.monitor.log_loss_components(loss_dict)
+
+            # 记录内存使用情况
+            self.monitor.log_memory_usage()
+
+        return loss_dict
+
+    def compute_similarity(self, train_loader):
+        # 计算图像和文本特征的相似度
+        self.model.eval()
+        with torch.no_grad():
+            for image, cloth_captions, id_captions, pid, cam_id, is_matched in train_loader:
+                image = image.to(self.device)
+                outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
+                image_feats, id_text_feats, _, _, _, _, _, _, _, gate_weights = outputs
+                sim = torch.matmul(image_feats, id_text_feats.t())
+                pos_sim = sim.diag().mean().item()
+                neg_sim = sim[~torch.eye(sim.shape[0], dtype=bool, device=self.device)].mean().item()
+                scale = self.model.scale
+                return pos_sim, neg_sim, None, scale
+        self.model.train()
+        return None, None, None, None
+
+    def _format_loss_display(self, loss_meters):
+        # 格式化损失显示，按指定顺序排列并隐藏特定项
+        display_order = ['info_nce', 'cloth', 'cloth_match', 'cloth_adv', 'decouple', 'gate', 'total']
+        hidden_losses = {'cls', 'uniformity', 'projection_l2'}
+
+        avg_losses = []
+        for key in display_order:
+            if key in loss_meters and loss_meters[key].count > 0:
+                avg_losses.append(f"{key}={loss_meters[key].avg:.4f}")
+
+        return avg_losses
+
+    def train(self, train_loader, optimizer, lr_scheduler, query_loader=None, gallery_loader=None, checkpoint_dir=None):
+        # 训练模型，包含损失计算、优化和检查点保存
+        self.model.train()
+        best_mAP = 0.0
+        best_checkpoint_path = None
+        total_batches = len(train_loader)
+        loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
+
+        for epoch in range(1, self.args.epochs + 1):
+            # 打印上一个 epoch 的平均损失
+            if epoch > 1:
+                avg_losses = self._format_loss_display(loss_meters)
+                if avg_losses:
+                    # 将平均损失记录到日志，而不是打印到终端
+                    if self.monitor:
+                        self.monitor.logger.info(f"[Epoch {epoch-1} Avg Loss:] : {', '.join(avg_losses)}")
+                    else:
+                        print(f"[Avg Loss:] : {', '.join(avg_losses)}")
+
+            # 重置损失记录器
+            for meter in loss_meters.values():
+                meter.reset()
+
+            progress_bar = tqdm(
+                train_loader, desc=f"[Epoch {epoch}/{self.args.epochs}] Training",
+                dynamic_ncols=True, leave=True, total=total_batches
+            )
+
+            for i, inputs in enumerate(progress_bar):
+                optimizer.zero_grad()
+                loss_dict = self.run(inputs, epoch, i, total_batches)
+                loss = loss_dict['total']
+
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+
+                    # 记录梯度信息
+                    if self.monitor and i % 100 == 0:  # 每100个批次记录一次梯度
+                        self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
+
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+
+                    # 记录梯度信息
+                    if self.monitor and i % 100 == 0:  # 每100个批次记录一次梯度
+                        self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
+
+                    optimizer.step()
+
+                # 更新损失记录
+                for key, val in loss_dict.items():
+                    if key in loss_meters:
+                        loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
+
+                # 记录批次信息
+                if self.monitor and i % 50 == 0:  # 每50个批次记录一次
+                    current_lr = optimizer.param_groups[0]['lr']
+                    self.monitor.log_batch_info(epoch, i, total_batches,
+                                              {k: v.avg for k, v in loss_meters.items()},
+                                              current_lr)
+
+            progress_bar.close()
+            lr_scheduler.step()
+
+            # 记录epoch信息
+            if self.monitor:
+                epoch_metrics = {k: v.avg for k, v in loss_meters.items()}
+                self.monitor.log_epoch_info(epoch, self.args.epochs, epoch_metrics)
+
+            # 每个epoch结束后进行评估
+            if query_loader and gallery_loader:
+                # 评估模型
+                evaluator = Evaluator(self.model, args=self.args)
+                metrics = evaluator.evaluate(
+                    query_loader, gallery_loader, query_loader.dataset.data,
+                    gallery_loader.dataset.data, checkpoint_path=None, epoch=epoch
+                )
+
+                current_mAP = metrics['mAP']
+
+                # 记录评估结果到日志
+                if self.monitor:
+                    self.monitor.logger.info(f"Epoch {epoch} - Evaluation Results: {metrics}")
+                
+                # 按照用户要求，在终端竖列显示评估指标
+                print(f"\n[Epoch {epoch} Evaluation Results]")
+                print(f"  mAP:    {metrics['mAP']:.4f}")
+                print(f"  Rank-1: {metrics['rank1']:.4f}")
+                print(f"  Rank-5: {metrics['rank5']:.4f}")
+                print(f"  Rank-10: {metrics['rank10']:.4f}\n")
+
+                # 保存最优检查点
+                if current_mAP > best_mAP:
+                    best_mAP = current_mAP
+
+                    # 生成最佳检查点路径
+                    if checkpoint_dir:
+                        # 确保目录存在
+                        import os
+                        os.makedirs(f"{checkpoint_dir}/model", exist_ok=True)
+
+                        # 根据数据集名称确定模型文件名
+                        dataset_name = self._get_dataset_name()
+                        new_best_checkpoint_path = f"{checkpoint_dir}/model/best_{dataset_name}.pth"
+
+                        # 删除旧的最佳检查点
+                        if best_checkpoint_path and Path(best_checkpoint_path).exists():
+                            try:
+                                Path(best_checkpoint_path).unlink()
+                                if self.monitor:
+                                    self.monitor.logger.info(f"Removed old best checkpoint: {best_checkpoint_path}")
+                            except OSError:
+                                if self.monitor:
+                                    self.monitor.logger.warning(f"Could not remove old best checkpoint: {best_checkpoint_path}")
+
+                        # 保存新的最佳检查点
+                        save_checkpoint({
+                            'model': self.model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'mAP': current_mAP
+                        }, fpath=new_best_checkpoint_path)
+
+                        best_checkpoint_path = new_best_checkpoint_path
+
+                        if self.monitor:
+                            self.monitor.logger.info(f"New best checkpoint saved: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
+                    else:
+                        if self.monitor:
+                            self.monitor.logger.warning("checkpoint_dir not provided, cannot save best checkpoint")
+
+        # 记录最终结果
+        if self.monitor:
+            self.monitor.logger.info(f"Training completed. Best mAP: {best_mAP:.4f}")
+
+        # 打印最终平均损失
+        avg_losses = self._format_loss_display(loss_meters)
+        if avg_losses:
+            # 将最终平均损失记录到日志，而不是打印到终端
+            if self.monitor:
+                self.monitor.logger.info(f"[Final Avg Loss:] : {', '.join(avg_losses)}")
+            else:
+                print(f"[Avg Loss:] : {', '.join(avg_losses)}")
+
+        if best_checkpoint_path:
+            logging.info(f"Final best checkpoint: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
+
+    def _get_dataset_name(self):
+        """获取数据集名称用于模型文件命名"""
+        if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
+            dataset_name = self.args.dataset_configs[0]['name'].lower()
+            if 'cuhk' in dataset_name:
+                return 'cuhk'
+            elif 'rstp' in dataset_name:
+                return 'rstp'
+            elif 'icfg' in dataset_name:
+                return 'icfg'
+            else:
+                return dataset_name
+        else:
+            return 'unknown'

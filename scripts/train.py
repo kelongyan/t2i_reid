@@ -1,0 +1,339 @@
+import argparse
+import ast
+import gc
+import logging
+import random
+import sys
+from pathlib import Path
+import torch
+from torch.backends import cudnn
+from torch.cuda.amp import GradScaler
+
+ROOT_DIR = Path(__file__).parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+
+from utils.serialization import save_checkpoint
+from models.model import Model
+from datasets.data_builder import DataBuilder
+from trainers.trainer import Trainer
+from utils.lr_scheduler import WarmupMultiStepLR
+from utils.monitor import get_monitor_for_dataset
+
+def configuration():
+    # 解析命令行参数
+    parser = argparse.ArgumentParser(description="Train T2I-ReID model")
+    parser.add_argument('--root', type=str, default=str(ROOT_DIR / 'datasets'),
+                       help='Root directory of the dataset')
+    parser.add_argument('--dataset-configs', nargs='+', type=str, help='List of dataset configurations in JSON format')
+    parser.add_argument('--loss-weights', type=str, help='Loss weights in JSON format')
+    parser.add_argument('-b', '--batch-size', type=int, default=128, help='Batch size for training')
+    parser.add_argument('-j', '--workers', type=int, default=4, help='Number of data loading workers')
+    parser.add_argument('--height', type=int, default=224, help='Image height')
+    parser.add_argument('--width', type=int, default=224, help='Image width')
+    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--weight-decay', type=float, default=0.001, help='Weight decay')
+    parser.add_argument('--warmup-step', type=int, default=500, help='Warmup steps')
+    parser.add_argument('--milestones', nargs='+', type=int, default=[40, 60], help='Milestones for LR scheduler')
+    parser.add_argument('--epochs', type=int, default=80, help='Number of training epochs')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--print-freq', type=int, default=50, help='Print frequency')
+    parser.add_argument('--save-freq', type=int, default=10, help='Save frequency')
+    parser.add_argument('--fp16', action='store_true', help='Use mixed precision training')
+    parser.add_argument('--bert-base-path', type=str, default=str(ROOT_DIR / 'pretrained' / 'bert-base-uncased'),
+                       help='Path to BERT model')
+    parser.add_argument('--vit-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'vit-base-patch16-224'),
+                       help='Path to ViT model')
+    parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'logs'), help='Directory for logs')
+    parser.add_argument('--num-classes', type=int, default=8000, help='Number of identity classes')
+
+    # Fusion module parameters
+    parser.add_argument('--fusion-type', type=str, default='enhanced_mamba', help='Type of fusion module')
+    parser.add_argument('--fusion-dim', type=int, default=256, help='Fusion module dimension')
+    parser.add_argument('--fusion-d-state', type=int, default=16, help='Fusion module d_state')
+    parser.add_argument('--fusion-d-conv', type=int, default=4, help='Fusion module d_conv')
+    parser.add_argument('--fusion-num-layers', type=int, default=2, help='Fusion module number of layers')
+    parser.add_argument('--fusion-output-dim', type=int, default=256, help='Fusion module output dimension')
+    parser.add_argument('--fusion-dropout', type=float, default=0.1, help='Fusion module dropout')
+
+    # Disentangle module parameters
+    parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
+    parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
+
+    # Loss weights
+    parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
+    parser.add_argument('--loss-cls', type=float, default=1.0, help='Classification loss weight')
+    parser.add_argument('--loss-cloth', type=float, default=0.5, help='Cloth loss weight')
+    parser.add_argument('--loss-cloth-adv', type=float, default=0.1, help='Cloth adversarial loss weight')
+    parser.add_argument('--loss-cloth-match', type=float, default=1.0, help='Cloth matching loss weight')
+    parser.add_argument('--loss-decouple', type=float, default=0.1, help='Decoupling loss weight')
+    parser.add_argument('--loss-gate-regularization', type=float, default=0.01, help='Gate regularization loss weight')
+    parser.add_argument('--loss-projection-l2', type=float, default=0.0001, help='Projection L2 loss weight')
+    parser.add_argument('--loss-uniformity', type=float, default=0.01, help='Uniformity loss weight')
+
+    # Optimizer and scheduler
+    parser.add_argument('--optimizer', type=str, default='Adam', help='Optimizer type')
+    parser.add_argument('--scheduler', type=str, default='cosine', help='Scheduler type')
+
+    # [修改点 1] 添加 finetune-from 参数
+    parser.add_argument('--finetune-from', type=str, help='Path to checkpoint to finetune from')
+
+    args = parser.parse_args()
+
+    # 初始化 disentangle 字典
+    args.disentangle = {}
+
+    # 处理损失权重
+    if args.loss_weights:
+        args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
+    else:
+        # 设置默认损失权重
+        args.disentangle['loss_weights'] = {
+            'info_nce': args.loss_info_nce,
+            'cls': args.loss_cls,
+            'cloth': args.loss_cloth,
+            'cloth_adv': args.loss_cloth_adv,
+            'cloth_match': args.loss_cloth_match,
+            'decouple': args.loss_decouple,
+            'gate_regularization': args.loss_gate_regularization,
+            'projection_l2': args.loss_projection_l2,
+            'uniformity': args.loss_uniformity
+        }
+
+    # 处理数据集配置
+    if args.dataset_configs:
+        dataset_configs = []
+        for cfg in args.dataset_configs:
+            parsed = ast.literal_eval(cfg)
+            dataset_configs.extend(parsed if isinstance(parsed, list) else [parsed])
+        args.dataset_configs = dataset_configs
+    else:
+        args.dataset_configs = [
+            {
+                'name': 'CUHK-PEDES',
+                'root': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES'),
+                'json_file': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_all.json'),
+                'cloth_json': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_cloth.json'),
+                'id_json': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_id.json')
+            },
+            {
+                'name': 'ICFG-PEDES',
+                'root': str(ROOT_DIR / 'datasets' / 'ICFG-PEDES'),
+                'json_file': str(ROOT_DIR / 'datasets' / 'ICFG-PEDES' / 'annotations' / 'ICFG-PEDES.json'),
+                'cloth_json': str(ROOT_DIR / 'datasets' / 'ICFG-PEDES' / 'annotations' / 'caption_cloth.json'),
+                'id_json': str(ROOT_DIR / 'datasets' / 'ICFG-PEDES' / 'annotations' / 'caption_id.json')
+            },
+            {
+                'name': 'RSTPReid',
+                'root': str(ROOT_DIR / 'datasets' / 'RSTPReid'),
+                'json_file': str(ROOT_DIR / 'datasets' / 'RSTPReid' / 'annotations' / 'data_captions.json'),
+                'cloth_json': str(ROOT_DIR / 'datasets' / 'RSTPReid' / 'annotations' / 'caption_cloth.json'),
+                'id_json': str(ROOT_DIR / 'datasets' / 'RSTPReid' / 'annotations' / 'caption_id.json')
+            }
+        ]
+
+    # 确保路径使用 Path 对象
+    args.bert_base_path = str(Path(args.bert_base_path))
+    args.vit_pretrained = str(Path(args.vit_pretrained))
+    args.logs_dir = str(Path(args.logs_dir))
+    args.root = str(Path(args.root))
+
+    # 验证路径有效性
+    if not Path(args.bert_base_path).exists():
+        raise FileNotFoundError(f"BERT base path not found at: {args.bert_base_path}")
+    if not Path(args.vit_pretrained).exists():
+        raise FileNotFoundError(f"ViT base path not found at: {args.vit_pretrained}")
+
+    args.img_size = (args.height, args.width)
+    args.task_name = 't2i'
+    return args, {}
+
+class Runner:
+    def __init__(self, args, config):
+        # 初始化运行器，设置参数和设备
+        self.args = args
+        self.config = config
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
+        if args.fp16 and self.device.type != 'cuda':
+            logging.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
+
+        # 初始化监控器
+        # 从数据集配置中获取数据集名称
+        if hasattr(args, 'dataset_configs') and args.dataset_configs:
+            dataset_name = args.dataset_configs[0]['name'] if args.dataset_configs else 'unknown'
+        else:
+            dataset_name = 'unknown'
+        # 使用log目录而不是logs目录
+        log_monitor_dir = args.logs_dir.replace('logs', 'log').replace('\\', '/')
+        self.monitor = get_monitor_for_dataset(dataset_name, log_monitor_dir)
+
+    def build_optimizer(self, model):
+        # 创建优化器
+        params = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.Adam(params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+
+    def build_scheduler(self, optimizer):
+        # 创建学习率调度器
+        if self.args.scheduler == 'cosine':
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=self.args.epochs, eta_min=1e-6
+            )
+        return WarmupMultiStepLR(
+            optimizer, self.args.milestones, gamma=0.1,
+            warmup_factor=0.1, warmup_iters=self.args.warmup_step
+        )
+
+    def load_param(self, model, trained_path):
+        # 加载预训练模型参数
+        param_dict = torch.load(trained_path, map_location=self.device, weights_only=True)
+        param_dict = param_dict.get('state_dict', param_dict.get('model', param_dict))
+        model_dict = model.state_dict()
+        for i in param_dict:
+            # 这里的形状检查非常关键：顺序训练不同数据集时，ID分类器(id_classifier)的维度不同
+            # 形状检查可以确保不加载形状不匹配的分类头，从而让新阶段从随机初始化的分类器开始
+            if i in model_dict and model_dict[i].shape == param_dict[i].shape:
+                model_dict[i] = param_dict[i]
+        model.load_state_dict(model_dict, strict=False)
+        logging.info(f"Loaded pretrained weights from {trained_path}")
+
+    def run(self):
+        # 执行训练和评估流程
+        args = self.args
+        config = self.config  # 现在config为空字典，但我们直接使用args中的参数
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        # 创建日志目录 - 使用log目录而不是logs目录
+        log_dir_path = Path(args.logs_dir.replace('logs', 'log'))
+        log_dir_path.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir_path / 'log.txt'
+
+        # 创建两个logger：一个用于详细日志，一个用于重要信息显示
+        detailed_logger = logging.getLogger('detailed')
+        detailed_logger.setLevel(logging.DEBUG)
+
+        # 清除已有处理器
+        for handler in detailed_logger.handlers[:]:
+            detailed_logger.removeHandler(handler)
+
+        # 文件处理器 - 记录所有详细信息
+        file_handler = logging.FileHandler(log_file, mode='w')
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        detailed_logger.addHandler(file_handler)
+
+        # 控制台logger - 只显示重要信息
+        console_logger = logging.getLogger('console')
+        console_logger.setLevel(logging.INFO)
+
+        # 清除已有处理器
+        for handler in console_logger.handlers[:]:
+            console_logger.removeHandler(handler)
+
+        # 控制台处理器 - 只显示重要信息
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_formatter = logging.Formatter('%(message)s')  # 简化格式，只显示消息
+        console_handler.setFormatter(console_formatter)
+        console_logger.addHandler(console_handler)
+
+        # 设置基础日志配置，主要用于调试信息
+        logging.basicConfig(
+            level=logging.DEBUG,
+            handlers=[file_handler]  # 只写入文件
+        )
+
+        # 构建数据集
+        console_logger.info("Building dataset...")
+        data_builder = DataBuilder(args, is_distributed=False)
+        args.num_classes = data_builder.get_num_classes()
+        detailed_logger.info(f"Set num_classes = {args.num_classes}")
+
+        console_logger.info("Loading training data...")
+        train_loader, _ = data_builder.build_data(is_train=True)
+        console_logger.info("Loading query and gallery data...")
+        query_loader, gallery_loader = data_builder.build_data(is_train=False)
+        console_logger.info(f"Train data size: {len(train_loader.dataset.data)}")
+        console_logger.info(f"Query data size: {len(query_loader.dataset.data)}")
+        console_logger.info(f"Gallery data size: {len(gallery_loader.dataset.data)}")
+        detailed_logger.info(f"Train data size: {len(train_loader.dataset.data)}")
+        detailed_logger.info(f"Query data size: {len(query_loader.dataset.data)}")
+
+        # 构建模型配置字典
+        model_config = {
+            'bert_base_path': args.bert_base_path,
+            'vit_pretrained': args.vit_pretrained,
+            'num_classes': args.num_classes,
+            'fusion': {
+                'type': args.fusion_type,
+                'dim': args.fusion_dim,
+                'd_state': args.fusion_d_state,
+                'd_conv': args.fusion_d_conv,
+                'num_layers': args.fusion_num_layers,
+                'output_dim': args.fusion_output_dim,
+                'dropout': args.fusion_dropout
+            }
+        }
+
+        # 初始化模型
+        console_logger.info("Initializing model...")
+        model = Model(net_config=model_config).to(self.device)
+        detailed_logger.info(f"Model initialized with {sum(p.numel() for p in model.parameters()):,} parameters")
+
+        # 记录训练开始信息
+        self.monitor.log_training_start(model, args)
+
+        # [修改点 2] 如果指定了 finetune-from，则在构建优化器之前加载权重
+        if args.finetune_from:
+            detailed_logger.info(f"Finetuning: Loading checkpoint from {args.finetune_from}")
+            console_logger.info(f"Loading checkpoint from {args.finetune_from}")
+            self.load_param(model, args.finetune_from)
+
+        # 构建优化器和调度器
+        console_logger.info("Building optimizer and scheduler...")
+        optimizer = self.build_optimizer(model)
+        lr_scheduler = self.build_scheduler(optimizer)
+
+        # 训练模型
+        console_logger.info("Starting training...")
+        trainer = Trainer(model, args, self.monitor)  # 传递监控器给训练器
+        trainer.train(
+            train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=args.logs_dir
+        )
+
+        # 保存最终检查点
+        checkpoint_path = Path(args.logs_dir) / 'checkpoint_epoch_final.pth'
+        save_checkpoint({
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'lr_scheduler': lr_scheduler.state_dict(),
+            'epoch': args.epochs
+        }, fpath=str(checkpoint_path))
+        console_logger.info(f"Model saved at: {checkpoint_path}")
+
+        # 评估模型
+        console_logger.info("Evaluating model...")
+        from evaluators.evaluator import Evaluator
+        # 注意：这里加载的是刚训练完保存的 checkpoint_path，不是 finetune_from
+        self.load_param(model, str(checkpoint_path))
+        evaluator = Evaluator(model, args=args)
+        metrics = evaluator.evaluate(
+            query_loader, gallery_loader, query_loader.dataset.data,
+            gallery_loader.dataset.data, checkpoint_path=str(checkpoint_path)
+        )
+        console_logger.info(f"Evaluation Results: {metrics}")
+        detailed_logger.info(f"Evaluation Results: {metrics}")
+
+        # 记录训练结束信息
+        self.monitor.log_training_end(metrics)
+
+if __name__ == '__main__':
+    args, config = configuration()
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    cudnn.deterministic = True
+    cudnn.benchmark = False
+    runner = Runner(args, config)
+    runner.run()
