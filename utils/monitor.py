@@ -229,9 +229,9 @@ def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> Training
     Returns:
         TrainingMonitor实例
     """
-    # 规范化数据集名称
+    # 规范化数据集名称 - 使用与检查点保存一致的命名规则
     if 'cuhk' in dataset_name.lower():
-        normalized_name = 'cuhk_pedes'
+        normalized_name = 'cuhk'
     elif 'rstp' in dataset_name.lower():
         normalized_name = 'rstp'
     elif 'icfg' in dataset_name.lower():

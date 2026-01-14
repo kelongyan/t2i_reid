@@ -21,7 +21,6 @@ python scripts/train.py \
     --height 224 \
     --width 224 \
     --print-freq 50 \
-    --save-freq 10 \
     --fp16 \
     --num-classes 8000 \
     --fusion-type "enhanced_mamba" \
@@ -43,5 +42,4 @@ python scripts/train.py \
     --loss-projection-l2 0.0001 \
     --loss-uniformity 0.01 \
     --optimizer "Adam" \
-    --scheduler "cosine" \
-    --logs-dir log/icfg_pedes
+    --scheduler "cosine"

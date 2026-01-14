@@ -214,13 +214,48 @@ class Trainer:
 
                     # 生成最佳检查点路径
                     if checkpoint_dir:
-                        # 确保目录存在
-                        import os
-                        os.makedirs(f"{checkpoint_dir}/model", exist_ok=True)
-
                         # 根据数据集名称确定模型文件名
-                        dataset_name = self._get_dataset_name()
-                        new_best_checkpoint_path = f"{checkpoint_dir}/model/best_{dataset_name}.pth"
+                        dataset_short_name = self._get_dataset_name()
+
+                        # 获取数据集的标准名称用于目录结构
+                        if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
+                            dataset_full_name = self.args.dataset_configs[0]['name'].lower()
+                            if 'cuhk' in dataset_full_name:
+                                dataset_dir_name = 'cuhk_pedes'
+                            elif 'rstp' in dataset_full_name:
+                                dataset_dir_name = 'rstp'
+                            elif 'icfg' in dataset_full_name:
+                                dataset_dir_name = 'icfg'
+                            else:
+                                dataset_dir_name = dataset_full_name
+                        else:
+                            dataset_dir_name = dataset_short_name
+
+                        # 构建检查点保存路径为 PROJECT_ROOT/log/DATASET_DIR_NAME/model/best_DATASET_SHORTNAME.pth
+                        # 获取项目根目录（通过当前脚本路径向上两级）
+                        script_dir = Path(__file__).parent  # trainers/
+                        project_root = script_dir.parent   # 项目根目录
+
+                        # 根据数据集名称确定正确的目录名，不依赖于传入的checkpoint_dir
+                        if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
+                            dataset_full_name = self.args.dataset_configs[0]['name'].lower()
+                            if 'cuhk' in dataset_full_name:
+                                dataset_dir_name_correct = 'cuhk'
+                            elif 'rstp' in dataset_full_name:
+                                dataset_dir_name_correct = 'rstp'
+                            elif 'icfg' in dataset_full_name:
+                                dataset_dir_name_correct = 'icfg'
+                            else:
+                                dataset_dir_name_correct = dataset_short_name
+                        else:
+                            dataset_dir_name_correct = dataset_short_name
+
+                        log_base_path = project_root / 'log'
+
+                        model_dir = log_base_path / dataset_dir_name_correct / 'model'
+                        model_dir.mkdir(parents=True, exist_ok=True)
+
+                        new_best_checkpoint_path = str(model_dir / f"best_{dataset_short_name}.pth")
 
                         # 删除旧的最佳检查点
                         if best_checkpoint_path and Path(best_checkpoint_path).exists():

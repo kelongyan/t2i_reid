@@ -37,13 +37,12 @@ def configuration():
     parser.add_argument('--epochs', type=int, default=80, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--print-freq', type=int, default=50, help='Print frequency')
-    parser.add_argument('--save-freq', type=int, default=10, help='Save frequency')
     parser.add_argument('--fp16', action='store_true', help='Use mixed precision training')
     parser.add_argument('--bert-base-path', type=str, default=str(ROOT_DIR / 'pretrained' / 'bert-base-uncased'),
                        help='Path to BERT model')
     parser.add_argument('--vit-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'vit-base-patch16-224'),
                        help='Path to ViT model')
-    parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'logs'), help='Directory for logs')
+    parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'log'), help='Directory for logs')
     parser.add_argument('--num-classes', type=int, default=8000, help='Number of identity classes')
 
     # Fusion module parameters
@@ -157,15 +156,23 @@ class Runner:
         if args.fp16 and self.device.type != 'cuda':
             logging.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
 
+        # 保存原始的日志目录，以防在训练过程中被修改
+        self.args.original_logs_dir = args.logs_dir
+
         # 初始化监控器
         # 从数据集配置中获取数据集名称
         if hasattr(args, 'dataset_configs') and args.dataset_configs:
             dataset_name = args.dataset_configs[0]['name'] if args.dataset_configs else 'unknown'
         else:
             dataset_name = 'unknown'
-        # 使用log目录而不是logs目录
-        log_monitor_dir = args.logs_dir.replace('logs', 'log').replace('\\', '/')
-        self.monitor = get_monitor_for_dataset(dataset_name, log_monitor_dir)
+        # 使用基于项目根目录的 log 目录，而不是依赖args.logs_dir
+        # 获取项目根目录
+        script_dir = Path(__file__).parent  # scripts/
+        project_root = script_dir.parent   # 项目根目录
+        log_base_dir = str(project_root / 'log')
+
+        # 传递原始的dataset_name给get_monitor_for_dataset，它会内部规范化
+        self.monitor = get_monitor_for_dataset(dataset_name, log_base_dir)
 
     def build_optimizer(self, model):
         # 创建优化器
@@ -204,11 +211,6 @@ class Runner:
             torch.cuda.empty_cache()
             gc.collect()
 
-        # 创建日志目录 - 使用log目录而不是logs目录
-        log_dir_path = Path(args.logs_dir.replace('logs', 'log'))
-        log_dir_path.mkdir(parents=True, exist_ok=True)
-        log_file = log_dir_path / 'log.txt'
-
         # 创建两个logger：一个用于详细日志，一个用于重要信息显示
         detailed_logger = logging.getLogger('detailed')
         detailed_logger.setLevel(logging.DEBUG)
@@ -217,8 +219,34 @@ class Runner:
         for handler in detailed_logger.handlers[:]:
             detailed_logger.removeHandler(handler)
 
-        # 文件处理器 - 记录所有详细信息
-        file_handler = logging.FileHandler(log_file, mode='w')
+        # 为detailed_logger添加处理器，写入数据集特定的日志文件
+        # 获取数据集名称以确定日志文件位置
+        if hasattr(args, 'dataset_configs') and args.dataset_configs:
+            dataset_full_name = args.dataset_configs[0]['name'].lower()
+            if 'cuhk' in dataset_full_name:
+                dataset_dir_name = 'cuhk'
+            elif 'rstp' in dataset_full_name:
+                dataset_dir_name = 'rstp'
+            elif 'icfg' in dataset_full_name:
+                dataset_dir_name = 'icfg'
+            else:
+                dataset_dir_name = dataset_full_name
+        else:
+            dataset_dir_name = 'unknown'
+
+        # 确保使用 log 目录而不是 logs 目录
+        # 获取项目根目录
+        script_dir = Path(__file__).parent  # scripts/
+        project_root = script_dir.parent   # 项目根目录
+        log_base_dir = project_root / 'log'
+        dataset_log_dir = log_base_dir / dataset_dir_name
+        dataset_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建数据集特定的主要日志文件
+        main_log_file = dataset_log_dir / 'log.txt'
+
+        # 为detailed_logger添加文件处理器
+        file_handler = logging.FileHandler(main_log_file, mode='a', encoding='utf-8')
         file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(file_formatter)
         detailed_logger.addHandler(file_handler)
@@ -237,11 +265,37 @@ class Runner:
         console_handler.setFormatter(console_formatter)
         console_logger.addHandler(console_handler)
 
-        # 设置基础日志配置，主要用于调试信息
+        # 设置基础日志配置，将调试信息写入数据集特定的日志文件
+        # 获取项目根目录
+        script_dir = Path(__file__).parent  # scripts/
+        project_root = script_dir.parent   # 项目根目录
+        log_base_dir = project_root / 'log'
+        dataset_log_dir = log_base_dir / dataset_dir_name
+        dataset_log_dir.mkdir(parents=True, exist_ok=True)
+
+        # 创建数据集特定的调试日志文件
+        debug_log_file = dataset_log_dir / 'debug.txt'
+
+        # 设置基础日志配置，将调试信息写入数据集特定的调试日志文件
         logging.basicConfig(
             level=logging.DEBUG,
-            handlers=[file_handler]  # 只写入文件
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(debug_log_file, mode='a', encoding='utf-8'),  # 写入调试日志文件
+                logging.StreamHandler(sys.stdout)  # 同时输出到控制台（可以移除此项以仅写入文件）
+            ]
         )
+
+        # 但为了满足要求，只将调试信息写入文件，不输出到控制台
+        # 重新配置，只写入文件
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+
+        file_handler = logging.FileHandler(debug_log_file, mode='a', encoding='utf-8')
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(file_formatter)
+        logging.root.addHandler(file_handler)
+        logging.root.setLevel(logging.DEBUG)
 
         # 构建数据集
         console_logger.info("Building dataset...")
@@ -301,29 +355,17 @@ class Runner:
             train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=args.logs_dir
         )
 
-        # 保存最终检查点
-        checkpoint_path = Path(args.logs_dir) / 'checkpoint_epoch_final.pth'
-        save_checkpoint({
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'lr_scheduler': lr_scheduler.state_dict(),
-            'epoch': args.epochs
-        }, fpath=str(checkpoint_path))
-        console_logger.info(f"Model saved at: {checkpoint_path}")
-
-        # 评估模型
+        # 评估模型 - 直接使用训练好的模型，不再保存和加载最终检查点
         console_logger.info("Evaluating model...")
         from evaluators.evaluator import Evaluator
-        # 注意：这里加载的是刚训练完保存的 checkpoint_path，不是 finetune_from
-        self.load_param(model, str(checkpoint_path))
+        # 直接使用当前训练好的模型进行评估，无需保存和重新加载
         evaluator = Evaluator(model, args=args)
         metrics = evaluator.evaluate(
             query_loader, gallery_loader, query_loader.dataset.data,
-            gallery_loader.dataset.data, checkpoint_path=str(checkpoint_path)
+            gallery_loader.dataset.data, checkpoint_path=None
         )
         console_logger.info(f"Evaluation Results: {metrics}")
         detailed_logger.info(f"Evaluation Results: {metrics}")
-
         # 记录训练结束信息
         self.monitor.log_training_end(metrics)
 

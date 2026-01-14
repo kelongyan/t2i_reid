@@ -133,15 +133,12 @@ def main():
     执行 T2I-ReID 模型评估并记录日志
     """
     args = parse_args()
-    # 使用log目录而不是logs目录
-    log_dir_path = Path(args.logs_dir.replace('logs', 'log'))
-    log_dir_path.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir_path / 'log.txt'
+    # 不再创建根目录下的log.txt文件，而是依赖monitor系统管理日志
+    # 设置基础日志配置，只输出到控制台
     logging.basicConfig(
         level=logging.INFO,
         format='%(message)s',
         handlers=[
-            logging.FileHandler(log_file, mode='a'),
             logging.StreamHandler(sys.stdout)
         ]
     )

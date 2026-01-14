@@ -71,8 +71,8 @@ class Evaluator:
                     dataset_name = self.args.dataset_configs[0]['name']
                 else:
                     dataset_name = 'unknown'
-                # 使用log目录而不是logs目录
-                log_dir = self.args.logs_dir.replace('logs', 'log').replace('\\', '/')
+                # 使用log目录，避免重复替换
+                log_dir = self.args.logs_dir.replace('\\', '/')
                 monitor = get_monitor_for_dataset(dataset_name, log_dir)
                 monitor.logger.info(f"Epoch {epoch}: "
                              f"mAP: {metrics['mAP']:.4f}, Rank-1: {metrics['rank1']:.4f}")
