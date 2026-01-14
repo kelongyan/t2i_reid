@@ -9,11 +9,12 @@ from utils.serialization import save_checkpoint
 from utils.meters import AverageMeter
 
 class Trainer:
-    def __init__(self, model, args, monitor=None):
+    def __init__(self, model, args, monitor=None, runner=None):
         # 初始化训练器，设置模型、参数和设备
         self.model = model
         self.args = args
         self.monitor = monitor  # 添加监控器
+        self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # 定义默认损失权重
         default_loss_weights = {
@@ -123,6 +124,40 @@ class Trainer:
         loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
 
         for epoch in range(1, self.args.epochs + 1):
+            # 【渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
+            stage_changed = False
+            if self.runner:
+                if epoch == 6:  # Stage 2: 解冻ViT后4层
+                    print("\n=== Progressive Unfreezing: Stage 2 ===")
+                    print("Epoch 6-20: Unfreezing ViT last 4 layers (layer 8-11)")
+                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=8)
+                    optimizer = self.runner.build_optimizer(self.model, stage=2)
+                    lr_scheduler = self.runner.build_scheduler(optimizer)
+                    stage_changed = True
+                elif epoch == 21:  # Stage 3: 解冻ViT后8层
+                    print("\n=== Progressive Unfreezing: Stage 3 ===")
+                    print("Epoch 21-40: Unfreezing ViT last 8 layers (layer 4-11)")
+                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
+                    optimizer = self.runner.build_optimizer(self.model, stage=3)
+                    lr_scheduler = self.runner.build_scheduler(optimizer)
+                    stage_changed = True
+                elif epoch == 41:  # Stage 4: 全部解冻
+                    print("\n=== Progressive Unfreezing: Stage 4 ===")
+                    print("Epoch 41-60: Unfreezing all ViT layers")
+                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
+                    optimizer = self.runner.build_optimizer(self.model, stage=4)
+                    lr_scheduler = self.runner.build_scheduler(optimizer)
+                    stage_changed = True
+                elif epoch == 61:  # Stage 5: 降低学习率
+                    print("\n=== Progressive Unfreezing: Stage 5 ===")
+                    print("Epoch 61-80: Fine-tuning with reduced learning rate")
+                    optimizer = self.runner.build_optimizer(self.model, stage=5)
+                    lr_scheduler = self.runner.build_scheduler(optimizer)
+                    stage_changed = True
+                    
+            if stage_changed and self.monitor:
+                self.monitor.logger.info(f"Stage changed at epoch {epoch}")
+            
             # 打印上一个 epoch 的平均损失
             if epoch > 1:
                 avg_losses = self._format_loss_display(loss_meters)
@@ -188,7 +223,10 @@ class Trainer:
                                               current_lr)
 
             progress_bar.close()
-            lr_scheduler.step()
+            
+            # 只在stage未改变时调用lr_scheduler.step()
+            if not stage_changed:
+                lr_scheduler.step()
 
             # 记录epoch信息
             if self.monitor:

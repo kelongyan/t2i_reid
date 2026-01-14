@@ -179,10 +179,177 @@ class Runner:
         # 传递原始的dataset_name给get_monitor_for_dataset，它会内部规范化
         self.monitor = get_monitor_for_dataset(dataset_name, log_base_dir)
 
-    def build_optimizer(self, model):
-        # 创建优化器
-        params = [p for p in model.parameters() if p.requires_grad]
-        return torch.optim.Adam(params, lr=self.args.lr, weight_decay=self.args.weight_decay)
+    def freeze_vit_layers(self, model, unfreeze_from_layer=None):
+        """
+        冻结/解冻ViT的指定层（基于实际ViT-Base 12层结构）
+        
+        Args:
+            unfreeze_from_layer=None: 冻结所有ViT层
+            unfreeze_from_layer=8: 解冻layer 8-11（后4层）
+            unfreeze_from_layer=4: 解冻layer 4-11（后8层）
+            unfreeze_from_layer=0: 解冻所有12层 (layer 0-11)
+        """
+        # 步骤1: 先冻结所有ViT参数
+        for name, param in model.named_parameters():
+            if 'visual_encoder' in name:
+                param.requires_grad = False
+        
+        # 步骤2: 如果指定了解冻层，则解冻对应的层
+        if unfreeze_from_layer is not None:
+            unfrozen_count = 0
+            for name, param in model.named_parameters():
+                if 'visual_encoder' in name:
+                    # 当完全解冻时(unfreeze_from_layer=0)，解冻embeddings
+                    if unfreeze_from_layer == 0 and 'embeddings' in name:
+                        param.requires_grad = True
+                        unfrozen_count += 1
+                    
+                    # 解冻指定层及其之后的所有层
+                    # ViT使用BERT风格命名: encoder.layer.X (X=0-11)
+                    if 'encoder.layer.' in name:
+                        try:
+                            # 提取层号 (例如: "encoder.layer.8.attention..." -> 8)
+                            parts = name.split('encoder.layer.')[1].split('.')
+                            layer_num = int(parts[0])
+                            
+                            # 验证层号范围 (0-11)
+                            if 0 <= layer_num <= 11 and layer_num >= unfreeze_from_layer:
+                                param.requires_grad = True
+                                unfrozen_count += 1
+                        except (IndexError, ValueError) as e:
+                            logging.warning(f"Could not parse layer number from: {name}, error: {e}")
+                            continue
+                    
+                    # 解冻layernorm和pooler（如果完全解冻）
+                    if unfreeze_from_layer == 0:
+                        if 'layernorm' in name or 'pooler' in name:
+                            param.requires_grad = True
+                            unfrozen_count += 1
+            
+            logging.info(f"Unfrozen {unfrozen_count} parameter groups from layer {unfreeze_from_layer}")
+        
+        # 步骤3: 统计并记录可训练参数
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        vit_trainable = sum(p.numel() for n, p in model.named_parameters() 
+                           if p.requires_grad and 'visual_encoder' in n)
+        vit_total = sum(p.numel() for n, p in model.named_parameters() if 'visual_encoder' in n)
+        
+        logging.info(f"Overall: {trainable:,}/{total:,} trainable ({100*trainable/total:.1f}%)")
+        logging.info(f"ViT: {vit_trainable:,}/{vit_total:,} trainable ({100*vit_trainable/vit_total:.1f}%)")
+    
+    def get_param_groups_with_diff_lr(self, model, base_lr, stage):
+        """
+        为不同的模块设置不同的学习率（基于ViT-Base 12层结构）
+        
+        层分组:
+        - vit_embed_params: embeddings (cls_token, position_embeddings, patch_embeddings)
+        - vit_low_params: layer 0-3 (前4层)
+        - vit_mid_params: layer 4-7 (中间4层)
+        - vit_high_params: layer 8-11 (后4层)
+        - task_params: 所有非ViT参数 (G-S3, Fusion, Classifier等)
+        
+        Args:
+            stage: 训练阶段 (1-5)
+        """
+        # 初始化参数组
+        vit_low_params = []      # ViT layer 0-3
+        vit_mid_params = []      # ViT layer 4-7
+        vit_high_params = []     # ViT layer 8-11
+        vit_embed_params = []    # ViT embeddings
+        vit_other_params = []    # ViT layernorm, pooler
+        task_params = []         # 任务特定模块
+        
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+                
+            if 'visual_encoder' in name:
+                if 'embeddings' in name:
+                    vit_embed_params.append(param)
+                elif 'encoder.layer.' in name:
+                    try:
+                        # 提取层号: "encoder.layer.X...." -> X
+                        parts = name.split('encoder.layer.')[1].split('.')
+                        layer_num = int(parts[0])
+                        
+                        # 根据层号分组
+                        if 0 <= layer_num <= 3:
+                            vit_low_params.append(param)
+                        elif 4 <= layer_num <= 7:
+                            vit_mid_params.append(param)
+                        elif 8 <= layer_num <= 11:
+                            vit_high_params.append(param)
+                        else:
+                            logging.warning(f"Unexpected layer number {layer_num} in {name}")
+                            task_params.append(param)
+                    except (IndexError, ValueError) as e:
+                        logging.warning(f"Could not parse layer from {name}: {e}")
+                        task_params.append(param)
+                elif 'layernorm' in name or 'pooler' in name:
+                    vit_other_params.append(param)
+                else:
+                    # 其他visual_encoder参数
+                    task_params.append(param)
+            else:
+                # 非ViT参数 (BERT, G-S3, Fusion, Classifier等)
+                task_params.append(param)
+        
+        # 根据训练阶段设置学习率
+        if stage == 1:  # Stage 1: Warmup (Epoch 1-5)
+            param_groups = [
+                {'params': task_params, 'lr': base_lr * 0.1, 'name': 'task_modules'}
+            ]
+            logging.info(f"Stage 1 LR: task={base_lr*0.1:.2e}")
+            
+        elif stage == 2:  # Stage 2: 解冻后4层 (Epoch 6-20)
+            param_groups = [
+                {'params': vit_high_params, 'lr': base_lr * 0.3, 'name': 'vit_high'},
+                {'params': task_params, 'lr': base_lr, 'name': 'task_modules'}
+            ]
+            logging.info(f"Stage 2 LR: vit_high={base_lr*0.3:.2e}, task={base_lr:.2e}")
+            
+        elif stage == 3:  # Stage 3: 解冻后8层 (Epoch 21-40)
+            param_groups = [
+                {'params': vit_mid_params + vit_high_params, 'lr': base_lr * 0.5, 'name': 'vit_mid_high'},
+                {'params': task_params, 'lr': base_lr, 'name': 'task_modules'}
+            ]
+            logging.info(f"Stage 3 LR: vit_mid_high={base_lr*0.5:.2e}, task={base_lr:.2e}")
+            
+        elif stage == 4:  # Stage 4: 全部解冻 (Epoch 41-60)
+            param_groups = [
+                {'params': vit_embed_params + vit_other_params, 'lr': base_lr * 0.01, 'name': 'vit_embed'},
+                {'params': vit_low_params, 'lr': base_lr * 0.1, 'name': 'vit_low'},
+                {'params': vit_mid_params, 'lr': base_lr * 0.3, 'name': 'vit_mid'},
+                {'params': vit_high_params, 'lr': base_lr * 0.5, 'name': 'vit_high'},
+                {'params': task_params, 'lr': base_lr * 0.8, 'name': 'task_modules'}
+            ]
+            logging.info(f"Stage 4 LR: embed={base_lr*0.01:.2e}, low={base_lr*0.1:.2e}, "
+                        f"mid={base_lr*0.3:.2e}, high={base_lr*0.5:.2e}, task={base_lr*0.8:.2e}")
+            
+        elif stage == 5:  # Stage 5: 精细微调 (Epoch 61-80)
+            all_vit_params = (vit_embed_params + vit_other_params + 
+                            vit_low_params + vit_mid_params + vit_high_params)
+            param_groups = [
+                {'params': all_vit_params, 'lr': base_lr * 0.1, 'name': 'all_vit'},
+                {'params': task_params, 'lr': base_lr * 0.1, 'name': 'task_modules'}
+            ]
+            logging.info(f"Stage 5 LR: all_params={base_lr*0.1:.2e}")
+            
+        else:
+            raise ValueError(f"Invalid stage: {stage}. Must be 1-5.")
+        
+        # 统计每组参数数量
+        for group in param_groups:
+            num_params = sum(p.numel() for p in group['params'])
+            logging.info(f"  {group['name']}: {num_params:,} parameters")
+        
+        return param_groups
+
+    def build_optimizer(self, model, stage=1):
+        # 创建优化器，根据训练阶段使用不同的参数组
+        param_groups = self.get_param_groups_with_diff_lr(model, self.args.lr, stage)
+        return torch.optim.Adam(param_groups, weight_decay=self.args.weight_decay)
 
     def build_scheduler(self, optimizer):
         # 创建学习率调度器
@@ -317,28 +484,6 @@ class Runner:
         console_logger.info(f"Gallery data size: {len(gallery_loader.dataset.data)}")
         detailed_logger.info(f"Train data size: {len(train_loader.dataset.data)}")
         detailed_logger.info(f"Query data size: {len(query_loader.dataset.data)}")
-        
-        # ========== 诊断数据导出 ==========
-        # 导出Query和Gallery数据用于诊断
-        import pickle
-        debug_dir = project_root / 'debug_data'
-        debug_dir.mkdir(exist_ok=True)
-        
-        query_data = query_loader.dataset.data
-        gallery_data = gallery_loader.dataset.data
-        
-        with open(debug_dir / 'debug_query_data.pkl', 'wb') as f:
-            pickle.dump(query_data, f)
-        with open(debug_dir / 'debug_gallery_data.pkl', 'wb') as f:
-            pickle.dump(gallery_data, f)
-        
-        detailed_logger.info(f"Exported query/gallery data to {debug_dir} for diagnosis")
-        
-        # 立即运行诊断
-        detailed_logger.info("Running dataset diagnosis...")
-        from scripts.diagnose_dataset import analyze_split
-        analyze_split(query_data, gallery_data)
-        # ========== 诊断结束 ==========
 
 
         # 构建模型配置字典
@@ -378,14 +523,19 @@ class Runner:
             console_logger.info(f"Loading checkpoint from {args.finetune_from}")
             self.load_param(model, args.finetune_from)
 
+        # 【渐进解冻策略 - Stage 1】Epoch 1-5: 冻结所有ViT层
+        console_logger.info("=== Progressive Unfreezing Strategy ===")
+        console_logger.info("Stage 1 (Epoch 1-5): Freeze all ViT layers")
+        self.freeze_vit_layers(model, unfreeze_from_layer=None)
+
         # 构建优化器和调度器
         console_logger.info("Building optimizer and scheduler...")
-        optimizer = self.build_optimizer(model)
+        optimizer = self.build_optimizer(model, stage=1)
         lr_scheduler = self.build_scheduler(optimizer)
 
         # 训练模型
         console_logger.info("Starting training...")
-        trainer = Trainer(model, args, self.monitor)  # 传递监控器给训练器
+        trainer = Trainer(model, args, self.monitor, runner=self)  # 传递runner引用以便调用freeze方法
         trainer.train(
             train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=args.logs_dir
         )
