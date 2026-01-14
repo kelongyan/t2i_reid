@@ -7,31 +7,34 @@ class Loss(nn.Module):
         super().__init__()
         self.temperature = temperature
         self.ce_loss = nn.CrossEntropyLoss()
-        self.id_embed_projector = nn.Linear(768, 256)
-        self.cloth_embed_projector = nn.Linear(768, 256)
 
-        # 初始化损失权重（可被 GradNorm 学习动态调整）
+        # 优化后的损失权重：移除冗余和冲突的损失
         self.weights = weights if weights is not None else {
             'info_nce': 1.0,
             'cls': 1.0,
-            'cloth': 0.5,
-            'cloth_adv': 0.1,
-            'cloth_match': 1.0,
-            'decouple': 0.2,
-            'gate_regularization': 0.01,
-            'projection_l2': 1e-4,
-            'uniformity': 0.01,
+            'cloth_semantic': 0.5,
+            'orthogonal': 0.3,
+            'gate_adaptive': 0.01,
         }
 
-        # 需进行 GradNorm 动态平衡的任务列表
-        self.task_list = ['info_nce', 'cls', 'cloth', 'cloth_adv', 'cloth_match', 'decouple']
-        self.log_vars = nn.Parameter(torch.zeros(len(self.task_list)))  # 学习的 log σ² 权重
-        self.gradnorm_alpha = 1.5  # GradNorm 调整因子
-        self.initial_losses = None  # 初始参考损失
-
-    def gate_regularization_loss(self, gate):
-        target = torch.full_like(gate, 0.5)
-        return F.mse_loss(gate, target)
+    def gate_adaptive_loss(self, gate, id_embeds, cloth_embeds):
+        """自适应门控正则化：根据特征质量动态调整目标"""
+        if gate is None or id_embeds is None or cloth_embeds is None:
+            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+        
+        id_quality = id_embeds.var(dim=0).mean().detach()
+        cloth_quality = cloth_embeds.var(dim=0).mean().detach()
+        total_quality = id_quality + cloth_quality + 1e-8
+        target_gate = id_quality / total_quality
+        
+        gate_mean = gate.mean(dim=-1) if gate.dim() > 1 else gate
+        mse_loss = F.mse_loss(gate_mean, target_gate.expand_as(gate_mean))
+        
+        gate_clamp = torch.clamp(gate_mean, min=1e-7, max=1-1e-7)
+        entropy = -(gate_clamp * torch.log(gate_clamp) + (1 - gate_clamp) * torch.log(1 - gate_clamp))
+        entropy_reg = -entropy.mean()
+        
+        return mse_loss + 0.1 * entropy_reg
 
     def info_nce_loss(self, image_embeds, text_embeds):
         bsz = image_embeds.size(0)
@@ -44,89 +47,96 @@ class Loss(nn.Module):
     def id_classification_loss(self, id_logits, pids):
         return self.ce_loss(id_logits, pids)
 
-    def cloth_contrastive_loss(self, cloth_embeds, cloth_text_embeds):
-        if cloth_embeds is None or cloth_text_embeds is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        bsz = cloth_embeds.size(0)
-        cloth_embeds = F.normalize(self.cloth_embed_projector(cloth_embeds), dim=-1)
-        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1)
-        sim = torch.matmul(cloth_embeds, cloth_text_embeds.t()) / self.temperature
-        labels = torch.arange(bsz, device=sim.device)
-        return self.ce_loss(sim, labels)
-
-    def cloth_adversarial_loss(self, cloth_embeds, cloth_text_embeds, epoch=None):
-        if cloth_embeds is None or cloth_text_embeds is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        cloth_embeds = F.normalize(self.cloth_embed_projector(cloth_embeds), dim=-1)
-        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1)
-        sim = torch.matmul(cloth_embeds, cloth_text_embeds.t()) / self.temperature
-        sim = sim - torch.diag(torch.diagonal(sim))
-        neg_loss = -F.log_softmax(sim, dim=1).mean()
-        if epoch is not None:
-            adv_weight = min(1.0, 0.2 + epoch * 0.05)
-            neg_loss *= adv_weight
-        return neg_loss
-
-    def compute_cloth_matching_loss(self, cloth_image_embeds, cloth_text_embeds, is_matched):
-        if cloth_image_embeds is None or cloth_text_embeds is None or is_matched is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
+    def cloth_semantic_loss(self, cloth_image_embeds, cloth_text_embeds):
+        """服装语义损失：合并 cloth 和 cloth_match，避免冗余"""
+        if cloth_image_embeds is None or cloth_text_embeds is None:
+            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+        
         bsz = cloth_image_embeds.size(0)
         cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1)
         cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1)
+        
         sim = torch.matmul(cloth_image_embeds, cloth_text_embeds.t()) / self.temperature
         labels = torch.arange(bsz, device=sim.device)
+        
         return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
 
-    def compute_decoupling_loss(self, id_embeds, cloth_embeds):
+    def orthogonal_loss(self, id_embeds, cloth_embeds):
+        """正交约束损失：直接约束特征向量正交，比 Gram 矩阵更高效"""
         if id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=next(self.parameters()).device)
-        id_proj = F.normalize(self.id_embed_projector(id_embeds), dim=-1)
-        cloth_proj = F.normalize(self.cloth_embed_projector(cloth_embeds), dim=-1)
-        id_kernel = torch.matmul(id_proj, id_proj.t())
-        cloth_kernel = torch.matmul(cloth_proj, cloth_proj.t())
-        id_kernel -= torch.diag(torch.diagonal(id_kernel))
-        cloth_kernel -= torch.diag(torch.diagonal(cloth_kernel))
-        return torch.mean(id_kernel * cloth_kernel) / (id_proj.size(0) - 1)
-
-    def projection_l2_regularization(self):
-        return torch.norm(self.id_embed_projector.weight, p=2) + torch.norm(self.cloth_embed_projector.weight, p=2)
-
-    def uniformity_loss(self, embeds):
-        embeds = F.normalize(embeds, dim=-1)
-        return (embeds @ embeds.t()).exp().mean().log()
+            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+        
+        id_norm = F.normalize(id_embeds, dim=-1)
+        cloth_norm = F.normalize(cloth_embeds, dim=-1)
+        cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
+        
+        return cosine_sim.abs().mean()
+    
+    def opa_alignment_loss(self, id_seq_features, cloth_seq_features):
+        """
+        OPA 对齐损失（G-S3 专用）
+        确保 OPA 输出的身份和服装序列特征正交
+        """
+        if id_seq_features is None or cloth_seq_features is None:
+            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+        
+        id_norm = F.normalize(id_seq_features, dim=-1)
+        cloth_norm = F.normalize(cloth_seq_features, dim=-1)
+        cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
+        
+        return cosine_sim.abs().mean()
+    
+    def mamba_filter_quality_loss(self, filtered_features, saliency_score):
+        """
+        Mamba 过滤质量损失（G-S3 专用）
+        确保高显著性区域的特征被有效抑制
+        """
+        if filtered_features is None or saliency_score is None:
+            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+        
+        feature_strength = filtered_features.norm(dim=-1, keepdim=True)
+        suppression_loss = (feature_strength * saliency_score).mean()
+        
+        return suppression_loss
 
     def forward(self, image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
-                cloth_embeds, cloth_text_embeds, cloth_image_embeds, pids, is_matched, epoch=None, gate=None):
+                cloth_embeds, cloth_text_embeds, cloth_image_embeds, pids, is_matched=None, epoch=None, gate=None,
+                id_seq_features=None, cloth_seq_features=None, saliency_score=None):
         
         losses = {}
+        
+        # 核心损失
         losses['info_nce'] = self.info_nce_loss(image_embeds, id_text_embeds) if image_embeds is not None and id_text_embeds is not None else torch.tensor(0.0, device=self.ce_loss.weight.device)
         losses['cls'] = self.id_classification_loss(id_logits, pids) if id_logits is not None and pids is not None else torch.tensor(0.0, device=self.ce_loss.weight.device)
-        losses['cloth'] = self.cloth_contrastive_loss(cloth_embeds, cloth_text_embeds)
-        losses['cloth_adv'] = self.cloth_adversarial_loss(cloth_embeds, cloth_text_embeds, epoch)
-        losses['cloth_match'] = self.compute_cloth_matching_loss(cloth_image_embeds, cloth_text_embeds, is_matched)
-        losses['decouple'] = self.compute_decoupling_loss(id_embeds, cloth_embeds)
-        losses['gate_regularization'] = self.gate_regularization_loss(gate) if gate is not None else torch.tensor(0.0, device=self.ce_loss.weight.device)
-        losses['projection_l2'] = self.projection_l2_regularization()
-        losses['uniformity'] = self.uniformity_loss(id_embeds) if id_embeds is not None else torch.tensor(0.0, device=self.ce_loss.weight.device)
-
-        # GradNorm 权重自动平衡计算
-        if self.initial_losses is None:
-            self.initial_losses = {k: v.item() + 1e-8 for k, v in losses.items() if k in self.task_list}
-
-        task_losses = torch.stack([losses[k] for k in self.task_list])
-        weights = torch.exp(-self.log_vars)
-        weighted_losses = weights * task_losses
-        total_loss = torch.sum(weighted_losses)
-
-        avg_loss = task_losses.mean().detach()
-        relative_rates = task_losses.detach() / torch.tensor([self.initial_losses[k] for k in self.task_list], device=task_losses.device)
-        inverse_rate = relative_rates / relative_rates.mean()
-        gradnorm_term = (weights * inverse_rate).sum() * self.gradnorm_alpha
-        total_loss += gradnorm_term
-
-        # 加入固定加权的正则项
-        for key in ['gate_regularization', 'projection_l2', 'uniformity']:
-            total_loss += self.weights[key] * losses[key]
-
+        
+        # 服装语义损失（合并版）
+        losses['cloth_semantic'] = self.cloth_semantic_loss(cloth_image_embeds, cloth_text_embeds)
+        
+        # 正交约束损失（改进版）
+        losses['orthogonal'] = self.orthogonal_loss(id_embeds, cloth_embeds)
+        
+        # 自适应门控正则
+        losses['gate_adaptive'] = self.gate_adaptive_loss(gate, id_embeds, cloth_embeds)
+        
+        # G-S3 专用损失（可选）
+        if 'opa_alignment' in self.weights and id_seq_features is not None and cloth_seq_features is not None:
+            losses['opa_alignment'] = self.opa_alignment_loss(id_seq_features, cloth_seq_features)
+        
+        if 'mamba_quality' in self.weights and id_seq_features is not None and saliency_score is not None:
+            losses['mamba_quality'] = self.mamba_filter_quality_loss(id_seq_features, saliency_score)
+        
+        # 简单加权求和
+        total_loss = sum(self.weights.get(k, 0) * losses[k] for k in losses.keys() if k != 'total')
+        
         losses['total'] = total_loss
+        
+        # 调试模式：记录损失梯度和数值稳定性
+        if hasattr(self, '_debug_mode') and self._debug_mode:
+            self._debug_loss_info = {
+                'loss_values': {k: v.item() for k, v in losses.items() if isinstance(v, torch.Tensor)},
+                'loss_requires_grad': {k: v.requires_grad for k, v in losses.items() if isinstance(v, torch.Tensor)},
+                'has_nan': any(torch.isnan(v).any() for v in losses.values() if isinstance(v, torch.Tensor)),
+                'has_inf': any(torch.isinf(v).any() for v in losses.values() if isinstance(v, torch.Tensor))
+            }
+        
         return losses

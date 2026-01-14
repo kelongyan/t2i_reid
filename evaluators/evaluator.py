@@ -29,9 +29,8 @@ class Evaluator:
 
         # 定义默认损失权重
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 1.0, 'cloth': 0.5, 'cloth_adv': 0.1,
-            'cloth_match': 1.0, 'decouple': 0.2, 'gate': 0.01,
-            'projection_l2': 1e-4, 'uniformity': 0.01
+            'info_nce': 1.0, 'cls': 1.0, 'cloth_semantic': 0.5, 
+            'orthogonal': 0.3, 'gate_adaptive': 0.01
         }
         # 从配置文件获取损失权重，合并默认值
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)

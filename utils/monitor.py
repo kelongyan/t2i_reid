@@ -216,6 +216,129 @@ class TrainingMonitor:
         self.log_feature_statistics(cloth_features, "clothing_features")
         if gate is not None:
             self.log_gate_weights(gate, "disentangle_gate")
+    
+    def log_gs3_module_info(self, id_seq: torch.Tensor, cloth_seq: torch.Tensor, 
+                           saliency_score: torch.Tensor = None, 
+                           id_filtered: torch.Tensor = None):
+        """记录 G-S3 模块详细信息"""
+        self.debug_logger.debug("=" * 50)
+        self.debug_logger.debug("G-S3 Module Debug Info:")
+        
+        # OPA 输出
+        if id_seq is not None:
+            stats = self._get_tensor_stats(id_seq, "id_seq_after_opa")
+            self.debug_logger.debug(f"  ID sequence (after OPA): {stats}")
+        
+        if cloth_seq is not None:
+            stats = self._get_tensor_stats(cloth_seq, "cloth_seq_after_opa")
+            self.debug_logger.debug(f"  Cloth sequence (after OPA): {stats}")
+        
+        # 正交性检查
+        if id_seq is not None and cloth_seq is not None:
+            import torch.nn.functional as F
+            id_norm = F.normalize(id_seq, dim=-1)
+            cloth_norm = F.normalize(cloth_seq, dim=-1)
+            cosine_sim = (id_norm * cloth_norm).sum(dim=-1).mean().item()
+            self.debug_logger.debug(f"  Orthogonality (cosine sim): {cosine_sim:.6f} (should be close to 0)")
+        
+        # 显著性分数
+        if saliency_score is not None:
+            stats = self._get_tensor_stats(saliency_score, "saliency_score")
+            self.debug_logger.debug(f"  Saliency score: {stats}")
+            # 统计高/中/低显著性的比例
+            flat_score = saliency_score.flatten()
+            high_ratio = (flat_score > 0.7).float().mean().item()
+            mid_ratio = ((flat_score > 0.3) & (flat_score <= 0.7)).float().mean().item()
+            low_ratio = (flat_score <= 0.3).float().mean().item()
+            self.debug_logger.debug(f"  Saliency distribution: High={high_ratio:.2%}, Mid={mid_ratio:.2%}, Low={low_ratio:.2%}")
+        
+        # Mamba 过滤后
+        if id_filtered is not None:
+            stats = self._get_tensor_stats(id_filtered, "id_filtered_after_mamba")
+            self.debug_logger.debug(f"  ID features (after Mamba filter): {stats}")
+        
+        self.debug_logger.debug("=" * 50)
+    
+    def log_loss_breakdown(self, loss_dict: Dict[str, torch.Tensor], epoch: int, batch_idx: int):
+        """详细记录每个损失分量"""
+        self.debug_logger.debug(f"Loss breakdown [Epoch {epoch}, Batch {batch_idx}]:")
+        
+        total_loss = loss_dict.get('total', torch.tensor(0.0)).item()
+        self.debug_logger.debug(f"  Total loss: {total_loss:.6f}")
+        
+        for key, value in sorted(loss_dict.items()):
+            if key != 'total' and isinstance(value, torch.Tensor):
+                loss_val = value.item()
+                percentage = (loss_val / total_loss * 100) if total_loss > 0 else 0
+                self.debug_logger.debug(f"    - {key}: {loss_val:.6f} ({percentage:.2f}%)")
+    
+    def log_model_architecture(self, model: torch.nn.Module):
+        """记录模型详细架构"""
+        self.debug_logger.debug("=" * 80)
+        self.debug_logger.debug("Model Architecture:")
+        self.debug_logger.debug(f"  Model class: {model.__class__.__name__}")
+        
+        # 记录主要模块
+        for name, module in model.named_children():
+            module_params = sum(p.numel() for p in module.parameters())
+            trainable_params = sum(p.numel() for p in module.parameters() if p.requires_grad)
+            self.debug_logger.debug(f"  - {name}: {module.__class__.__name__}")
+            self.debug_logger.debug(f"      Params: {module_params:,} (Trainable: {trainable_params:,})")
+        
+        self.debug_logger.debug("=" * 80)
+    
+    def log_data_batch_info(self, batch_data: Dict[str, torch.Tensor], batch_idx: int):
+        """记录数据批次信息"""
+        self.debug_logger.debug(f"Batch {batch_idx} data info:")
+        
+        for key, value in batch_data.items():
+            if isinstance(value, torch.Tensor):
+                self.debug_logger.debug(f"  {key}: shape={list(value.shape)}, dtype={value.dtype}")
+            elif isinstance(value, (list, tuple)):
+                self.debug_logger.debug(f"  {key}: type={type(value).__name__}, len={len(value)}")
+    
+    def log_optimizer_state(self, optimizer: torch.optim.Optimizer, epoch: int):
+        """记录优化器状态"""
+        self.debug_logger.debug(f"Optimizer state [Epoch {epoch}]:")
+        
+        for i, param_group in enumerate(optimizer.param_groups):
+            self.debug_logger.debug(f"  Param group {i}:")
+            self.debug_logger.debug(f"    LR: {param_group['lr']:.8f}")
+            self.debug_logger.debug(f"    Weight decay: {param_group.get('weight_decay', 0):.6f}")
+            self.debug_logger.debug(f"    Num params: {len(param_group['params'])}")
+    
+    def log_gradient_flow(self, model: torch.nn.Module):
+        """记录梯度流动情况，检测梯度消失/爆炸"""
+        self.debug_logger.debug("Gradient flow analysis:")
+        
+        ave_grads = []
+        max_grads = []
+        layers = []
+        
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                layers.append(name)
+                ave_grads.append(param.grad.abs().mean().item())
+                max_grads.append(param.grad.abs().max().item())
+        
+        # 检测异常梯度
+        for i, (layer, ave_grad, max_grad) in enumerate(zip(layers, ave_grads, max_grads)):
+            if i < 5 or i >= len(layers) - 5:  # 只记录前5层和后5层
+                status = ""
+                if ave_grad < 1e-7:
+                    status = " [WARNING: Vanishing gradient]"
+                elif ave_grad > 1e2:
+                    status = " [WARNING: Exploding gradient]"
+                
+                self.debug_logger.debug(f"  {layer}: avg={ave_grad:.8f}, max={max_grad:.8f}{status}")
+    
+    def log_checkpoint_save(self, checkpoint_path: str, epoch: int, metrics: Dict[str, float]):
+        """记录检查点保存信息"""
+        self.logger.info(f"Checkpoint saved: {checkpoint_path}")
+        self.debug_logger.debug(f"Checkpoint details [Epoch {epoch}]:")
+        self.debug_logger.debug(f"  Path: {checkpoint_path}")
+        self.debug_logger.debug(f"  Metrics: {metrics}")
+        self.debug_logger.debug(f"  Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 
 def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> TrainingMonitor:

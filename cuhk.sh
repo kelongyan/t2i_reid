@@ -6,11 +6,9 @@ find . -type f -name "*.pyc" -delete 2>/dev/null || true
 find . -type f -name "*.pyo" -delete 2>/dev/null || true
 find . -type f -name "*.pyd" -delete 2>/dev/null || true
 
-# 注意：Windows下路径分隔符建议使用 /
-# 注意：Windows下 workers 建议设置较小（如 0 或 2），避免多进程死锁
-# 注意：已将 root 指向 CUHK-PEDES/imgs 以避免递归搜索死锁
-# 注意：已将 json_file 更新为目录中实际存在的 data_captions_ori.json
-# 警告：检测到目录下缺失 caption_cloth.json 和 caption_id.json，请确保这些文件存在，否则训练会报错
+# CUHK-PEDES Training Script with G-S3 Module
+# 使用 G-S3 (Geometry-Guided Selective State Space) 解耦模块
+# 对比实验：将 --disentangle-type 改为 simple 可使用简化版本
 
 python scripts/train.py \
     --root datasets \
@@ -21,12 +19,17 @@ python scripts/train.py \
     --epochs 80 \
     --milestones 40 60 \
     --warmup-step 500 \
-    --workers 2 \
+    --workers 4 \
     --height 224 \
     --width 224 \
     --print-freq 50 \
     --fp16 \
     --num-classes 8000 \
+    --disentangle-type gs3 \
+    --gs3-num-heads 8 \
+    --gs3-d-state 16 \
+    --gs3-d-conv 4 \
+    --gs3-dropout 0.1 \
     --fusion-type "enhanced_mamba" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
@@ -38,12 +41,8 @@ python scripts/train.py \
     --cloth-projection-dim 768 \
     --loss-info-nce 1.0 \
     --loss-cls 1.0 \
-    --loss-cloth 0.5 \
-    --loss-cloth-adv 0.1 \
-    --loss-cloth-match 1.0 \
-    --loss-decouple 0.1 \
-    --loss-gate-regularization 0.01 \
-    --loss-projection-l2 0.0001 \
-    --loss-uniformity 0.01 \
+    --loss-cloth-semantic 0.5 \
+    --loss-orthogonal 0.3 \
+    --loss-gate-adaptive 0.01 \
     --optimizer "Adam" \
     --scheduler "cosine"

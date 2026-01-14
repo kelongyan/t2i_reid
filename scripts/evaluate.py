@@ -58,6 +58,20 @@ def parse_args():
     parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'logs'), help='Directory for logs')
     parser.add_argument('--visualize-attention', action='store_true', help='Enable attention map visualization')
     parser.add_argument('--num-attention-samples', type=int, default=20, help='Number of samples for attention visualization')
+    
+    # G-S3 module parameters (for model initialization)
+    parser.add_argument('--disentangle-type', type=str, default='gs3',
+                       choices=['gs3', 'simple'],
+                       help='Type of disentangle module')
+    parser.add_argument('--gs3-num-heads', type=int, default=8,
+                       help='Number of attention heads in G-S3 OPA')
+    parser.add_argument('--gs3-d-state', type=int, default=16,
+                       help='State dimension for G-S3 Mamba filter')
+    parser.add_argument('--gs3-d-conv', type=int, default=4,
+                       help='Convolution kernel size for G-S3 Mamba filter')
+    parser.add_argument('--gs3-dropout', type=float, default=0.1,
+                       help='Dropout rate for G-S3 module')
+    
     args = parser.parse_args()
 
     # 验证配置文件路径
@@ -167,6 +181,14 @@ def main():
     # 初始化模型
     net_config = args.model.copy()
     net_config['num_classes'] = args.num_classes
+    # 添加 G-S3 配置
+    net_config['disentangle_type'] = args.disentangle_type
+    net_config['gs3'] = {
+        'num_heads': args.gs3_num_heads,
+        'd_state': args.gs3_d_state,
+        'd_conv': args.gs3_d_conv,
+        'dropout': args.gs3_dropout
+    }
     model = Model(net_config=net_config)
 
     # 加载检查点

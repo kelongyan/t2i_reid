@@ -17,9 +17,8 @@ class Trainer:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         # 定义默认损失权重
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 1.0, 'cloth': 0.5, 'cloth_adv': 0.1,
-            'cloth_match': 1.0, 'decouple': 0.2, 'gate': 0.01,
-            'projection_l2': 1e-4, 'uniformity': 0.01
+            'info_nce': 1.0, 'cls': 1.0, 'cloth_semantic': 0.5, 
+            'orthogonal': 0.3, 'gate_adaptive': 0.01
         }
         # 从配置文件获取损失权重，合并默认值
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
@@ -105,8 +104,8 @@ class Trainer:
 
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
-        display_order = ['info_nce', 'cloth', 'cloth_match', 'cloth_adv', 'decouple', 'gate', 'total']
-        hidden_losses = {'cls', 'uniformity', 'projection_l2'}
+        display_order = ['info_nce', 'cls', 'cloth_semantic', 'orthogonal', 'gate_adaptive', 'total']
+        hidden_losses = set()  # 所有损失都显示
 
         avg_losses = []
         for key in display_order:
@@ -151,8 +150,11 @@ class Trainer:
                 if self.scaler:
                     self.scaler.scale(loss).backward()
 
-                    # 记录梯度信息
-                    if self.monitor and i % 100 == 0:  # 每100个批次记录一次梯度
+                    # 记录梯度流动（每1000个batch记录一次）
+                    if self.monitor and i % 1000 == 0:
+                        self.monitor.log_gradient_flow(self.model)
+                    # 记录基础梯度信息（每100个batch）
+                    elif self.monitor and i % 100 == 0:
                         self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
 
                     self.scaler.step(optimizer)
@@ -160,8 +162,11 @@ class Trainer:
                 else:
                     loss.backward()
 
-                    # 记录梯度信息
-                    if self.monitor and i % 100 == 0:  # 每100个批次记录一次梯度
+                    # 记录梯度流动（每1000个batch记录一次）
+                    if self.monitor and i % 1000 == 0:
+                        self.monitor.log_gradient_flow(self.model)
+                    # 记录基础梯度信息（每100个batch）
+                    elif self.monitor and i % 100 == 0:
                         self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
 
                     optimizer.step()
@@ -170,6 +175,10 @@ class Trainer:
                 for key, val in loss_dict.items():
                     if key in loss_meters:
                         loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
+                
+                # 记录详细损失分解（每100个batch）
+                if self.monitor and i % 100 == 0:
+                    self.monitor.log_loss_breakdown(loss_dict, epoch, i)
 
                 # 记录批次信息
                 if self.monitor and i % 50 == 0:  # 每50个批次记录一次

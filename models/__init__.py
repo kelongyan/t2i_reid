@@ -1,7 +1,9 @@
 from .model import Model
+from .gs3_module import GS3Module, OrthogonalProjectionAttention, ContentAwareMambaFilter
 
 __factory = {
     'Model': Model,
+    'GS3Module': GS3Module,
 }
 
 

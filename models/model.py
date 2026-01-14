@@ -6,12 +6,17 @@ import torch.nn as nn
 from transformers import BertModel, BertTokenizer, ViTModel
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
+from .gs3_module import GS3Module
 
 # 设置transformers库的日志级别为ERROR，减少不必要的日志输出
 logging.getLogger("transformers").setLevel(logging.ERROR)
 
 
 class DisentangleModule(nn.Module):
+    """
+    特征分离模块的基类（保留用于向后兼容）
+    实际使用中建议直接使用 GS3Module
+    """
     def __init__(self, dim):
         """
         简化的特征分离模块（消融实验版本），移除复杂的注意力机制。
@@ -105,8 +110,24 @@ class Model(nn.Module):
         # 初始化图像编码器
         self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
 
-        # 初始化简化的特征分离模块
-        self.disentangle = DisentangleModule(dim=self.text_width)
+        # 初始化 G-S3 特征分离模块（魔改版本）
+        # 可通过配置选择使用简化版本(DisentangleModule)或G-S3版本
+        disentangle_type = net_config.get('disentangle_type', 'gs3')
+        if disentangle_type == 'gs3':
+            # 使用增强的 G-S3 模块
+            gs3_config = net_config.get('gs3', {})
+            self.disentangle = GS3Module(
+                dim=self.text_width,
+                num_heads=gs3_config.get('num_heads', 8),
+                d_state=gs3_config.get('d_state', 16),
+                d_conv=gs3_config.get('d_conv', 4),
+                dropout=gs3_config.get('dropout', 0.1)
+            )
+            logging.info("Using G-S3 (Geometry-Guided Selective State Space) disentangle module")
+        else:
+            # 使用简化版本（消融实验）
+            self.disentangle = DisentangleModule(dim=self.text_width)
+            logging.info("Using simplified disentangle module")
 
         # 初始化身份分类器
         self.id_classifier = nn.Linear(self.text_width, num_classes)
@@ -273,6 +294,18 @@ class Model(nn.Module):
                 id_embeds, cloth_embeds, gate, id_attn_map, cloth_attn_map = self.disentangle(image_embeds, return_attention=True)
             else:
                 id_embeds, cloth_embeds, gate = self.disentangle(image_embeds, return_attention=False)
+            
+            # 存储中间特征用于调试（仅在 debug 模式下）
+            if hasattr(self, '_debug_mode') and self._debug_mode:
+                self._debug_features = {
+                    'image_embeds_raw': image_embeds,
+                    'id_embeds': id_embeds,
+                    'cloth_embeds': cloth_embeds,
+                    'gate': gate
+                }
+                # 如果使用 G-S3 模块，也记录其内部状态
+                if hasattr(self.disentangle, '_debug_info'):
+                    self._debug_features.update(self.disentangle._debug_info)
             
             id_logits = self.id_classifier(id_embeds)
             image_embeds = self.shared_mlp(id_embeds)

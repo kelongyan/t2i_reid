@@ -57,17 +57,26 @@ def configuration():
     # Disentangle module parameters
     parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
+    
+    # G-S3 module parameters
+    parser.add_argument('--disentangle-type', type=str, default='gs3', 
+                       choices=['gs3', 'simple'],
+                       help='Type of disentangle module: gs3 (G-S3 Module) or simple (DisentangleModule)')
+    parser.add_argument('--gs3-num-heads', type=int, default=8, 
+                       help='Number of attention heads in G-S3 OPA')
+    parser.add_argument('--gs3-d-state', type=int, default=16, 
+                       help='State dimension for G-S3 Mamba filter')
+    parser.add_argument('--gs3-d-conv', type=int, default=4, 
+                       help='Convolution kernel size for G-S3 Mamba filter')
+    parser.add_argument('--gs3-dropout', type=float, default=0.1, 
+                       help='Dropout rate for G-S3 module')
 
     # Loss weights
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
     parser.add_argument('--loss-cls', type=float, default=1.0, help='Classification loss weight')
-    parser.add_argument('--loss-cloth', type=float, default=0.5, help='Cloth loss weight')
-    parser.add_argument('--loss-cloth-adv', type=float, default=0.1, help='Cloth adversarial loss weight')
-    parser.add_argument('--loss-cloth-match', type=float, default=1.0, help='Cloth matching loss weight')
-    parser.add_argument('--loss-decouple', type=float, default=0.1, help='Decoupling loss weight')
-    parser.add_argument('--loss-gate-regularization', type=float, default=0.01, help='Gate regularization loss weight')
-    parser.add_argument('--loss-projection-l2', type=float, default=0.0001, help='Projection L2 loss weight')
-    parser.add_argument('--loss-uniformity', type=float, default=0.01, help='Uniformity loss weight')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight')
+    parser.add_argument('--loss-gate-adaptive', type=float, default=0.01, help='Gate adaptive loss weight')
 
     # Optimizer and scheduler
     parser.add_argument('--optimizer', type=str, default='Adam', help='Optimizer type')
@@ -89,13 +98,9 @@ def configuration():
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
             'cls': args.loss_cls,
-            'cloth': args.loss_cloth,
-            'cloth_adv': args.loss_cloth_adv,
-            'cloth_match': args.loss_cloth_match,
-            'decouple': args.loss_decouple,
-            'gate_regularization': args.loss_gate_regularization,
-            'projection_l2': args.loss_projection_l2,
-            'uniformity': args.loss_uniformity
+            'cloth_semantic': args.loss_cloth_semantic,
+            'orthogonal': args.loss_orthogonal,
+            'gate_adaptive': args.loss_gate_adaptive
         }
 
     # 处理数据集配置
@@ -318,6 +323,13 @@ class Runner:
             'bert_base_path': args.bert_base_path,
             'vit_pretrained': args.vit_pretrained,
             'num_classes': args.num_classes,
+            'disentangle_type': args.disentangle_type,
+            'gs3': {
+                'num_heads': args.gs3_num_heads,
+                'd_state': args.gs3_d_state,
+                'd_conv': args.gs3_d_conv,
+                'dropout': args.gs3_dropout
+            },
             'fusion': {
                 'type': args.fusion_type,
                 'dim': args.fusion_dim,
