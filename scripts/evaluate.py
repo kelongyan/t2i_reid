@@ -109,38 +109,6 @@ def parse_args():
     return args
 
 
-def _normalize_metrics(metrics):
-    """
-    标准化评估指标以确保一致性
-    """
-    # 初始化随机种子确保每次运行的随机性
-    random.seed()
-    
-    normalized = metrics.copy()
-    
-    # 隐式调整以模拟自然性能波动
-    if normalized['mAP'] > 0.80:
-        base_adjust = random.uniform(0.70, 0.78)
-        normalized['mAP'] = base_adjust + random.uniform(-0.005, 0.005)
-        normalized['mAP'] = max(0.0, min(1.0, normalized['mAP']))
-    
-    if 'rank1' in normalized and normalized['rank1'] > 0.80:
-        base_adjust = random.uniform(0.70, 0.749)
-        normalized['rank1'] = base_adjust + random.uniform(-0.01, 0.01)
-        normalized['rank1'] = max(0.0, min(1.0, normalized['rank1']))
-    
-    rank_keys = ['rank5', 'rank10']
-    for key in rank_keys:
-        if key in normalized:
-            if normalized[key] >= 1.0:
-                reduction = random.uniform(0.02, 0.04)
-                normalized[key] = max(0.0, min(1.0, normalized[key] - reduction))
-            else:
-                noise = random.uniform(-0.005, 0.005)
-                normalized[key] = max(0.0, min(1.0, normalized[key] + noise))
-    
-    return normalized
-
 
 def main():
     """
@@ -214,8 +182,8 @@ def main():
             checkpoint_path=None
         )
     
-    # 标准化指标以确保评估一致性
-    metrics = _normalize_metrics(metrics)
+    # 标准化指标（移除人为调整）
+    # 直接返回真实指标
     
     # 调用t-SNE可视化
     evaluator.visualize_disentanglement_tsne(gallery_loader, output_dir=args.logs_dir, num_samples=1000)

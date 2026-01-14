@@ -317,6 +317,29 @@ class Runner:
         console_logger.info(f"Gallery data size: {len(gallery_loader.dataset.data)}")
         detailed_logger.info(f"Train data size: {len(train_loader.dataset.data)}")
         detailed_logger.info(f"Query data size: {len(query_loader.dataset.data)}")
+        
+        # ========== 诊断数据导出 ==========
+        # 导出Query和Gallery数据用于诊断
+        import pickle
+        debug_dir = project_root / 'debug_data'
+        debug_dir.mkdir(exist_ok=True)
+        
+        query_data = query_loader.dataset.data
+        gallery_data = gallery_loader.dataset.data
+        
+        with open(debug_dir / 'debug_query_data.pkl', 'wb') as f:
+            pickle.dump(query_data, f)
+        with open(debug_dir / 'debug_gallery_data.pkl', 'wb') as f:
+            pickle.dump(gallery_data, f)
+        
+        detailed_logger.info(f"Exported query/gallery data to {debug_dir} for diagnosis")
+        
+        # 立即运行诊断
+        detailed_logger.info("Running dataset diagnosis...")
+        from scripts.diagnose_dataset import analyze_split
+        analyze_split(query_data, gallery_data)
+        # ========== 诊断结束 ==========
+
 
         # 构建模型配置字典
         model_config = {

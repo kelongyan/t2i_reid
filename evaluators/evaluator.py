@@ -205,25 +205,13 @@ class Evaluator:
         query_ids = np.array([items[3] for items in query])
         gallery_ids = np.array([items[3] for items in gallery])
         cmc_scores, mAP = self.eval_func(distmat, q_pids=query_ids, g_pids=gallery_ids)
-    
-        if epoch is not None:
-            stability_factor = 1.0 - (0.15 * np.exp(-0.1 * (epoch - 1)))
-            mAP = mAP * stability_factor
-            cmc_scores[0] = cmc_scores[0] * stability_factor
-            cmc_scores[4] = cmc_scores[4] * (1.0 - 0.05 * np.exp(-0.1 * (epoch - 1)))
-            cmc_scores[9] = cmc_scores[9] * (1.0 - 0.02 * np.exp(-0.1 * (epoch - 1)))
         
-        adjusted_mAP = max(0.0, min(mAP, 0.85))
-        adjusted_cmc_scores = cmc_scores.copy()
-        adjusted_cmc_scores[0] = max(0.0, min(cmc_scores[0], 0.85))
-        adjusted_cmc_scores[4] = max(0.0, min(cmc_scores[4], 0.95))
-        adjusted_cmc_scores[9] = max(0.0, min(cmc_scores[9], 0.98))
-    
+        # 移除人为调整，返回真实指标
         return {
-            f'{prefix}mAP': adjusted_mAP,
-            f'{prefix}rank1': adjusted_cmc_scores[0],
-            f'{prefix}rank5': adjusted_cmc_scores[4],
-            f'{prefix}rank10': adjusted_cmc_scores[9]
+            f'{prefix}mAP': mAP,
+            f'{prefix}rank1': cmc_scores[0],
+            f'{prefix}rank5': cmc_scores[4],
+            f'{prefix}rank10': cmc_scores[9]
         }
 
     @staticmethod

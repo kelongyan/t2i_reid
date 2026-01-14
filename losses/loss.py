@@ -22,25 +22,41 @@ class Loss(nn.Module):
         if gate is None or id_embeds is None or cloth_embeds is None:
             return torch.tensor(0.0, device=self.ce_loss.weight.device)
         
-        id_quality = id_embeds.var(dim=0).mean().detach()
-        cloth_quality = cloth_embeds.var(dim=0).mean().detach()
-        total_quality = id_quality + cloth_quality + 1e-8
-        target_gate = id_quality / total_quality
+        # 计算特征质量（方差作为判别性的代理指标）
+        # 修复：var(dim=0) 需要至少2个样本，使用 unbiased=False 避免自由度问题
+        batch_size = id_embeds.size(0)
+        if batch_size < 2:
+            # 批次太小，使用固定目标
+            target_gate = torch.tensor(0.5, device=id_embeds.device, dtype=id_embeds.dtype)
+        else:
+            id_quality = id_embeds.var(dim=0, unbiased=False).mean().detach()
+            cloth_quality = cloth_embeds.var(dim=0, unbiased=False).mean().detach()
+            total_quality = id_quality + cloth_quality + 1e-8
+            target_gate = id_quality / total_quality
         
+        # MSE 损失
         gate_mean = gate.mean(dim=-1) if gate.dim() > 1 else gate
+        if gate_mean.dim() == 0:
+            gate_mean = gate_mean.unsqueeze(0)
         mse_loss = F.mse_loss(gate_mean, target_gate.expand_as(gate_mean))
         
+        # 熵正则：避免门控过于极端（0或1）
+        # H = -p*log(p) - (1-p)*log(1-p)
         gate_clamp = torch.clamp(gate_mean, min=1e-7, max=1-1e-7)
         entropy = -(gate_clamp * torch.log(gate_clamp) + (1 - gate_clamp) * torch.log(1 - gate_clamp))
-        entropy_reg = -entropy.mean()
+        entropy_reg = -entropy.mean()  # 最大化熵（负号）
         
         return mse_loss + 0.1 * entropy_reg
 
     def info_nce_loss(self, image_embeds, text_embeds):
         bsz = image_embeds.size(0)
-        image_embeds = F.normalize(image_embeds, dim=-1)
-        text_embeds = F.normalize(text_embeds, dim=-1)
+        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-8)
+        text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-8)
         sim = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
+        
+        # 防止数值溢出
+        sim = torch.clamp(sim, min=-50, max=50)
+        
         labels = torch.arange(bsz, device=sim.device)
         return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
 
@@ -53,10 +69,12 @@ class Loss(nn.Module):
             return torch.tensor(0.0, device=self.ce_loss.weight.device)
         
         bsz = cloth_image_embeds.size(0)
-        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1)
-        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1)
+        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
+        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
         
         sim = torch.matmul(cloth_image_embeds, cloth_text_embeds.t()) / self.temperature
+        sim = torch.clamp(sim, min=-50, max=50)
+        
         labels = torch.arange(bsz, device=sim.device)
         
         return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
@@ -66,8 +84,8 @@ class Loss(nn.Module):
         if id_embeds is None or cloth_embeds is None:
             return torch.tensor(0.0, device=self.ce_loss.weight.device)
         
-        id_norm = F.normalize(id_embeds, dim=-1)
-        cloth_norm = F.normalize(cloth_embeds, dim=-1)
+        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-8)
+        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-8)
         cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
         
         return cosine_sim.abs().mean()
@@ -125,8 +143,18 @@ class Loss(nn.Module):
         if 'mamba_quality' in self.weights and id_seq_features is not None and saliency_score is not None:
             losses['mamba_quality'] = self.mamba_filter_quality_loss(id_seq_features, saliency_score)
         
+        # 检查NaN/Inf并替换为0（避免训练崩溃）
+        for key, value in losses.items():
+            if isinstance(value, torch.Tensor):
+                if torch.isnan(value).any() or torch.isinf(value).any():
+                    losses[key] = torch.tensor(0.0, device=value.device, requires_grad=True)
+        
         # 简单加权求和
         total_loss = sum(self.weights.get(k, 0) * losses[k] for k in losses.keys() if k != 'total')
+        
+        # 最终检查
+        if torch.isnan(total_loss).any() or torch.isinf(total_loss).any():
+            total_loss = torch.tensor(0.0, device=total_loss.device, requires_grad=True)
         
         losses['total'] = total_loss
         
