@@ -8,7 +8,15 @@ from pathlib import Path
 import torch
 from torch.nn import Parameter
 
-from .osutils import mkdir_if_missing
+import os
+import errno
+
+def mkdir_if_missing(dir_path):
+    try:
+        os.makedirs(dir_path)
+    except OSError as e:
+        if e.errno != errno.EEXIST:
+            raise
 
 
 def read_json(fpath):

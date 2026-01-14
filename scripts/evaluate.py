@@ -56,8 +56,7 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=0, help='Number of data loading workers')
     parser.add_argument('--fp16', action='store_true', help='Use mixed precision evaluation')
     parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'logs'), help='Directory for logs')
-    parser.add_argument('--visualize-attention', action='store_true', help='Enable attention map visualization')
-    parser.add_argument('--num-attention-samples', type=int, default=20, help='Number of samples for attention visualization')
+
     
     # G-S3 module parameters (for model initialization)
     parser.add_argument('--disentangle-type', type=str, default='gs3',
@@ -185,20 +184,7 @@ def main():
     # 标准化指标（移除人为调整）
     # 直接返回真实指标
     
-    # 调用t-SNE可视化
-    evaluator.visualize_disentanglement_tsne(gallery_loader, output_dir=args.logs_dir, num_samples=1000)
 
-    # **新增：调用注意力图可视化**
-    if args.visualize_attention:
-        try:
-            logging.info("Generating attention maps visualization...")
-            evaluator.visualize_attention_comparison(
-                gallery_loader, 
-                output_dir=args.logs_dir, 
-                num_samples=args.num_attention_samples
-            )
-        except Exception as e:
-            logging.warning(f"Attention visualization failed: {e}")
 
     # 输出评估结果
     logger.info("Evaluation results (capped at 1.0):")
