@@ -314,24 +314,25 @@ class GS3Module(nn.Module):
         
         # === 阶段 4: 门控平衡 ===
         gate = self.gate(torch.cat([id_feat, cloth_feat], dim=-1))  # [B, 1]
-        gate_value = gate  # 保存gate原始值用于损失计算
-        gate_expanded = gate.expand(-1, dim)  # [B, dim]
+        gate = gate.expand(-1, dim)  # [B, dim]
         
         # 应用门控
-        id_feat_gated = gate_expanded * id_feat
-        cloth_feat_gated = (1 - gate_expanded) * cloth_feat
+        id_feat = gate * id_feat
+        cloth_feat = (1 - gate) * cloth_feat
         
         # === 调试信息（不要在训练中频繁调用）===
+        # 注意：这些调试信息会在 monitor 中被调用
+        # 这里只存储必要的中间结果用于后续分析
         if hasattr(self, '_debug_mode') and self._debug_mode:
             self._debug_info = {
                 'id_seq': id_seq,
                 'cloth_seq': cloth_seq,
                 'saliency_score': saliency_score,
                 'id_seq_filtered': id_seq_filtered,
-                'gate': gate_value
+                'gate': gate
             }
         
         if return_attention:
-            return id_feat_gated, cloth_feat_gated, gate_value, id_attn_map, cloth_attn_map
+            return id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map
         else:
-            return id_feat_gated, cloth_feat_gated, gate_value
+            return id_feat, cloth_feat, gate

@@ -19,67 +19,48 @@ class Loss(nn.Module):
         }
 
     def gate_adaptive_loss(self, gate, id_embeds, cloth_embeds):
-        """
-        门控自适应损失：强制gate学习有意义的值
-        
-        设计原则：
-        1. 极端惩罚：gate=0或1应该得到高损失（>5.0）
-        2. 变化鼓励：批次内gate应该有差异
-        3. 平衡引导：整体均值应该接近0.5
-        """
+        """自适应门控正则化：根据特征质量动态调整目标"""
         if gate is None or id_embeds is None or cloth_embeds is None:
             return torch.tensor(0.0, device=id_embeds.device if id_embeds is not None else 'cuda')
         
-        # gate shape: [batch_size, 1] 或 [batch_size]
+        # 计算特征质量（方差作为判别性的代理指标）
+        batch_size = id_embeds.size(0)
+        if batch_size < 2:
+            # 批次太小，鼓励平衡的门控值
+            target_gate = torch.tensor(0.5, device=id_embeds.device, dtype=id_embeds.dtype)
+        else:
+            # 计算特征方差，使用更稳定的方法
+            id_quality = torch.clamp(id_embeds.std(dim=0).mean().detach(), min=0.1, max=5.0)
+            cloth_quality = torch.clamp(cloth_embeds.std(dim=0).mean().detach(), min=0.1, max=5.0)
+            total_quality = id_quality + cloth_quality
+            target_gate = id_quality / total_quality
+        
+        # 处理gate的形状
         if gate.dim() > 1:
-            gate_value = gate.squeeze(-1)  # [batch_size]
+            gate_mean = gate.mean(dim=-1)  # [batch_size]
         else:
-            gate_value = gate
+            gate_mean = gate
         
-        batch_size = gate_value.size(0)
+        if gate_mean.dim() == 0:
+            gate_mean = gate_mean.unsqueeze(0)
         
-        # === 损失1: 极端值强惩罚（最关键）===
-        # 当gate接近0或1时，给予指数级惩罚
-        gate_safe = torch.clamp(gate_value, min=1e-7, max=1-1e-7)
+        # 确保target_gate和gate_mean形状一致
+        if target_gate.dim() == 0:
+            target_gate = target_gate.expand_as(gate_mean)
         
-        # 方法1: 距离边界惩罚（三次方）
-        dist_to_boundary = torch.min(gate_safe, 1 - gate_safe)
-        # 如果距离<0.15，强惩罚
-        boundary_penalty = F.relu(0.15 - dist_to_boundary)
-        # 使用三次方增强惩罚
-        boundary_loss = 50.0 * boundary_penalty.pow(3).mean()  # 放大50倍，三次方
+        # MSE 损失
+        mse_loss = F.mse_loss(gate_mean, target_gate)
         
-        # 方法2: 对数屏障惩罚（防止到达边界）- 加大权重
-        # -log(gate) 和 -log(1-gate) 在边界处趋于无穷
-        log_barrier = -(torch.log(gate_safe) + torch.log(1 - gate_safe)).mean()
-        # 对于gate=0.001: log_barrier≈6.9, 乘以0.8得5.52
-        # 加上其他损失可以超过8
+        # 熵正则：避免门控过于极端（0或1）
+        # 鼓励gate保持在合理范围内
+        gate_clamp = torch.clamp(gate_mean, min=1e-6, max=1-1e-6)
+        entropy = -(gate_clamp * torch.log(gate_clamp) + (1 - gate_clamp) * torch.log(1 - gate_clamp))
+        entropy_reg = -entropy.mean()  # 最大化熵（负号）
         
-        # === 损失2: 熵正则（鼓励分散） ===
-        entropy = -(gate_safe * torch.log(gate_safe) + 
-                   (1 - gate_safe) * torch.log(1 - gate_safe))
-        # 熵最大值是ln(2)≈0.693
-        max_entropy = 0.693
-        entropy_loss = (max_entropy - entropy.mean())
+        # 平衡两个损失项
+        total_loss = mse_loss + 0.2 * entropy_reg
         
-        # === 损失3: 标准差惩罚（鼓励变化）===
-        if batch_size > 1:
-            gate_std = gate_value.std()
-            # 标准差应该至少0.1
-            std_loss = 5.0 * F.relu(0.1 - gate_std)
-        else:
-            std_loss = torch.tensor(0.0, device=gate_value.device)
-        
-        # === 损失4: 均值引导 ===
-        gate_mean = gate_value.mean()
-        # 均值应该在[0.3, 0.7]范围内
-        mean_loss = 2.0 * F.relu(torch.abs(gate_mean - 0.5) - 0.2)
-        
-        # === 组合损失 ===
-        # 增加log_barrier权重从0.5到0.8，极端值损失从5.4提升到≈7.0
-        total_loss = boundary_loss + 0.8 * log_barrier + entropy_loss + std_loss + mean_loss
-        
-        # 确保在合理范围
+        # 确保损失在合理范围内
         total_loss = torch.clamp(total_loss, min=0.0, max=10.0)
         
         return total_loss
