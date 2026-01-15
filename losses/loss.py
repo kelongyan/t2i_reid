@@ -9,64 +9,100 @@ class Loss(nn.Module):
         # 使用Label Smoothing降低分类损失的初始值
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-        # 优化后的损失权重：大幅降低cls权重，避免其主导总损失
+        # 优化后的损失权重：进一步降低cls权重，平衡各损失项
         self.weights = weights if weights is not None else {
-            'info_nce': 1.0,        # 提高对比学习权重
-            'cls': 0.1,             # 大幅降低分类权重（从0.5降到0.1）
-            'cloth_semantic': 0.5,  # 提高服装语义权重
+            'info_nce': 1.0,        # 对比学习权重
+            'cls': 0.05,            # 进一步降低分类权重（从0.1降到0.05）
+            'cloth_semantic': 0.5,  # 服装语义权重
             'orthogonal': 0.1,
-            'gate_adaptive': 0.01,
+            'gate_adaptive': 0.05,  # 提高门控损失权重（从0.01到0.05）
         }
 
     def gate_adaptive_loss(self, gate, id_embeds, cloth_embeds):
-        """自适应门控正则化：根据特征质量动态调整目标"""
+        """
+        门控自适应损失：强制gate学习有意义的值
+        
+        设计原则：
+        1. 极端惩罚：gate=0或1应该得到高损失（>5.0）
+        2. 变化鼓励：批次内gate应该有差异
+        3. 平衡引导：整体均值应该接近0.5
+        """
         if gate is None or id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
+            return torch.tensor(0.0, device=id_embeds.device if id_embeds is not None else 'cuda')
         
-        # 计算特征质量（方差作为判别性的代理指标）
-        batch_size = id_embeds.size(0)
-        if batch_size < 2:
-            # 批次太小，使用固定目标
-            target_gate = torch.tensor(0.5, device=id_embeds.device, dtype=id_embeds.dtype)
+        # gate shape: [batch_size, 1] 或 [batch_size]
+        if gate.dim() > 1:
+            gate_value = gate.squeeze(-1)  # [batch_size]
         else:
-            id_quality = torch.clamp(id_embeds.var(dim=0, unbiased=False).mean().detach(), min=0.0, max=10.0)
-            cloth_quality = torch.clamp(cloth_embeds.var(dim=0, unbiased=False).mean().detach(), min=0.0, max=10.0)
-            total_quality = id_quality + cloth_quality + 1e-6
-            target_gate = id_quality / total_quality
+            gate_value = gate
         
-        # MSE 损失
-        gate_mean = gate.mean(dim=-1) if gate.dim() > 1 else gate
-        if gate_mean.dim() == 0:
-            gate_mean = gate_mean.unsqueeze(0)
+        batch_size = gate_value.size(0)
         
-        # 确保target_gate和gate_mean形状一致
-        if target_gate.dim() == 0:
-            target_gate = target_gate.expand_as(gate_mean)
+        # === 损失1: 极端值强惩罚（最关键）===
+        # 当gate接近0或1时，给予指数级惩罚
+        gate_safe = torch.clamp(gate_value, min=1e-7, max=1-1e-7)
         
-        mse_loss = F.mse_loss(gate_mean, target_gate)
+        # 方法1: 距离边界惩罚（三次方）
+        dist_to_boundary = torch.min(gate_safe, 1 - gate_safe)
+        # 如果距离<0.15，强惩罚
+        boundary_penalty = F.relu(0.15 - dist_to_boundary)
+        # 使用三次方增强惩罚
+        boundary_loss = 50.0 * boundary_penalty.pow(3).mean()  # 放大50倍，三次方
         
-        # 熵正则：避免门控过于极端（0或1）
-        # H = -p*log(p) - (1-p)*log(1-p)
-        gate_clamp = torch.clamp(gate_mean, min=1e-6, max=1-1e-6)
-        entropy = -(gate_clamp * torch.log(gate_clamp) + (1 - gate_clamp) * torch.log(1 - gate_clamp))
-        entropy_reg = -entropy.mean()  # 最大化熵（负号）
+        # 方法2: 对数屏障惩罚（防止到达边界）- 加大权重
+        # -log(gate) 和 -log(1-gate) 在边界处趋于无穷
+        log_barrier = -(torch.log(gate_safe) + torch.log(1 - gate_safe)).mean()
+        # 对于gate=0.001: log_barrier≈6.9, 乘以0.8得5.52
+        # 加上其他损失可以超过8
         
-        # 限制总损失幅度，防止负值
-        total_loss = torch.clamp(mse_loss + 0.1 * entropy_reg, min=0.0, max=1.0)
+        # === 损失2: 熵正则（鼓励分散） ===
+        entropy = -(gate_safe * torch.log(gate_safe) + 
+                   (1 - gate_safe) * torch.log(1 - gate_safe))
+        # 熵最大值是ln(2)≈0.693
+        max_entropy = 0.693
+        entropy_loss = (max_entropy - entropy.mean())
+        
+        # === 损失3: 标准差惩罚（鼓励变化）===
+        if batch_size > 1:
+            gate_std = gate_value.std()
+            # 标准差应该至少0.1
+            std_loss = 5.0 * F.relu(0.1 - gate_std)
+        else:
+            std_loss = torch.tensor(0.0, device=gate_value.device)
+        
+        # === 损失4: 均值引导 ===
+        gate_mean = gate_value.mean()
+        # 均值应该在[0.3, 0.7]范围内
+        mean_loss = 2.0 * F.relu(torch.abs(gate_mean - 0.5) - 0.2)
+        
+        # === 组合损失 ===
+        # 增加log_barrier权重从0.5到0.8，极端值损失从5.4提升到≈7.0
+        total_loss = boundary_loss + 0.8 * log_barrier + entropy_loss + std_loss + mean_loss
+        
+        # 确保在合理范围
+        total_loss = torch.clamp(total_loss, min=0.0, max=10.0)
         
         return total_loss
 
     def info_nce_loss(self, image_embeds, text_embeds):
         bsz = image_embeds.size(0)
-        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-6)
-        text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-6)
+        # 确保特征已归一化
+        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-8)
+        text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-8)
+        
+        # 计算相似度矩阵
         sim = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
         
-        # 防止数值溢出
-        sim = torch.clamp(sim, min=-20, max=20)
+        # 防止数值溢出（softmax稳定性）
+        sim = torch.clamp(sim, min=-50, max=50)
         
-        labels = torch.arange(bsz, device=sim.device)
-        return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
+        labels = torch.arange(bsz, device=sim.device, dtype=torch.long)
+        
+        # 计算双向对比损失
+        loss_i2t = self.ce_loss(sim, labels)
+        loss_t2i = self.ce_loss(sim.t(), labels)
+        
+        return (loss_i2t + loss_t2i) / 2
 
     def id_classification_loss(self, id_logits, pids):
         return self.ce_loss(id_logits, pids)
@@ -74,31 +110,41 @@ class Loss(nn.Module):
     def cloth_semantic_loss(self, cloth_image_embeds, cloth_text_embeds):
         """服装语义损失：合并 cloth 和 cloth_match，避免冗余"""
         if cloth_image_embeds is None or cloth_text_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
+            return torch.tensor(0.0, device=cloth_image_embeds.device if cloth_image_embeds is not None else 'cuda')
         
         bsz = cloth_image_embeds.size(0)
-        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1, eps=1e-6)
-        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1, eps=1e-6)
+        # 确保特征已归一化
+        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
+        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
         
+        # 计算相似度矩阵
         sim = torch.matmul(cloth_image_embeds, cloth_text_embeds.t()) / self.temperature
-        sim = torch.clamp(sim, min=-20, max=20)
+        sim = torch.clamp(sim, min=-50, max=50)
         
-        labels = torch.arange(bsz, device=sim.device)
+        labels = torch.arange(bsz, device=sim.device, dtype=torch.long)
         
-        return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
+        # 计算双向损失
+        loss_i2t = self.ce_loss(sim, labels)
+        loss_t2i = self.ce_loss(sim.t(), labels)
+        
+        return (loss_i2t + loss_t2i) / 2
 
     def orthogonal_loss(self, id_embeds, cloth_embeds):
         """正交约束损失：直接约束特征向量正交，比 Gram 矩阵更高效"""
         if id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
+            return torch.tensor(0.0, device=id_embeds.device if id_embeds is not None else 'cuda')
         
-        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-6)
-        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-6)
+        # 归一化特征向量
+        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-8)
+        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-8)
+        
+        # 计算余弦相似度
         cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
         
-        # 裁剪余弦相似度，防止梯度爆炸
+        # 裁剪余弦相似度，防止数值不稳定
         cosine_sim = torch.clamp(cosine_sim, min=-1.0, max=1.0)
         
+        # 正交损失：最小化余弦相似度的绝对值
         return cosine_sim.abs().mean()
     
     def opa_alignment_loss(self, id_seq_features, cloth_seq_features):

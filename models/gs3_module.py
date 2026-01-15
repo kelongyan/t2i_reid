@@ -83,21 +83,21 @@ class OrthogonalProjectionAttention(nn.Module):
         dot_product = (q_id * q_cloth).sum(dim=-1, keepdim=True)  # [B, num_heads, N, 1]
         
         # 计算 ||Q_cloth||^2，增大eps防止数值不稳定
-        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-6  # 防止除零
+        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-8  # 防止除零
         
         # 计算投影系数并进行梯度裁剪
         projection_coeff = dot_product / norm_sq
-        projection_coeff = torch.clamp(projection_coeff, min=-10.0, max=10.0)
+        projection_coeff = torch.clamp(projection_coeff, min=-5.0, max=5.0)  # 放宽裁剪范围
         
         # 计算投影分量
         projection = projection_coeff * q_cloth  # [B, num_heads, N, head_dim]
         
-        # 执行正交化：减去投影分量，使用detach阻断部分梯度流
-        q_id_ortho = q_id - 0.5 * projection  # 降低正交化强度
+        # 执行正交化：减去投影分量，降低正交化强度避免信息丢失
+        q_id_ortho = q_id - 0.3 * projection  # 进一步降低正交化强度（从0.5到0.3）
         
         # 计算服装显著性分数 (归一化的点积，范围 [0, 1])
         # 点积越大，说明当前 token 包含越多服装信息
-        saliency_score = torch.abs(dot_product) / (torch.sqrt(norm_sq) + 1e-6)
+        saliency_score = torch.abs(dot_product) / (torch.sqrt(norm_sq) + 1e-8)
         saliency_score = torch.clamp(saliency_score.mean(dim=1), min=0.0, max=1.0)  # 对所有头取平均 [B, N, 1]
         
         return q_id_ortho, saliency_score
@@ -219,17 +219,17 @@ class ContentAwareMambaFilter(nn.Module):
         gate_signal = self.saliency_mlp(saliency_score)  # [B, N, 1]
         
         # === 步骤 2: 输入级抑制（降低抑制强度）===
-        # 门控逻辑：(1 - 0.3*gate_signal) 表示"保留比例"，降低抑制强度防止信息丢失
+        # 门控逻辑：(1 - 0.2*gate_signal) 表示"保留比例"，进一步降低抑制强度
         # 当 gate_signal ≈ 1（服装显著性高）时，输入被轻微抑制
         # 当 gate_signal ≈ 0（身份显著性高）时，输入正常通过
-        x_gated = x * (1 - 0.3 * gate_signal)  # [B, N, dim]
+        x_gated = x * (1 - 0.2 * gate_signal)  # [B, N, dim]（从0.3降到0.2）
         
         # === 步骤 3: Mamba 状态空间建模 ===
         # Mamba 会对序列进行时序建模，门控后的输入确保服装信息不会污染隐状态
         x_filtered = self.mamba(x_gated)
         
-        # === 步骤 4: 残差连接 + LayerNorm（降低Mamba输出权重）===
-        out = self.norm(x + 0.5 * x_filtered)  # 降低Mamba输出的影响
+        # === 步骤 4: 残差连接 + LayerNorm（进一步降低Mamba输出权重）===
+        out = self.norm(x + 0.3 * x_filtered)  # 进一步降低Mamba输出的影响（从0.5到0.3）
         
         return out
 
@@ -314,25 +314,24 @@ class GS3Module(nn.Module):
         
         # === 阶段 4: 门控平衡 ===
         gate = self.gate(torch.cat([id_feat, cloth_feat], dim=-1))  # [B, 1]
-        gate = gate.expand(-1, dim)  # [B, dim]
+        gate_value = gate  # 保存gate原始值用于损失计算
+        gate_expanded = gate.expand(-1, dim)  # [B, dim]
         
         # 应用门控
-        id_feat = gate * id_feat
-        cloth_feat = (1 - gate) * cloth_feat
+        id_feat_gated = gate_expanded * id_feat
+        cloth_feat_gated = (1 - gate_expanded) * cloth_feat
         
         # === 调试信息（不要在训练中频繁调用）===
-        # 注意：这些调试信息会在 monitor 中被调用
-        # 这里只存储必要的中间结果用于后续分析
         if hasattr(self, '_debug_mode') and self._debug_mode:
             self._debug_info = {
                 'id_seq': id_seq,
                 'cloth_seq': cloth_seq,
                 'saliency_score': saliency_score,
                 'id_seq_filtered': id_seq_filtered,
-                'gate': gate
+                'gate': gate_value
             }
         
         if return_attention:
-            return id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map
+            return id_feat_gated, cloth_feat_gated, gate_value, id_attn_map, cloth_attn_map
         else:
-            return id_feat, cloth_feat, gate
+            return id_feat_gated, cloth_feat_gated, gate_value

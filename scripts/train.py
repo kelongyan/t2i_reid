@@ -73,10 +73,10 @@ def configuration():
 
     # Loss weights（调整权重以平衡各损失项）
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.1, help='Classification loss weight (降低以避免主导)')
+    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight (降低以避免主导)')
     parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
     parser.add_argument('--loss-orthogonal', type=float, default=0.1, help='Orthogonal loss weight')
-    parser.add_argument('--loss-gate-adaptive', type=float, default=0.01, help='Gate adaptive loss weight')
+    parser.add_argument('--loss-gate-adaptive', type=float, default=0.05, help='Gate adaptive loss weight')
 
     # Optimizer and scheduler
     parser.add_argument('--optimizer', type=str, default='Adam', help='Optimizer type')
@@ -179,6 +179,65 @@ class Runner:
         # 传递原始的dataset_name给get_monitor_for_dataset，它会内部规范化
         self.monitor = get_monitor_for_dataset(dataset_name, log_base_dir)
 
+    def freeze_bert_layers(self, model, unfreeze_from_layer=None):
+        """
+        冻结/解冻BERT的指定层（基于BERT-Base 12层结构）
+        
+        Args:
+            model: 完整的T2I-ReID模型
+            unfreeze_from_layer: 
+                - None: 冻结所有BERT层
+                - 8: 解冻layer 8-11（后4层）
+                - 4: 解冻layer 4-11（后8层）
+                - 0: 解冻所有12层
+        """
+        # 步骤1: 先冻结所有BERT参数
+        for name, param in model.named_parameters():
+            if 'text_encoder' in name:
+                param.requires_grad = False
+        
+        # 步骤2: 如果指定了解冻层，则解冻对应的层
+        if unfreeze_from_layer is not None:
+            unfrozen_count = 0
+            for name, param in model.named_parameters():
+                if 'text_encoder' in name:
+                    # 当完全解冻时(unfreeze_from_layer=0)，解冻embeddings
+                    if unfreeze_from_layer == 0 and 'embeddings' in name:
+                        param.requires_grad = True
+                        unfrozen_count += 1
+                    
+                    # 解冻指定层及其之后的所有层
+                    # BERT命名: encoder.layer.X (X=0-11)
+                    if 'encoder.layer.' in name:
+                        try:
+                            # 提取层号
+                            parts = name.split('encoder.layer.')[1].split('.')
+                            layer_num = int(parts[0])
+                            
+                            # 验证层号范围 (0-11)
+                            if 0 <= layer_num <= 11 and layer_num >= unfreeze_from_layer:
+                                param.requires_grad = True
+                                unfrozen_count += 1
+                        except (IndexError, ValueError) as e:
+                            logging.warning(f"Could not parse BERT layer number from: {name}, error: {e}")
+                            continue
+                    
+                    # 解冻pooler（如果完全解冻）
+                    if unfreeze_from_layer == 0 and 'pooler' in name:
+                        param.requires_grad = True
+                        unfrozen_count += 1
+            
+            logging.info(f"BERT: Unfrozen {unfrozen_count} parameter groups from layer {unfreeze_from_layer}")
+        else:
+            logging.info(f"BERT: All layers frozen")
+        
+        # 步骤3: 统计并记录可训练参数
+        bert_trainable = sum(p.numel() for n, p in model.named_parameters() 
+                            if p.requires_grad and 'text_encoder' in n)
+        bert_total = sum(p.numel() for n, p in model.named_parameters() if 'text_encoder' in n)
+        
+        logging.info(f"BERT: {bert_trainable:,}/{bert_total:,} trainable ({100*bert_trainable/bert_total:.1f}%)")
+    
     def freeze_vit_layers(self, model, unfreeze_from_layer=None):
         """
         冻结/解冻ViT的指定层（基于实际ViT-Base 12层结构）
@@ -217,7 +276,7 @@ class Runner:
                                 param.requires_grad = True
                                 unfrozen_count += 1
                         except (IndexError, ValueError) as e:
-                            logging.warning(f"Could not parse layer number from: {name}, error: {e}")
+                            logging.warning(f"Could not parse ViT layer number from: {name}, error: {e}")
                             continue
                     
                     # 解冻layernorm和pooler（如果完全解冻）
@@ -226,45 +285,90 @@ class Runner:
                             param.requires_grad = True
                             unfrozen_count += 1
             
-            logging.info(f"Unfrozen {unfrozen_count} parameter groups from layer {unfreeze_from_layer}")
+            logging.info(f"ViT: Unfrozen {unfrozen_count} parameter groups from layer {unfreeze_from_layer}")
+        else:
+            logging.info(f"ViT: All layers frozen")
         
         # 步骤3: 统计并记录可训练参数
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        total = sum(p.numel() for p in model.parameters())
         vit_trainable = sum(p.numel() for n, p in model.named_parameters() 
                            if p.requires_grad and 'visual_encoder' in n)
         vit_total = sum(p.numel() for n, p in model.named_parameters() if 'visual_encoder' in n)
         
-        logging.info(f"Overall: {trainable:,}/{total:,} trainable ({100*trainable/total:.1f}%)")
         logging.info(f"ViT: {vit_trainable:,}/{vit_total:,} trainable ({100*vit_trainable/vit_total:.1f}%)")
+        
+        # 总体统计
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        logging.info(f"Overall: {trainable:,}/{total:,} trainable ({100*trainable/total:.1f}%)")
     
     def get_param_groups_with_diff_lr(self, model, base_lr, stage):
         """
-        为不同的模块设置不同的学习率（基于ViT-Base 12层结构）
+        为不同的模块设置不同的学习率（基于BERT和ViT的12层结构）
         
         层分组:
-        - vit_embed_params: embeddings (cls_token, position_embeddings, patch_embeddings)
-        - vit_low_params: layer 0-3 (前4层)
-        - vit_mid_params: layer 4-7 (中间4层)
-        - vit_high_params: layer 8-11 (后4层)
-        - task_params: 所有非ViT参数 (G-S3, Fusion, Classifier等)
+        - bert_embed_params: BERT embeddings
+        - bert_low_params: BERT layer 0-3 (前4层)
+        - bert_mid_params: BERT layer 4-7 (中间4层)
+        - bert_high_params: BERT layer 8-11 (后4层)
+        - vit_embed_params: ViT embeddings (cls_token, position_embeddings, patch_embeddings)
+        - vit_low_params: ViT layer 0-3 (前4层)
+        - vit_mid_params: ViT layer 4-7 (中间4层)
+        - vit_high_params: ViT layer 8-11 (后4层)
+        - task_params: 所有任务特定参数 (G-S3, Fusion, Classifier, text_attn等)
         
         Args:
             stage: 训练阶段 (1-5)
         """
         # 初始化参数组
+        # BERT参数组
+        bert_embed_params = []   # BERT embeddings
+        bert_low_params = []     # BERT layer 0-3
+        bert_mid_params = []     # BERT layer 4-7
+        bert_high_params = []    # BERT layer 8-11
+        bert_other_params = []   # BERT pooler
+        
+        # ViT参数组
+        vit_embed_params = []    # ViT embeddings
         vit_low_params = []      # ViT layer 0-3
         vit_mid_params = []      # ViT layer 4-7
         vit_high_params = []     # ViT layer 8-11
-        vit_embed_params = []    # ViT embeddings
         vit_other_params = []    # ViT layernorm, pooler
-        task_params = []         # 任务特定模块
+        
+        # 任务特定模块
+        task_params = []         # G-S3, Fusion, Classifier, text_attn等
         
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-                
-            if 'visual_encoder' in name:
+            
+            # 处理BERT参数
+            if 'text_encoder' in name:
+                if 'embeddings' in name:
+                    bert_embed_params.append(param)
+                elif 'encoder.layer.' in name:
+                    try:
+                        parts = name.split('encoder.layer.')[1].split('.')
+                        layer_num = int(parts[0])
+                        
+                        if 0 <= layer_num <= 3:
+                            bert_low_params.append(param)
+                        elif 4 <= layer_num <= 7:
+                            bert_mid_params.append(param)
+                        elif 8 <= layer_num <= 11:
+                            bert_high_params.append(param)
+                        else:
+                            logging.warning(f"Unexpected BERT layer number {layer_num} in {name}")
+                            task_params.append(param)
+                    except (IndexError, ValueError) as e:
+                        logging.warning(f"Could not parse BERT layer from {name}: {e}")
+                        task_params.append(param)
+                elif 'pooler' in name:
+                    bert_other_params.append(param)
+                else:
+                    task_params.append(param)
+            
+            # 处理ViT参数
+            elif 'visual_encoder' in name:
                 if 'embeddings' in name:
                     vit_embed_params.append(param)
                 elif 'encoder.layer.' in name:
@@ -281,57 +385,68 @@ class Runner:
                         elif 8 <= layer_num <= 11:
                             vit_high_params.append(param)
                         else:
-                            logging.warning(f"Unexpected layer number {layer_num} in {name}")
+                            logging.warning(f"Unexpected ViT layer number {layer_num} in {name}")
                             task_params.append(param)
                     except (IndexError, ValueError) as e:
-                        logging.warning(f"Could not parse layer from {name}: {e}")
+                        logging.warning(f"Could not parse ViT layer from {name}: {e}")
                         task_params.append(param)
                 elif 'layernorm' in name or 'pooler' in name:
                     vit_other_params.append(param)
                 else:
-                    # 其他visual_encoder参数
                     task_params.append(param)
+            
+            # 其他参数（任务特定模块）
             else:
-                # 非ViT参数 (BERT, G-S3, Fusion, Classifier等)
                 task_params.append(param)
         
-        # 根据训练阶段设置学习率
-        if stage == 1:  # Stage 1: Warmup (Epoch 1-5)
+        # 根据训练阶段设置学习率（BERT和ViT协同解冻）
+        if stage == 1:  # Stage 1: Warmup (Epoch 1-5) - 冻结BERT和ViT
             param_groups = [
                 {'params': task_params, 'lr': base_lr * 0.1, 'name': 'task_modules'}
             ]
             logging.info(f"Stage 1 LR: task={base_lr*0.1:.2e}")
             
-        elif stage == 2:  # Stage 2: 解冻后4层 (Epoch 6-20)
+        elif stage == 2:  # Stage 2: 解冻BERT和ViT后4层 (Epoch 6-20)
+            # 合并BERT和ViT的后4层参数
+            backbone_high_params = bert_high_params + vit_high_params
             param_groups = [
-                {'params': vit_high_params, 'lr': base_lr * 0.2, 'weight_decay': 0.0001, 'name': 'vit_high'},
+                {'params': backbone_high_params, 'lr': base_lr * 0.2, 'weight_decay': 0.0001, 'name': 'backbone_high'},
                 {'params': task_params, 'lr': base_lr * 0.5, 'weight_decay': 0.0001, 'name': 'task_modules'}
             ]
-            logging.info(f"Stage 2 LR: vit_high={base_lr*0.2:.2e}, task={base_lr*0.5:.2e}")
+            logging.info(f"Stage 2 LR: backbone_high={base_lr*0.2:.2e}, task={base_lr*0.5:.2e}")
             
-        elif stage == 3:  # Stage 3: 解冻后8层 (Epoch 21-40)
+        elif stage == 3:  # Stage 3: 解冻BERT和ViT后8层 (Epoch 21-40)
+            # 合并BERT和ViT的中间+后层参数
+            backbone_mid_high_params = bert_mid_params + bert_high_params + vit_mid_params + vit_high_params
             param_groups = [
-                {'params': vit_mid_params + vit_high_params, 'lr': base_lr * 0.5, 'name': 'vit_mid_high'},
+                {'params': backbone_mid_high_params, 'lr': base_lr * 0.5, 'name': 'backbone_mid_high'},
                 {'params': task_params, 'lr': base_lr, 'name': 'task_modules'}
             ]
-            logging.info(f"Stage 3 LR: vit_mid_high={base_lr*0.5:.2e}, task={base_lr:.2e}")
+            logging.info(f"Stage 3 LR: backbone_mid_high={base_lr*0.5:.2e}, task={base_lr:.2e}")
             
         elif stage == 4:  # Stage 4: 全部解冻 (Epoch 41-60)
+            # BERT和ViT全部解冻，分层设置学习率
+            all_embed_params = bert_embed_params + bert_other_params + vit_embed_params + vit_other_params
+            all_low_params = bert_low_params + vit_low_params
+            all_mid_params = bert_mid_params + vit_mid_params
+            all_high_params = bert_high_params + vit_high_params
+            
             param_groups = [
-                {'params': vit_embed_params + vit_other_params, 'lr': base_lr * 0.01, 'name': 'vit_embed'},
-                {'params': vit_low_params, 'lr': base_lr * 0.1, 'name': 'vit_low'},
-                {'params': vit_mid_params, 'lr': base_lr * 0.3, 'name': 'vit_mid'},
-                {'params': vit_high_params, 'lr': base_lr * 0.5, 'name': 'vit_high'},
+                {'params': all_embed_params, 'lr': base_lr * 0.01, 'name': 'backbone_embed'},
+                {'params': all_low_params, 'lr': base_lr * 0.1, 'name': 'backbone_low'},
+                {'params': all_mid_params, 'lr': base_lr * 0.3, 'name': 'backbone_mid'},
+                {'params': all_high_params, 'lr': base_lr * 0.5, 'name': 'backbone_high'},
                 {'params': task_params, 'lr': base_lr * 0.8, 'name': 'task_modules'}
             ]
             logging.info(f"Stage 4 LR: embed={base_lr*0.01:.2e}, low={base_lr*0.1:.2e}, "
                         f"mid={base_lr*0.3:.2e}, high={base_lr*0.5:.2e}, task={base_lr*0.8:.2e}")
             
         elif stage == 5:  # Stage 5: 精细微调 (Epoch 61-80)
-            all_vit_params = (vit_embed_params + vit_other_params + 
-                            vit_low_params + vit_mid_params + vit_high_params)
+            # 所有参数使用统一的较低学习率
+            all_backbone_params = (bert_embed_params + bert_other_params + bert_low_params + bert_mid_params + bert_high_params +
+                                  vit_embed_params + vit_other_params + vit_low_params + vit_mid_params + vit_high_params)
             param_groups = [
-                {'params': all_vit_params, 'lr': base_lr * 0.1, 'name': 'all_vit'},
+                {'params': all_backbone_params, 'lr': base_lr * 0.1, 'name': 'all_backbone'},
                 {'params': task_params, 'lr': base_lr * 0.1, 'name': 'task_modules'}
             ]
             logging.info(f"Stage 5 LR: all_params={base_lr*0.1:.2e}")
@@ -349,8 +464,16 @@ class Runner:
     def build_optimizer(self, model, stage=1):
         # 创建优化器，根据训练阶段使用不同的参数组
         param_groups = self.get_param_groups_with_diff_lr(model, self.args.lr, stage)
-        # 使用AdamW优化器，增加weight_decay
-        return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
+        
+        # 根据配置选择优化器
+        optimizer_type = self.args.optimizer.lower()
+        if optimizer_type == 'adamw':
+            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
+        elif optimizer_type == 'adam':
+            return torch.optim.Adam(param_groups, eps=1e-8, betas=(0.9, 0.999))
+        else:
+            logging.warning(f"Unknown optimizer {self.args.optimizer}, defaulting to AdamW")
+            return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
 
     def build_scheduler(self, optimizer):
         # 创建学习率调度器
@@ -524,9 +647,10 @@ class Runner:
             console_logger.info(f"Loading checkpoint from {args.finetune_from}")
             self.load_param(model, args.finetune_from)
 
-        # 【渐进解冻策略 - Stage 1】Epoch 1-5: 冻结所有ViT层
+        # 【渐进解冻策略 - Stage 1】Epoch 1-5: 冻结所有BERT和ViT层
         console_logger.info("=== Progressive Unfreezing Strategy ===")
-        console_logger.info("Stage 1 (Epoch 1-5): Freeze all ViT layers")
+        console_logger.info("Stage 1 (Epoch 1-5): Freeze all BERT and ViT layers")
+        self.freeze_bert_layers(model, unfreeze_from_layer=None)
         self.freeze_vit_layers(model, unfreeze_from_layer=None)
 
         # 构建优化器和调度器
