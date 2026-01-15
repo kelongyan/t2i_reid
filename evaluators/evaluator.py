@@ -19,10 +19,10 @@ class Evaluator:
         self.gallery_labels = None
         self.device = next(model.parameters()).device
 
-        # Define default loss weights
+        # Define default loss weights (与loss.py保持一致)
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 1.0, 'cloth_semantic': 0.5, 
-            'orthogonal': 0.3, 'gate_adaptive': 0.01
+            'info_nce': 1.0, 'cls': 0.1, 'cloth_semantic': 0.5, 
+            'orthogonal': 0.1, 'gate_adaptive': 0.01
         }
         # Get loss weights from config file, merge with defaults
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
@@ -50,7 +50,9 @@ class Evaluator:
             if self.gallery_features is None or self.gallery_labels is None:
                 self.gallery_features, self.gallery_labels = self.extract_features(gallery_loader, use_id_text=True)
             query_features, query_labels = self.extract_features(query_loader, use_id_text=True)
-        distmat = self.pairwise_distance(query_features, self.gallery_features)
+        
+        # 传入query和gallery列表，确保特征顺序正确
+        distmat = self.pairwise_distance(query_features, self.gallery_features, query, gallery)
         metrics = self.eval(distmat, query, gallery, epoch=epoch)
 
         if epoch is not None:
@@ -125,6 +127,7 @@ class Evaluator:
     def extract_features(self, data_loader, use_id_text=True, id_only=False):
         """
         Extract feature vectors from data loader
+        确保特征提取的顺序与dataset.data一致
         """
         self.model.eval()
         features = {}
@@ -133,11 +136,17 @@ class Evaluator:
         text_weight_stats = AverageMeter()
         all_image_batch_means = []
         all_text_batch_means = []
+        
         with torch.no_grad():
+            # 获取完整的数据列表
+            full_data = data_loader.dataset.data
+            processed_count = 0
+            
             for i, data in enumerate(data_loader):
                 imgs, cloth_captions, id_captions, pids, cam_id, is_matched = data
                 imgs = to_torch(imgs).to(self.device)
                 captions = id_captions if id_only else cloth_captions + id_captions
+                
                 try:
                     with torch.amp.autocast('cuda', enabled=self.args.fp16):
                         if use_id_text:
@@ -153,6 +162,7 @@ class Evaluator:
                 except AttributeError as e:
                     logging.error(f"Model failed to extract fused features: {e}")
                     raise
+                
                 if gate_weights is not None:
                     image_weight_mean_batch = gate_weights[:, 0].mean().item()
                     text_weight_mean_batch = gate_weights[:, 1].mean().item()
@@ -160,14 +170,31 @@ class Evaluator:
                     text_weight_stats.update(text_weight_mean_batch)
                     all_image_batch_means.append(image_weight_mean_batch)
                     all_text_batch_means.append(text_weight_mean_batch)
+                
+                # 使用实际batch大小，避免索引越界
                 batch_size = len(imgs)
-                start_idx = i * data_loader.batch_size
-                end_idx = min(start_idx + batch_size, len(data_loader.dataset.data))
-                batch_data = data_loader.dataset.data[start_idx:end_idx]
-                for idx, (data_item, feat, pid) in enumerate(zip(batch_data, fused_feats, pids)):
+                
+                # 从full_data中按顺序提取对应的数据项
+                for idx in range(batch_size):
+                    data_idx = processed_count + idx
+                    if data_idx >= len(full_data):
+                        logging.warning(f"Data index {data_idx} exceeds dataset size {len(full_data)}")
+                        break
+                    
+                    data_item = full_data[data_idx]
                     img_path = data_item[0]
-                    features[img_path] = feat.cpu()
-                    labels[img_path] = pid.cpu().item()
+                    pid = pids[idx].cpu().item()
+                    feat = fused_feats[idx].cpu()
+                    
+                    features[img_path] = feat
+                    labels[img_path] = pid
+                
+                processed_count += batch_size
+            
+            # 验证处理的数据数量
+            if processed_count != len(full_data):
+                logging.warning(f"Processed {processed_count} samples but dataset has {len(full_data)} samples")
+            
             if image_weight_stats.count > 0 and text_weight_stats.count > 0:
                 image_weight_avg = image_weight_stats.avg
                 text_weight_avg = text_weight_stats.avg
@@ -175,18 +202,34 @@ class Evaluator:
                 text_weight_std = (sum((x - text_weight_avg) ** 2 for x in all_text_batch_means) / text_weight_stats.count) ** 0.5 if text_weight_stats.count > 0 else 0.0
                 logging.info(f"Gate weights statistics: Image weight mean={image_weight_avg:.4f}, std={image_weight_std:.4f}; "
                              f"Text weight mean={text_weight_avg:.4f}, std={text_weight_std:.4f}")
+        
         return features, labels
 
-    def pairwise_distance(self, query_features, gallery_features):
+    def pairwise_distance(self, query_features, gallery_features, query_list, gallery_list):
         """
         Compute distance matrix between query and gallery features
+        确保特征矩阵的顺序与query/gallery列表一致
+        
+        Args:
+            query_features: {img_path: feature} 字典
+            gallery_features: {img_path: feature} 字典
+            query_list: query数据列表，每项为 (img_path, ...)
+            gallery_list: gallery数据列表
         """
-        x = torch.cat([feat.unsqueeze(0) for fname, feat in query_features.items()], 0)
-        y = torch.cat([feat.unsqueeze(0) for fname, feat in gallery_features.items()], 0)
+        # 按照列表顺序提取特征，确保顺序一致
+        x = torch.stack([query_features[item[0]] for item in query_list], dim=0)
+        y = torch.stack([gallery_features[item[0]] for item in gallery_list], dim=0)
+        
+        # L2归一化
         x = torch.nn.functional.normalize(x, p=2, dim=1)
         y = torch.nn.functional.normalize(y, p=2, dim=1)
+        
+        # 计算余弦相似度
         similarities = torch.matmul(x, y.t())
+        
+        # 转换为欧氏距离: ||x-y||^2 = 2 - 2*<x,y> (当||x||=||y||=1时)
         distmat = 2 - 2 * similarities
+        
         return distmat
 
     def eval(self, distmat, query, gallery, prefix='', epoch=None):

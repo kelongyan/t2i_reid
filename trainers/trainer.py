@@ -16,10 +16,10 @@ class Trainer:
         self.monitor = monitor  # 添加监控器
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # 定义默认损失权重
+        # 定义默认损失权重（与loss.py保持一致）
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 1.0, 'cloth_semantic': 0.5, 
-            'orthogonal': 0.3, 'gate_adaptive': 0.01
+            'info_nce': 1.0, 'cls': 0.1, 'cloth_semantic': 0.5, 
+            'orthogonal': 0.1, 'gate_adaptive': 0.01
         }
         # 从配置文件获取损失权重，合并默认值
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
@@ -184,6 +184,10 @@ class Trainer:
 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
+                    
+                    # 梯度裁剪：放宽限制，允许分类损失更快下降
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
 
                     # 记录梯度流动（每1000个batch记录一次）
                     if self.monitor and i % 1000 == 0:
@@ -196,6 +200,9 @@ class Trainer:
                     self.scaler.update()
                 else:
                     loss.backward()
+                    
+                    # 梯度裁剪：放宽限制
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
 
                     # 记录梯度流动（每1000个batch记录一次）
                     if self.monitor and i % 1000 == 0:

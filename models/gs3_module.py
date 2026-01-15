@@ -54,6 +54,16 @@ class OrthogonalProjectionAttention(nn.Module):
         self.norm_id = nn.LayerNorm(dim)
         self.norm_cloth = nn.LayerNorm(dim)
         
+        # 初始化权重：使用Xavier初始化降低初始梯度
+        self._init_weights()
+    
+    def _init_weights(self):
+        """初始化权重，防止梯度爆炸"""
+        for m in [self.qkv_id, self.qkv_cloth, self.proj_id, self.proj_cloth]:
+            nn.init.xavier_uniform_(m.weight, gain=0.5)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        
     def orthogonal_projection(self, q_id, q_cloth):
         """
         执行正交投影: Q_id_perp = Q_id - proj_{Q_cloth}(Q_id)
@@ -72,19 +82,23 @@ class OrthogonalProjectionAttention(nn.Module):
         # 计算点积 <Q_id, Q_cloth>
         dot_product = (q_id * q_cloth).sum(dim=-1, keepdim=True)  # [B, num_heads, N, 1]
         
-        # 计算 ||Q_cloth||^2
-        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-8  # 防止除零
+        # 计算 ||Q_cloth||^2，增大eps防止数值不稳定
+        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-6  # 防止除零
+        
+        # 计算投影系数并进行梯度裁剪
+        projection_coeff = dot_product / norm_sq
+        projection_coeff = torch.clamp(projection_coeff, min=-10.0, max=10.0)
         
         # 计算投影分量
-        projection = (dot_product / norm_sq) * q_cloth  # [B, num_heads, N, head_dim]
+        projection = projection_coeff * q_cloth  # [B, num_heads, N, head_dim]
         
-        # 执行正交化：减去投影分量
-        q_id_ortho = q_id - projection
+        # 执行正交化：减去投影分量，使用detach阻断部分梯度流
+        q_id_ortho = q_id - 0.5 * projection  # 降低正交化强度
         
         # 计算服装显著性分数 (归一化的点积，范围 [0, 1])
         # 点积越大，说明当前 token 包含越多服装信息
-        saliency_score = torch.abs(dot_product) / (torch.sqrt(norm_sq) + 1e-8)
-        saliency_score = saliency_score.mean(dim=1)  # 对所有头取平均 [B, N, 1]
+        saliency_score = torch.abs(dot_product) / (torch.sqrt(norm_sq) + 1e-6)
+        saliency_score = torch.clamp(saliency_score.mean(dim=1), min=0.0, max=1.0)  # 对所有头取平均 [B, N, 1]
         
         return q_id_ortho, saliency_score
     
@@ -121,12 +135,15 @@ class OrthogonalProjectionAttention(nn.Module):
         # === 步骤 3: 计算注意力 ===
         # 身份分支：使用正交化后的查询
         attn_id = (q_id_ortho @ k_id.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
+        # 裁剪防止softmax溢出
+        attn_id = torch.clamp(attn_id, min=-50.0, max=50.0)
         attn_id = attn_id.softmax(dim=-1)
         attn_id = self.attn_dropout(attn_id)
         out_id = (attn_id @ v_id).transpose(1, 2).reshape(B, N, C)  # [B, N, C]
         
         # 服装分支：正常计算
         attn_cloth = (q_cloth @ k_cloth.transpose(-2, -1)) * self.scale
+        attn_cloth = torch.clamp(attn_cloth, min=-50.0, max=50.0)
         attn_cloth = attn_cloth.softmax(dim=-1)
         attn_cloth = self.attn_dropout(attn_cloth)
         out_cloth = (attn_cloth @ v_cloth).transpose(1, 2).reshape(B, N, C)
@@ -201,18 +218,18 @@ class ContentAwareMambaFilter(nn.Module):
         # === 步骤 1: 计算门控信号 ===
         gate_signal = self.saliency_mlp(saliency_score)  # [B, N, 1]
         
-        # === 步骤 2: 输入级抑制 ===
-        # 门控逻辑：(1 - gate_signal) 表示"保留比例"
-        # 当 gate_signal ≈ 1（服装显著性高）时，输入被抑制
+        # === 步骤 2: 输入级抑制（降低抑制强度）===
+        # 门控逻辑：(1 - 0.3*gate_signal) 表示"保留比例"，降低抑制强度防止信息丢失
+        # 当 gate_signal ≈ 1（服装显著性高）时，输入被轻微抑制
         # 当 gate_signal ≈ 0（身份显著性高）时，输入正常通过
-        x_gated = x * (1 - gate_signal)  # [B, N, dim]
+        x_gated = x * (1 - 0.3 * gate_signal)  # [B, N, dim]
         
         # === 步骤 3: Mamba 状态空间建模 ===
         # Mamba 会对序列进行时序建模，门控后的输入确保服装信息不会污染隐状态
         x_filtered = self.mamba(x_gated)
         
-        # === 步骤 4: 残差连接 + LayerNorm ===
-        out = self.norm(x + x_filtered)
+        # === 步骤 4: 残差连接 + LayerNorm（降低Mamba输出权重）===
+        out = self.norm(x + 0.5 * x_filtered)  # 降低Mamba输出的影响
         
         return out
 

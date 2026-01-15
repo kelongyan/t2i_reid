@@ -6,56 +6,64 @@ class Loss(nn.Module):
     def __init__(self, temperature=0.1, weights=None):
         super().__init__()
         self.temperature = temperature
-        self.ce_loss = nn.CrossEntropyLoss()
+        # 使用Label Smoothing降低分类损失的初始值
+        self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-        # 优化后的损失权重：移除冗余和冲突的损失
+        # 优化后的损失权重：大幅降低cls权重，避免其主导总损失
         self.weights = weights if weights is not None else {
-            'info_nce': 1.0,
-            'cls': 1.0,
-            'cloth_semantic': 0.5,
-            'orthogonal': 0.3,
+            'info_nce': 1.0,        # 提高对比学习权重
+            'cls': 0.1,             # 大幅降低分类权重（从0.5降到0.1）
+            'cloth_semantic': 0.5,  # 提高服装语义权重
+            'orthogonal': 0.1,
             'gate_adaptive': 0.01,
         }
 
     def gate_adaptive_loss(self, gate, id_embeds, cloth_embeds):
         """自适应门控正则化：根据特征质量动态调整目标"""
         if gate is None or id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
         
         # 计算特征质量（方差作为判别性的代理指标）
-        # 修复：var(dim=0) 需要至少2个样本，使用 unbiased=False 避免自由度问题
         batch_size = id_embeds.size(0)
         if batch_size < 2:
             # 批次太小，使用固定目标
             target_gate = torch.tensor(0.5, device=id_embeds.device, dtype=id_embeds.dtype)
         else:
-            id_quality = id_embeds.var(dim=0, unbiased=False).mean().detach()
-            cloth_quality = cloth_embeds.var(dim=0, unbiased=False).mean().detach()
-            total_quality = id_quality + cloth_quality + 1e-8
+            id_quality = torch.clamp(id_embeds.var(dim=0, unbiased=False).mean().detach(), min=0.0, max=10.0)
+            cloth_quality = torch.clamp(cloth_embeds.var(dim=0, unbiased=False).mean().detach(), min=0.0, max=10.0)
+            total_quality = id_quality + cloth_quality + 1e-6
             target_gate = id_quality / total_quality
         
         # MSE 损失
         gate_mean = gate.mean(dim=-1) if gate.dim() > 1 else gate
         if gate_mean.dim() == 0:
             gate_mean = gate_mean.unsqueeze(0)
-        mse_loss = F.mse_loss(gate_mean, target_gate.expand_as(gate_mean))
+        
+        # 确保target_gate和gate_mean形状一致
+        if target_gate.dim() == 0:
+            target_gate = target_gate.expand_as(gate_mean)
+        
+        mse_loss = F.mse_loss(gate_mean, target_gate)
         
         # 熵正则：避免门控过于极端（0或1）
         # H = -p*log(p) - (1-p)*log(1-p)
-        gate_clamp = torch.clamp(gate_mean, min=1e-7, max=1-1e-7)
+        gate_clamp = torch.clamp(gate_mean, min=1e-6, max=1-1e-6)
         entropy = -(gate_clamp * torch.log(gate_clamp) + (1 - gate_clamp) * torch.log(1 - gate_clamp))
         entropy_reg = -entropy.mean()  # 最大化熵（负号）
         
-        return mse_loss + 0.1 * entropy_reg
+        # 限制总损失幅度，防止负值
+        total_loss = torch.clamp(mse_loss + 0.1 * entropy_reg, min=0.0, max=1.0)
+        
+        return total_loss
 
     def info_nce_loss(self, image_embeds, text_embeds):
         bsz = image_embeds.size(0)
-        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-8)
-        text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-8)
+        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-6)
+        text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-6)
         sim = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
         
         # 防止数值溢出
-        sim = torch.clamp(sim, min=-50, max=50)
+        sim = torch.clamp(sim, min=-20, max=20)
         
         labels = torch.arange(bsz, device=sim.device)
         return (self.ce_loss(sim, labels) + self.ce_loss(sim.t(), labels)) / 2
@@ -66,14 +74,14 @@ class Loss(nn.Module):
     def cloth_semantic_loss(self, cloth_image_embeds, cloth_text_embeds):
         """服装语义损失：合并 cloth 和 cloth_match，避免冗余"""
         if cloth_image_embeds is None or cloth_text_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
         
         bsz = cloth_image_embeds.size(0)
-        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
-        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
+        cloth_image_embeds = F.normalize(cloth_image_embeds, dim=-1, eps=1e-6)
+        cloth_text_embeds = F.normalize(cloth_text_embeds, dim=-1, eps=1e-6)
         
         sim = torch.matmul(cloth_image_embeds, cloth_text_embeds.t()) / self.temperature
-        sim = torch.clamp(sim, min=-50, max=50)
+        sim = torch.clamp(sim, min=-20, max=20)
         
         labels = torch.arange(bsz, device=sim.device)
         
@@ -82,11 +90,14 @@ class Loss(nn.Module):
     def orthogonal_loss(self, id_embeds, cloth_embeds):
         """正交约束损失：直接约束特征向量正交，比 Gram 矩阵更高效"""
         if id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+            return torch.tensor(0.0, device=self.ce_loss.weight.device if self.ce_loss.weight is not None else 'cuda')
         
-        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-8)
-        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-8)
+        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-6)
+        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-6)
         cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
+        
+        # 裁剪余弦相似度，防止梯度爆炸
+        cosine_sim = torch.clamp(cosine_sim, min=-1.0, max=1.0)
         
         return cosine_sim.abs().mean()
     

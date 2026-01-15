@@ -71,11 +71,11 @@ def configuration():
     parser.add_argument('--gs3-dropout', type=float, default=0.1, 
                        help='Dropout rate for G-S3 module')
 
-    # Loss weights
+    # Loss weights（调整权重以平衡各损失项）
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=1.0, help='Classification loss weight')
+    parser.add_argument('--loss-cls', type=float, default=0.1, help='Classification loss weight (降低以避免主导)')
     parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.1, help='Orthogonal loss weight')
     parser.add_argument('--loss-gate-adaptive', type=float, default=0.01, help='Gate adaptive loss weight')
 
     # Optimizer and scheduler
@@ -304,10 +304,10 @@ class Runner:
             
         elif stage == 2:  # Stage 2: 解冻后4层 (Epoch 6-20)
             param_groups = [
-                {'params': vit_high_params, 'lr': base_lr * 0.3, 'name': 'vit_high'},
-                {'params': task_params, 'lr': base_lr, 'name': 'task_modules'}
+                {'params': vit_high_params, 'lr': base_lr * 0.2, 'weight_decay': 0.0001, 'name': 'vit_high'},
+                {'params': task_params, 'lr': base_lr * 0.5, 'weight_decay': 0.0001, 'name': 'task_modules'}
             ]
-            logging.info(f"Stage 2 LR: vit_high={base_lr*0.3:.2e}, task={base_lr:.2e}")
+            logging.info(f"Stage 2 LR: vit_high={base_lr*0.2:.2e}, task={base_lr*0.5:.2e}")
             
         elif stage == 3:  # Stage 3: 解冻后8层 (Epoch 21-40)
             param_groups = [
@@ -349,7 +349,8 @@ class Runner:
     def build_optimizer(self, model, stage=1):
         # 创建优化器，根据训练阶段使用不同的参数组
         param_groups = self.get_param_groups_with_diff_lr(model, self.args.lr, stage)
-        return torch.optim.Adam(param_groups, weight_decay=self.args.weight_decay)
+        # 使用AdamW优化器，增加weight_decay
+        return torch.optim.AdamW(param_groups, eps=1e-8, betas=(0.9, 0.999))
 
     def build_scheduler(self, optimizer):
         # 创建学习率调度器

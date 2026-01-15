@@ -47,9 +47,9 @@ python scripts/train.py \
     --id-projection-dim 768 \
     --cloth-projection-dim 768 \
     --loss-info-nce 1.0 \
-    --loss-cls 1.0 \
+    --loss-cls 0.1 \
     --loss-cloth-semantic 0.5 \
-    --loss-orthogonal 0.3 \
+    --loss-orthogonal 0.1 \
     --loss-gate-adaptive 0.01 \
     --optimizer "Adam" \
     --scheduler "cosine"
