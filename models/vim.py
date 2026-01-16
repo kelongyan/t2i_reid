@@ -9,8 +9,11 @@ class PatchEmbed(nn.Module):
     """ 2D Image to Patch Embedding """
     def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768, norm_layer=None):
         super().__init__()
-        img_size = (img_size, img_size)
-        patch_size = (patch_size, patch_size)
+        if isinstance(img_size, int):
+            img_size = (img_size, img_size)
+        if isinstance(patch_size, int):
+            patch_size = (patch_size, patch_size)
+            
         num_patches = (img_size[0] // patch_size[0]) * (img_size[1] // patch_size[1])
         self.img_size = img_size
         self.patch_size = patch_size

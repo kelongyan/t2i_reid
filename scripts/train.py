@@ -720,6 +720,7 @@ class Runner:
             'vit_pretrained': args.vit_pretrained,
             'vision_backbone': args.vision_backbone,
             'vim_pretrained': args.vim_pretrained,
+            'img_size': (args.height, args.width),
             'num_classes': args.num_classes,
             'disentangle_type': args.disentangle_type,
             'gs3': {

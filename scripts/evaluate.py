@@ -154,6 +154,7 @@ def main():
     net_config['num_classes'] = args.num_classes
     net_config['vision_backbone'] = args.vision_backbone
     net_config['vim_pretrained'] = args.vim_pretrained
+    net_config['img_size'] = (getattr(args, 'height', 224), getattr(args, 'width', 224))
     # 添加 G-S3 配置
     net_config['disentangle_type'] = args.disentangle_type
     net_config['gs3'] = {

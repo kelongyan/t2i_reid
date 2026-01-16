@@ -1,8 +1,10 @@
 # src/models/model.py
 import logging
+import math
 from pathlib import Path
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from transformers import BertModel, BertTokenizer, ViTModel
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
@@ -12,6 +14,48 @@ from .vim import VisionMamba
 
 # 设置transformers库的日志级别为ERROR，减少不必要的日志输出
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True):
+    """
+    Rescale the grid of position embeddings when loading from state_dict. Adapted from DEIT/Vim.
+    
+    Args:
+        posemb: Pretrained position embedding tensor. [1, 197, 384]
+        posemb_new: Target position embedding tensor. [1, 129, 384]
+        num_tokens: Number of special tokens (CLS, etc.).
+        gs_new: Target grid size (h, w).
+        mid_cls: Whether the CLS token is in the middle (Vim style).
+    """
+    logging.info(f"Resizing position embedding: shape {posemb.shape} -> {posemb_new.shape}")
+    ntok_new = posemb_new.shape[1]
+    
+    # Handle CLS token(s)
+    if num_tokens:
+        posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[:, num_tokens:]
+        ntok_new -= num_tokens
+    else:
+        posemb_tok, posemb_grid = posemb[:, :0], posemb
+    
+    gs_old = int(math.sqrt(len(posemb_grid[0])))
+    
+    if ntok_new != len(posemb_grid[0]):
+        logging.info(f'Position embedding grid resize from {gs_old}x{gs_old} to {gs_new[0]}x{gs_new[1]}')
+        posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
+        posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bicubic', align_corners=False)
+        posemb_grid = posemb_grid.permute(0, 2, 3, 1).flatten(1, 2)
+        
+        # Re-assemble
+        if mid_cls:
+            # Vim typically stores pos_embed as [CLS, Patch1, ... PatchN] in checkpoint
+            # but uses it with CLS in middle during forward.
+            # Here we assume the checkpoint format is standard [CLS, Grid].
+            # Interpolation is done on the Grid part.
+            posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
+        else:
+            posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
+            
+    return posemb
 
 
 class DisentangleModule(nn.Module):
@@ -114,7 +158,13 @@ class Model(nn.Module):
         if self.vision_backbone_type == 'vim':
             # Vision Mamba (Vim-S)
             vim_pretrained_path = net_config.get('vim_pretrained', 'pretrained/Vision Mamba/vim_s_midclstok.pth')
-            self.visual_encoder = VisionMamba(img_size=224, patch_size=16, embed_dim=384, depth=24)
+            # 获取图像尺寸，默认为 224x224
+            img_size = net_config.get('img_size', (224, 224))
+            if isinstance(img_size, int):
+                img_size = (img_size, img_size)
+            
+            # 使用配置的尺寸初始化 VisionMamba
+            self.visual_encoder = VisionMamba(img_size=img_size, patch_size=16, embed_dim=384, depth=24)
             
             # 加载 Vim 预训练权重
             if Path(vim_pretrained_path).exists():
@@ -122,6 +172,21 @@ class Model(nn.Module):
                 checkpoint = torch.load(vim_pretrained_path, map_location='cpu', weights_only=False)
                 # 提取模型权重 (处理 checkpoint 包含 'model' 键的情况)
                 state_dict = checkpoint.get('model', checkpoint)
+                
+                # === 关键修复：位置编码插值 ===
+                if 'pos_embed' in state_dict:
+                    # 计算新的 Grid 尺寸
+                    # img_size 是 (H, W)，patch_size 是 16
+                    grid_h = img_size[0] // 16
+                    grid_w = img_size[1] // 16
+                    
+                    state_dict['pos_embed'] = resize_pos_embed(
+                        state_dict['pos_embed'], 
+                        self.visual_encoder.pos_embed, 
+                        num_tokens=1, 
+                        gs_new=(grid_h, grid_w)
+                    )
+                
                 # 加载权重 (非严格模式，允许部分不匹配，如头部)
                 missing, unexpected = self.visual_encoder.load_state_dict(state_dict, strict=False)
                 logging.info(f"Loaded Vim backbone from {vim_pretrained_path}")
@@ -132,7 +197,7 @@ class Model(nn.Module):
             
             # 投影层：将 Vim 的 384 维映射到 768 维以适配后续模块
             self.visual_proj = nn.Linear(384, self.text_width)
-            logging.info("Using Vision Mamba (Vim-S) backbone with projection (384->768)")
+            logging.info(f"Using Vision Mamba (Vim-S) backbone with projection (384->768), img_size={img_size}")
             
         else:
             # ViT-Base (默认)
