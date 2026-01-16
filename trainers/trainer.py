@@ -51,18 +51,20 @@ class Trainer:
             # 训练时不需要注意力图，return_attention=False（默认值）
             outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-            # 训练时模型返回 10 个输出（不包含注意力图）
-            if len(outputs) != 10:
-                raise ValueError(f"Expected 10 model outputs during training, got {len(outputs)}")
+            # 训练时模型返回 11 个输出（增加了id_cls_features）
+            if len(outputs) != 11:
+                raise ValueError(f"Expected 11 model outputs during training, got {len(outputs)}")
 
             image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights = outputs
+            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights, \
+            id_cls_features = outputs
 
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate
+                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate,
+                id_cls_features=id_cls_features  # 新增：传入分类分支特征
             )
 
         # 记录模型内部状态信息
@@ -124,37 +126,46 @@ class Trainer:
         loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
 
         for epoch in range(1, self.args.epochs + 1):
-            # 【渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
+            # 【方案B：渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
             stage_changed = False
             if self.runner:
-                if epoch == 6:  # Stage 2: 解冻BERT和ViT后4层
-                    print("\n=== Progressive Unfreezing: Stage 2 ===")
-                    print("Epoch 6-20: Unfreezing BERT and ViT last 4 layers (layer 8-11)")
+                if epoch == 11:  # Stage 2: 解冻ViT后4层 (关键修复！)
+                    print("\n" + "="*70)
+                    print("🔓 Progressive Unfreezing: Stage 2")
+                    print("="*70)
+                    print("Epoch 11-30: Unfreezing ViT last 4 layers (layer 8-11)")
+                    print("             + BERT last 4 layers (layer 8-11)")
+                    print("Goal: Let classification head see learnable ViT features")
+                    print("="*70 + "\n")
                     self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=8)
                     self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=8)
+                    # 重新构建优化器和调度器
                     optimizer = self.runner.build_optimizer(self.model, stage=2)
                     lr_scheduler = self.runner.build_scheduler(optimizer)
                     stage_changed = True
-                elif epoch == 21:  # Stage 3: 解冻BERT和ViT后8层
-                    print("\n=== Progressive Unfreezing: Stage 3 ===")
-                    print("Epoch 21-40: Unfreezing BERT and ViT last 8 layers (layer 4-11)")
+                elif epoch == 31:  # Stage 3: 解冻ViT后8层
+                    print("\n" + "="*70)
+                    print("🔓 Progressive Unfreezing: Stage 3")
+                    print("="*70)
+                    print("Epoch 31-60: Unfreezing ViT last 8 layers (layer 4-11)")
+                    print("             + BERT last 8 layers (layer 4-11)")
+                    print("Goal: Deep feature adaptation for ReID task")
+                    print("="*70 + "\n")
                     self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=4)
                     self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
                     optimizer = self.runner.build_optimizer(self.model, stage=3)
                     lr_scheduler = self.runner.build_scheduler(optimizer)
                     stage_changed = True
-                elif epoch == 41:  # Stage 4: 全部解冻
-                    print("\n=== Progressive Unfreezing: Stage 4 ===")
-                    print("Epoch 41-60: Unfreezing all BERT and ViT layers")
+                elif epoch == 61:  # Stage 4: 全部解冻
+                    print("\n" + "="*70)
+                    print("🔓 Progressive Unfreezing: Stage 4")
+                    print("="*70)
+                    print("Epoch 61-80: Unfreezing all BERT and ViT layers")
+                    print("Goal: End-to-end fine-tuning")
+                    print("="*70 + "\n")
                     self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=0)
                     self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
                     optimizer = self.runner.build_optimizer(self.model, stage=4)
-                    lr_scheduler = self.runner.build_scheduler(optimizer)
-                    stage_changed = True
-                elif epoch == 61:  # Stage 5: 降低学习率
-                    print("\n=== Progressive Unfreezing: Stage 5 ===")
-                    print("Epoch 61-80: Fine-tuning with reduced learning rate")
-                    optimizer = self.runner.build_optimizer(self.model, stage=5)
                     lr_scheduler = self.runner.build_scheduler(optimizer)
                     stage_changed = True
                     

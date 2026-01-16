@@ -1,33 +1,31 @@
 #!/bin/bash
 
-# 清理__pycache__缓存文件
+# ============================================================================
+# CUHK-PEDES Training Script - 方案B：渐进解冻策略
+# ============================================================================
+# 核心修复：
+#   ✅ Stage 1 (Epoch 1-10):  解冻ViT后4层 (关键!)
+#   ✅ Stage 2 (Epoch 11-30): 解冻ViT+BERT后4层
+#   ✅ Stage 3 (Epoch 31-60): 解冻ViT+BERT后8层
+#   ✅ Stage 4 (Epoch 61-80): 全部解冻，分层学习率
+#
+# CUHK-PEDES特点（相比RSTPReid）：
+#   - 更多类别 (11,003 vs 3,701)
+#   - 更大数据集 (~34k训练样本)
+#   - 更长warmup (800 steps)
+#   - 更大batch_size (96)
+#
+# 预期性能：
+#   - Epoch 10: CLS 8.5 → 4.5-5.5
+#   - Epoch 30: CLS < 2.0, mAP 0.62-0.65
+#   - Epoch 60: mAP 0.65-0.68 (峰值)
+#   - Epoch 80: mAP 0.65-0.68 (稳定)
+# ============================================================================
+
+# 清理缓存
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 find . -type f -name "*.pyo" -delete 2>/dev/null || true
-find . -type f -name "*.pyd" -delete 2>/dev/null || true
-
-# ============================================================================
-# CUHK-PEDES Training Script with G-S3 Module (Optimized)
-# ============================================================================
-# 数据集特征：
-#   - 训练样本: 34,054 images, 11,003 identities
-#   - 最大、最复杂的数据集
-#   - 需要更强的正则化和更长的训练时间
-#
-# 优化策略：
-#   1. 较大batch size (96) 利用数据规模
-#   2. 更强的dropout (0.15) 防止过拟合
-#   3. 更高的weight decay (0.002) 
-#   4. 使用AdamW优化器，更好的权重衰减
-#   5. Warmup 1000步，充分预热
-#
-# 渐进解冻策略 (Progressive Unfreezing Strategy):
-#   Stage 1 (Epoch 1-5):   冻结所有BERT+ViT，只训练任务模块
-#   Stage 2 (Epoch 6-20):  解冻BERT+ViT后4层 (layer 8-11)
-#   Stage 3 (Epoch 21-40): 解冻BERT+ViT后8层 (layer 4-11)
-#   Stage 4 (Epoch 41-60): 解冻所有BERT+ViT层
-#   Stage 5 (Epoch 61-80): 降低学习率精细微调
-# ============================================================================
 
 python scripts/train.py \
     --root datasets \
@@ -37,7 +35,7 @@ python scripts/train.py \
     --weight-decay 0.002 \
     --epochs 80 \
     --milestones 40 60 \
-    --warmup-step 1000 \
+    --warmup-step 800 \
     --workers 8 \
     --height 224 \
     --width 224 \
@@ -59,9 +57,9 @@ python scripts/train.py \
     --id-projection-dim 768 \
     --cloth-projection-dim 768 \
     --loss-info-nce 1.0 \
-    --loss-cls 0.05 \
-    --loss-cloth-semantic 0.6 \
-    --loss-orthogonal 0.15 \
-    --loss-gate-adaptive 0.08 \
+    --loss-cls 0.1 \
+    --loss-cloth-semantic 0.15 \
+    --loss-orthogonal 0.3 \
+    --loss-gate-adaptive 0.02 \
     --optimizer "AdamW" \
     --scheduler "cosine"

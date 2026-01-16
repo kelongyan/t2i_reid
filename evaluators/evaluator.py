@@ -101,18 +101,20 @@ class Evaluator:
             with torch.amp.autocast('cuda', enabled=self.args.fp16):
                 outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-                # 训练时模型返回 10 个输出（不包含注意力图）
-                if len(outputs) != 10:
-                    raise ValueError(f"Expected 10 model outputs during validation, got {len(outputs)}")
+                # 模型返回 11 个输出（包含id_cls_features）
+                if len(outputs) != 11:
+                    raise ValueError(f"Expected 11 model outputs during validation, got {len(outputs)}")
 
                 image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-                cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights = outputs
+                cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights, \
+                id_cls_features = outputs
 
                 loss_dict = self.combined_loss(
                     image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                     id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                     cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                    pids=pid, is_matched=is_matched, epoch=None, gate=gate
+                    pids=pid, is_matched=is_matched, epoch=None, gate=gate,
+                    id_cls_features=id_cls_features
                 )
 
             # Update loss records

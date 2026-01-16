@@ -1,33 +1,15 @@
 #!/bin/bash
 
-# 清理__pycache__缓存文件
+# ============================================================================
+# ICFG-PEDES Training Script - 深度重构版本
+# ============================================================================
+# 实施P0+P1+P2方案，修复损失函数问题
+# ============================================================================
+
+# 清理缓存
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 find . -type f -name "*.pyo" -delete 2>/dev/null || true
-find . -type f -name "*.pyd" -delete 2>/dev/null || true
-
-# ============================================================================
-# ICFG-PEDES Training Script with G-S3 Module (Optimized)
-# ============================================================================
-# 数据集特征：
-#   - 训练样本: ~54,000 images, 4,102 identities
-#   - 跨数据集，domain gap较大
-#   - 需要强泛化能力
-#
-# 优化策略：
-#   1. 大batch size (112) 利用大规模数据
-#   2. 较高的dropout (0.18) 应对domain gap
-#   3. 更强的正交约束 (0.2) 增强解耦
-#   4. 增加Mamba层数 (3层) 增强建模能力
-#   5. 较低的cls权重 (0.03) 因为跨域分类难度高
-#
-# 渐进解冻策略 (Progressive Unfreezing Strategy):
-#   Stage 1 (Epoch 1-5):   冻结所有BERT+ViT，只训练任务模块
-#   Stage 2 (Epoch 6-20):  解冻BERT+ViT后4层 (layer 8-11)
-#   Stage 3 (Epoch 21-40): 解冻BERT+ViT后8层 (layer 4-11)
-#   Stage 4 (Epoch 41-60): 解冻所有BERT+ViT层
-#   Stage 5 (Epoch 61-80): 降低学习率精细微调
-# ============================================================================
 
 python scripts/train.py \
     --root datasets \
@@ -58,10 +40,10 @@ python scripts/train.py \
     --fusion-dropout 0.18 \
     --id-projection-dim 768 \
     --cloth-projection-dim 768 \
-    --loss-info-nce 1.5 \
-    --loss-cls 0.03 \
-    --loss-cloth-semantic 0.7 \
-    --loss-orthogonal 0.2 \
-    --loss-gate-adaptive 0.1 \
+    --loss-info-nce 1.0 \
+    --loss-cls 0.5 \
+    --loss-cloth-semantic 0.1 \
+    --loss-orthogonal 0.8 \
+    --loss-gate-adaptive 0.05 \
     --optimizer "AdamW" \
     --scheduler "cosine"

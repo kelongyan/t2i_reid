@@ -7,6 +7,7 @@ from transformers import BertModel, BertTokenizer, ViTModel
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
 from .gs3_module import GS3Module
+from .residual_classifier import ResidualClassifier, DeepResidualClassifier
 
 # 设置transformers库的日志级别为ERROR，减少不必要的日志输出
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -110,11 +111,9 @@ class Model(nn.Module):
         # 初始化图像编码器
         self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
 
-        # 初始化 G-S3 特征分离模块（魔改版本）
-        # 可通过配置选择使用简化版本(DisentangleModule)或G-S3版本
+        # 初始化 G-S3 特征分离模块
         disentangle_type = net_config.get('disentangle_type', 'gs3')
         if disentangle_type == 'gs3':
-            # 使用增强的 G-S3 模块
             gs3_config = net_config.get('gs3', {})
             self.disentangle = GS3Module(
                 dim=self.text_width,
@@ -125,29 +124,73 @@ class Model(nn.Module):
             )
             logging.info("Using G-S3 (Geometry-Guided Selective State Space) disentangle module")
         else:
-            # 使用简化版本（消融实验）
             self.disentangle = DisentangleModule(dim=self.text_width)
             logging.info("Using simplified disentangle module")
 
-        # 初始化身份分类器
-        self.id_classifier = nn.Linear(self.text_width, num_classes)
-
-        # 初始化共享MLP
+        # ================================================================
+        # === 方案C：分支解耦 - 为分类和检索使用不同的特征分支 ===
+        # ================================================================
+        
+        # === 分支1：专用于分类的id特征处理 ===
+        # 使用残差分类器（方案B）提取判别性特征
+        classifier_config = net_config.get('classifier', {})
+        classifier_type = classifier_config.get('type', 'residual')  # 'residual' or 'deep_residual'
+        
+        if classifier_type == 'deep_residual':
+            # 深层残差分类器（适合大数据集）
+            self.id_for_classification = DeepResidualClassifier(
+                in_dim=self.text_width,      # 768
+                hidden_dim=2048,              # 更高的中间维度
+                output_dim=1024,              # 输出到1024维
+                num_blocks=3,                 # 3个残差块
+                dropout=0.25
+            )
+            logging.info("Using DeepResidualClassifier for classification branch")
+        else:
+            # 标准残差分类器（默认）
+            self.id_for_classification = ResidualClassifier(
+                in_dim=self.text_width,      # 768
+                hidden_dim=1536,              # 中间维度
+                output_dim=1024,              # 输出到1024维
+                num_blocks=2,                 # 2个残差块
+                dropout=0.2
+            )
+            logging.info("Using ResidualClassifier for classification branch")
+        
+        # 身份分类器：从1024维映射到类别数
+        # 这里只需要一个简单的线性层，因为id_for_classification已经提取了高质量特征
+        self.id_classifier = nn.Linear(1024, num_classes)
+        
+        # === 分支2：专用于检索的id特征处理（保持原有设计）===
+        # 共享MLP：用于降维
+        # === 分支2：专用于检索的id特征处理（保持原有设计）===
+        # 共享MLP：用于降维
         self.shared_mlp = nn.Linear(self.text_width, 512)
 
-        # 初始化图像特征MLP
+        # 图像特征MLP：多层映射
         self.image_mlp = nn.Sequential(
             nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(256, 256)
         )
 
-        # 初始化文本特征MLP
+        # 文本特征MLP：多层映射
         self.text_mlp = nn.Sequential(
             nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(256, 256)
         )
+        
+        # === 分支3：cloth特征处理（共享检索分支的MLP）===
+        # cloth_embeds也使用shared_mlp和image_mlp进行投影
+        # 这样可以确保cloth特征和id特征在同一空间中对比
+        
+        logging.info("=" * 60)
+        logging.info("Branch Decoupling Architecture:")
+        logging.info(f"  - Classification Branch: {self.text_width} → {1024} → {num_classes}")
+        logging.info(f"  - Retrieval Branch: {self.text_width} → 512 → 256")
+        logging.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
+        logging.info("=" * 60)
 
         # 修改为 3 层文本自注意力模块
         self.text_attn_layers = nn.ModuleList([
@@ -170,6 +213,12 @@ class Model(nn.Module):
 
         # 文本分词结果缓存
         self.text_cache = {}
+    
+    def _count_classifier_params(self):
+        """计算分类分支的参数量"""
+        params = sum(p.numel() for p in self.id_for_classification.parameters())
+        params += sum(p.numel() for p in self.id_classifier.parameters())
+        return params
 
     def encode_image(self, image):
         """
@@ -266,6 +315,13 @@ class Model(nn.Module):
     def forward(self, image=None, cloth_instruction=None, id_instruction=None, return_attention=False):
         """
         前向传播，处理图像和文本输入，输出多模态特征和分类结果。
+        
+        === 重构后的流程（分支解耦）===
+        1. ViT编码 → image_embeds [B, 197, 768]
+        2. G-S3解耦 → id_embeds, cloth_embeds [B, 768]
+        3. 分支1（分类）：id_embeds → id_for_classification → id_logits
+        4. 分支2（检索）：id_embeds → shared_mlp → image_mlp → image_embeds
+        5. 分支3（cloth）：cloth_embeds → shared_mlp → image_mlp → cloth_image_embeds
 
         Args:
             image (torch.Tensor, optional): 输入图像，形状为 [batch_size, channels, height, width]。
@@ -275,42 +331,64 @@ class Model(nn.Module):
 
         Returns:
             tuple: (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
-                    cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights)
+                    cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights,
+                    id_cls_features)  # 新增：分类分支的中间特征
                    或包含注意力图的扩展元组
         """
         device = next(self.parameters()).device
         id_logits, id_embeds, cloth_embeds, gate = None, None, None, None
         id_attn_map, cloth_attn_map = None, None
+        id_cls_features = None  # 新增：分类分支的中间特征
         
         if image is not None:
             if image.dim() == 5:
                 image = image.squeeze(-1)
             image = image.to(device)
             image_outputs = self.visual_encoder(image)
-            image_embeds = image_outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+            image_embeds_raw = image_outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
             
-            # 调用解耦模块，支持返回注意力图
+            # ============================================================
+            # 步骤1：G-S3解耦，得到id和cloth特征
+            # ============================================================
             if return_attention:
-                id_embeds, cloth_embeds, gate, id_attn_map, cloth_attn_map = self.disentangle(image_embeds, return_attention=True)
+                id_embeds, cloth_embeds, gate, id_attn_map, cloth_attn_map = self.disentangle(
+                    image_embeds_raw, return_attention=True)
             else:
-                id_embeds, cloth_embeds, gate = self.disentangle(image_embeds, return_attention=False)
+                id_embeds, cloth_embeds, gate = self.disentangle(
+                    image_embeds_raw, return_attention=False)
             
             # 存储中间特征用于调试（仅在 debug 模式下）
             if hasattr(self, '_debug_mode') and self._debug_mode:
                 self._debug_features = {
-                    'image_embeds_raw': image_embeds,
+                    'image_embeds_raw': image_embeds_raw,
                     'id_embeds': id_embeds,
                     'cloth_embeds': cloth_embeds,
                     'gate': gate
                 }
-                # 如果使用 G-S3 模块，也记录其内部状态
                 if hasattr(self.disentangle, '_debug_info'):
                     self._debug_features.update(self.disentangle._debug_info)
             
-            id_logits = self.id_classifier(id_embeds)
+            # ============================================================
+            # 步骤2：分支1 - 分类分支（独立优化）
+            # ============================================================
+            # id_embeds [B, 768] → id_for_classification [B, 1024]
+            id_cls_features = self.id_for_classification(id_embeds)
+            
+            # id_cls_features [B, 1024] → id_logits [B, num_classes]
+            id_logits = self.id_classifier(id_cls_features)
+            
+            # ============================================================
+            # 步骤3：分支2 - 检索分支（用于info_nce）
+            # ============================================================
+            # id_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             image_embeds = self.shared_mlp(id_embeds)
             image_embeds = self.image_mlp(image_embeds)
             image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1)
+            
+            # ============================================================
+            # 步骤4：分支3 - cloth检索分支（用于cloth_semantic）
+            # ============================================================
+            # cloth_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             cloth_image_embeds = self.shared_mlp(cloth_embeds)
             cloth_image_embeds = self.image_mlp(cloth_image_embeds)
             cloth_image_embeds = torch.nn.functional.normalize(cloth_image_embeds, dim=-1)
@@ -318,15 +396,23 @@ class Model(nn.Module):
             image_embeds = None
             cloth_image_embeds = None
         
+        # ============================================================
+        # 步骤5：文本编码和融合
+        # ============================================================
         cloth_text_embeds = self.encode_text(cloth_instruction)
         id_text_embeds = self.encode_text(id_instruction)
+        
         fused_embeds, gate_weights = None, None
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
             fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
             fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1)
         
+        # ============================================================
+        # 返回值（新增id_cls_features）
+        # ============================================================
         base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
-                       cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights)
+                       cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights,
+                       id_cls_features)  # 新增：用于高级损失（如center loss）
         
         if return_attention:
             return base_outputs + (id_attn_map, cloth_attn_map)
