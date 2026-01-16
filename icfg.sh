@@ -26,6 +26,8 @@ python scripts/train.py \
     --print-freq 50 \
     --fp16 \
     --num-classes 4102 \
+    --vision-backbone vim \
+    --vim-pretrained "pretrained/Vision Mamba/vim_s_midclstok.pth" \
     --disentangle-type gs3 \
     --gs3-num-heads 12 \
     --gs3-d-state 24 \

@@ -210,8 +210,13 @@ class Trainer:
                     elif self.monitor and i % 100 == 0:
                         self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
 
-                    self.scaler.step(optimizer)
-                    self.scaler.update()
+                    # 检查是否有有效梯度
+                    has_grads = any(p.grad is not None for group in optimizer.param_groups for p in group['params'])
+                    if has_grads:
+                        self.scaler.step(optimizer)
+                        self.scaler.update()
+                    else:
+                        logging.warning(f"⚠️  Skipping step at epoch {epoch} batch {i}: No gradients found (likely due to NaN loss).")
                 else:
                     loss.backward()
                     

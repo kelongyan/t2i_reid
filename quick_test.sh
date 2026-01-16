@@ -1,13 +1,13 @@
 #!/bin/bash
 
 # ============================================================================
-# Quick Test Script - 方案B详细验证（15 epochs）
+# Quick Test Script - 方案B详细验证（15 epochs）- Vim 版本
 # ============================================================================
 # 验证渐进解冻策略的完整效果
 #
 # 训练范围：
-#   - Epoch 1-10:  Stage 1 (ViT后4层解冻)
-#   - Epoch 11-15: Stage 2开始 (ViT+BERT后4层解冻)
+#   - Epoch 1-10:  Stage 1 (Vim后4层解冻, layers 20-23)
+#   - Epoch 11-15: Stage 2开始 (Vim后8层 + BERT后4层)
 #
 # 预期效果：
 #   Stage 1 (Epoch 1-10):
@@ -39,7 +39,7 @@ find . -type f -name "*.pyo" -delete 2>/dev/null || true
 
 echo ""
 echo "========================================"
-echo "🚀 Quick Test - 15 Epochs (RSTPReid)"
+echo "🚀 Quick Test (Vim) - 15 Epochs (RSTPReid)"
 echo "========================================"
 echo "📋 测试目标:"
 echo "  ✓ 验证Stage 1完整效果 (Epoch 1-10)"
@@ -64,8 +64,9 @@ python scripts/train.py \
     --height 224 \
     --width 224 \
     --print-freq 50 \
-    --fp16 \
     --num-classes 3701 \
+    --vision-backbone vim \
+    --vim-pretrained "pretrained/Vision Mamba/vim_s_midclstok.pth" \
     --disentangle-type gs3 \
     --gs3-num-heads 8 \
     --gs3-d-state 20 \

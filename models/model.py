@@ -8,6 +8,7 @@ from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
 from .gs3_module import GS3Module
 from .residual_classifier import ResidualClassifier, DeepResidualClassifier
+from .vim import VisionMamba
 
 # 设置transformers库的日志级别为ERROR，减少不必要的日志输出
 logging.getLogger("transformers").setLevel(logging.ERROR)
@@ -109,7 +110,35 @@ class Model(nn.Module):
         self.text_width = self.text_encoder.config.hidden_size  # BERT隐藏层维度（768）
 
         # 初始化图像编码器
-        self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
+        self.vision_backbone_type = net_config.get('vision_backbone', 'vit')
+        if self.vision_backbone_type == 'vim':
+            # Vision Mamba (Vim-S)
+            vim_pretrained_path = net_config.get('vim_pretrained', 'pretrained/Vision Mamba/vim_s_midclstok.pth')
+            self.visual_encoder = VisionMamba(img_size=224, patch_size=16, embed_dim=384, depth=24)
+            
+            # 加载 Vim 预训练权重
+            if Path(vim_pretrained_path).exists():
+                # weights_only=False 以支持加载包含 argparse.Namespace 的 checkpoint
+                checkpoint = torch.load(vim_pretrained_path, map_location='cpu', weights_only=False)
+                # 提取模型权重 (处理 checkpoint 包含 'model' 键的情况)
+                state_dict = checkpoint.get('model', checkpoint)
+                # 加载权重 (非严格模式，允许部分不匹配，如头部)
+                missing, unexpected = self.visual_encoder.load_state_dict(state_dict, strict=False)
+                logging.info(f"Loaded Vim backbone from {vim_pretrained_path}")
+                if missing:
+                    logging.warning(f"Missing keys in Vim: {missing}")
+            else:
+                logging.warning(f"Vim pretrained path not found: {vim_pretrained_path}. Using random init.")
+            
+            # 投影层：将 Vim 的 384 维映射到 768 维以适配后续模块
+            self.visual_proj = nn.Linear(384, self.text_width)
+            logging.info("Using Vision Mamba (Vim-S) backbone with projection (384->768)")
+            
+        else:
+            # ViT-Base (默认)
+            self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
+            self.visual_proj = nn.Identity() # ViT 输出已经是 768，无需投影
+            logging.info("Using ViT-Base backbone")
 
         # 初始化 G-S3 特征分离模块
         disentangle_type = net_config.get('disentangle_type', 'gs3')
@@ -222,7 +251,7 @@ class Model(nn.Module):
 
     def encode_image(self, image):
         """
-        编码图像，提取图像特征并进行标准化，使用 ViT 整个序列。
+        编码图像，提取图像特征并进行标准化，使用 ViT/Vim 整个序列。
 
         Args:
             image (torch.Tensor): 输入图像，形状为 [batch_size, channels, height, width] 或更高维。
@@ -236,9 +265,21 @@ class Model(nn.Module):
         if image.dim() == 5:
             image = image.squeeze(-1)
         image = image.to(device)
-        image_outputs = self.visual_encoder(image)
-        image_embeds = image_outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
-        id_embeds, _, _ = self.disentangle(image_embeds)  # [batch_size, hidden_size]
+        
+        # 获取图像特征
+        if self.vision_backbone_type == 'vim':
+            # Vim 返回 [batch_size, seq_len, 384]
+            image_embeds_raw = self.visual_encoder(image)
+        else:
+            # ViT 返回 BaseModelOutput，取 last_hidden_state [batch_size, seq_len, 768]
+            image_outputs = self.visual_encoder(image)
+            image_embeds_raw = image_outputs.last_hidden_state
+            
+        # 投影到统一维度 (如果是 Vim: 384->768; 如果是 ViT: Identity)
+        image_embeds_raw = self.visual_proj(image_embeds_raw)
+        
+        # 后续处理保持不变 (解耦 -> 检索MLP -> 归一化)
+        id_embeds, _, _ = self.disentangle(image_embeds_raw)  # [batch_size, hidden_size]
         image_embeds = self.shared_mlp(id_embeds)
         image_embeds = self.image_mlp(image_embeds)
         image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1)
@@ -344,8 +385,16 @@ class Model(nn.Module):
             if image.dim() == 5:
                 image = image.squeeze(-1)
             image = image.to(device)
-            image_outputs = self.visual_encoder(image)
-            image_embeds_raw = image_outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+            
+            # === 获取图像原始特征 ===
+            if self.vision_backbone_type == 'vim':
+                image_embeds_raw = self.visual_encoder(image) # [B, 197, 384]
+            else:
+                image_outputs = self.visual_encoder(image)
+                image_embeds_raw = image_outputs.last_hidden_state  # [B, 197, 768]
+            
+            # === 维度对齐 (Vim 384 -> 768, ViT 768 -> 768) ===
+            image_embeds_raw = self.visual_proj(image_embeds_raw)
             
             # ============================================================
             # 步骤1：G-S3解耦，得到id和cloth特征
@@ -430,7 +479,7 @@ class Model(nn.Module):
             T2IReIDModel: 加载参数后的模型。
         """
         trained_path = Path(trained_path)
-        checkpoint = torch.load(trained_path, map_location='cpu', weights_only=True)
+        checkpoint = torch.load(trained_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
         self = copy_state_dict(state_dict, self)
         logging.info(f"Loaded checkpoint from {trained_path}, scale: {self.scale.item():.4f}")

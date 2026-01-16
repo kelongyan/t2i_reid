@@ -56,6 +56,10 @@ def parse_args():
     parser.add_argument('--workers', type=int, default=0, help='Number of data loading workers')
     parser.add_argument('--fp16', action='store_true', help='Use mixed precision evaluation')
     parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'logs'), help='Directory for logs')
+    parser.add_argument('--vision-backbone', type=str, default='vim', choices=['vit', 'vim'],
+                       help='Vision backbone type: vit or vim')
+    parser.add_argument('--vim-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'Vision Mamba' / 'vim_s_midclstok.pth'),
+                       help='Path to Vision Mamba model')
 
     
     # G-S3 module parameters (for model initialization)
@@ -148,6 +152,8 @@ def main():
     # 初始化模型
     net_config = args.model.copy()
     net_config['num_classes'] = args.num_classes
+    net_config['vision_backbone'] = args.vision_backbone
+    net_config['vim_pretrained'] = args.vim_pretrained
     # 添加 G-S3 配置
     net_config['disentangle_type'] = args.disentangle_type
     net_config['gs3'] = {
@@ -159,7 +165,7 @@ def main():
     model = Model(net_config=net_config)
 
     # 加载检查点
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
     
     if 'id_classifier.weight' in state_dict and state_dict['id_classifier.weight'].shape[0] != net_config['num_classes']:
@@ -171,7 +177,7 @@ def main():
     model = model.to(device)
 
     # 执行评估
-    evaluator = Evaluator_t2i(model, args=args)
+    evaluator = Evaluator(model, args=args)
     with torch.amp.autocast('cuda', enabled=args.fp16):
         metrics = evaluator.evaluate(
             query_loader,

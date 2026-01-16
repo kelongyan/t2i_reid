@@ -282,6 +282,8 @@ class Loss(nn.Module):
         for key, value in losses.items():
             if isinstance(value, torch.Tensor):
                 if torch.isnan(value).any() or torch.isinf(value).any():
+                    import logging
+                    logging.warning(f"⚠️  WARNING: Loss '{key}' contains NaN/Inf! Resetting to 0.0.")
                     losses[key] = torch.tensor(0.0, device=value.device, requires_grad=True)
         
         # === 加权求和 ===

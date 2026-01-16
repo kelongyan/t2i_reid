@@ -42,6 +42,10 @@ def configuration():
                        help='Path to BERT model')
     parser.add_argument('--vit-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'vit-base-patch16-224'),
                        help='Path to ViT model')
+    parser.add_argument('--vision-backbone', type=str, default='vim', choices=['vit', 'vim'],
+                       help='Vision backbone type: vit or vim')
+    parser.add_argument('--vim-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'Vision Mamba' / 'vim_s_midclstok.pth'),
+                       help='Path to Vision Mamba model')
     parser.add_argument('--logs-dir', type=str, default=str(ROOT_DIR / 'log'), help='Directory for logs')
     parser.add_argument('--num-classes', type=int, default=8000, help='Number of identity classes')
 
@@ -293,61 +297,110 @@ class Runner:
     
     def freeze_vit_layers(self, model, unfreeze_from_layer=None):
         """
-        冻结/解冻ViT的指定层（基于实际ViT-Base 12层结构）
+        冻结/解冻ViT或Vim的指定层
+        
+        ViT-Base: 12层 (encoder.layer.X)
+        Vim-S: 24层 (layers.X)
         
         Args:
-            unfreeze_from_layer=None: 冻结所有ViT层
-            unfreeze_from_layer=8: 解冻layer 8-11（后4层）
-            unfreeze_from_layer=4: 解冻layer 4-11（后8层）
-            unfreeze_from_layer=0: 解冻所有12层 (layer 0-11)
+            unfreeze_from_layer:
+                对于ViT (12层):
+                - None: 全冻结
+                - 8: 解冻 8-11 (后4层)
+                - 4: 解冻 4-11 (后8层)
+                - 0: 全解冻
+                
+                对于Vim (24层) - 自动映射:
+                - None: 全冻结
+                - 8 -> 映射为 16 (解冻 16-23, 后8层) -> 等等，保持比例
+                  为了简化逻辑，我们按照"后N层"的概念:
+                  Stage 1 (ViT后4层) -> Vim后4层 (20-23)
+                  Stage 2 (ViT后8层) -> Vim后8层 (16-23)
+                  Stage 3 (ViT后8层) -> Vim后12层 (12-23) ? 
+                  Let's align by ratio or fixed blocks.
+                  
+                  定义映射:
+                  unfreeze_from_layer=8 (ViT 8/12, last 4) -> Vim 20/24 (last 4)
+                  unfreeze_from_layer=4 (ViT 4/12, last 8) -> Vim 16/24 (last 8)
+                  unfreeze_from_layer=0 (ViT 0/12, all)    -> Vim 0/24 (all)
         """
-        # 步骤1: 先冻结所有ViT参数
+        is_vim = getattr(model, 'vision_backbone_type', 'vit') == 'vim'
+        total_layers = 24 if is_vim else 12
+        
+        # 确定解冻的起始层索引
+        target_start_layer = None
+        if unfreeze_from_layer is not None:
+            if unfreeze_from_layer == 0:
+                target_start_layer = 0
+            elif unfreeze_from_layer == 8: # ViT后4层
+                target_start_layer = total_layers - 4 # Vim: 20, ViT: 8
+            elif unfreeze_from_layer == 4: # ViT后8层
+                target_start_layer = total_layers - 8 # Vim: 16, ViT: 4
+            else:
+                # 默认映射
+                target_start_layer = unfreeze_from_layer if not is_vim else unfreeze_from_layer * 2
+
+        # 步骤1: 先冻结所有视觉编码器参数
         for name, param in model.named_parameters():
             if 'visual_encoder' in name:
                 param.requires_grad = False
+                # 投影层始终训练
+                if 'visual_proj' in name:
+                    param.requires_grad = True
         
-        # 步骤2: 如果指定了解冻层，则解冻对应的层
-        if unfreeze_from_layer is not None:
+        # 步骤2: 解冻指定层
+        if target_start_layer is not None:
             unfrozen_count = 0
             for name, param in model.named_parameters():
                 if 'visual_encoder' in name:
-                    # 当完全解冻时(unfreeze_from_layer=0)，解冻embeddings
-                    if unfreeze_from_layer == 0 and 'embeddings' in name:
+                    # 解冻embeddings (当完全解冻时)
+                    if target_start_layer == 0 and ('embeddings' in name or 'patch_embed' in name or 'cls_token' in name or 'pos_embed' in name):
+                        param.requires_grad = True
+                        unfrozen_count += 1
+                        continue
+
+                    # 识别层号
+                    layer_num = -1
+                    if is_vim:
+                        # Vim命名: visual_encoder.layers.X
+                        if 'layers.' in name:
+                            try:
+                                parts = name.split('layers.')[1].split('.')
+                                layer_num = int(parts[0])
+                            except (IndexError, ValueError):
+                                pass
+                    else:
+                        # ViT命名: visual_encoder.encoder.layer.X
+                        if 'encoder.layer.' in name:
+                            try:
+                                parts = name.split('encoder.layer.')[1].split('.')
+                                layer_num = int(parts[0])
+                            except (IndexError, ValueError):
+                                pass
+                    
+                    # 判断是否解冻
+                    if layer_num != -1 and layer_num >= target_start_layer:
                         param.requires_grad = True
                         unfrozen_count += 1
                     
-                    # 解冻指定层及其之后的所有层
-                    # ViT使用BERT风格命名: encoder.layer.X (X=0-11)
-                    if 'encoder.layer.' in name:
-                        try:
-                            # 提取层号 (例如: "encoder.layer.8.attention..." -> 8)
-                            parts = name.split('encoder.layer.')[1].split('.')
-                            layer_num = int(parts[0])
-                            
-                            # 验证层号范围 (0-11)
-                            if 0 <= layer_num <= 11 and layer_num >= unfreeze_from_layer:
-                                param.requires_grad = True
-                                unfrozen_count += 1
-                        except (IndexError, ValueError) as e:
-                            logging.warning(f"Could not parse ViT layer number from: {name}, error: {e}")
-                            continue
-                    
-                    # 解冻layernorm和pooler（如果完全解冻）
-                    if unfreeze_from_layer == 0:
-                        if 'layernorm' in name or 'pooler' in name:
+                    # 解冻最后的Norm层 (如果完全解冻或部分解冻)
+                    # Vim: norm_f, ViT: layernorm/pooler
+                    if target_start_layer == 0 or target_start_layer < total_layers:
+                        if is_vim and 'norm_f' in name:
                             param.requires_grad = True
-                            unfrozen_count += 1
-            
-            logging.info(f"ViT: Unfrozen {unfrozen_count} parameter groups from layer {unfreeze_from_layer}")
+                        elif not is_vim and ('layernorm' in name or 'pooler' in name):
+                            param.requires_grad = True
+
+            logging.info(f"{'Vim' if is_vim else 'ViT'}: Unfrozen params from layer {target_start_layer}/{total_layers}")
         else:
-            logging.info(f"ViT: All layers frozen")
+            logging.info(f"{'Vim' if is_vim else 'ViT'}: All layers frozen")
         
-        # 步骤3: 统计并记录可训练参数
+        # 步骤3: 统计
         vit_trainable = sum(p.numel() for n, p in model.named_parameters() 
                            if p.requires_grad and 'visual_encoder' in n)
         vit_total = sum(p.numel() for n, p in model.named_parameters() if 'visual_encoder' in n)
         
-        logging.info(f"ViT: {vit_trainable:,}/{vit_total:,} trainable ({100*vit_trainable/vit_total:.1f}%)")
+        logging.info(f"Visual Encoder: {vit_trainable:,}/{vit_total:,} trainable ({100*vit_trainable/vit_total:.1f}%)")
         
         # 总体统计
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -357,18 +410,15 @@ class Runner:
     def get_param_groups_with_diff_lr(self, model, base_lr, stage):
         """
         为不同的模块设置不同的学习率（方案B：渐进解冻）
+        支持 ViT (12层) 和 Vim (24层)
         
-        关键修复：只收集requires_grad=True的参数！
-        
-        Stage划分:
-        - Stage 1 (Epoch 1-10): ViT layer 8-11 + 任务模块
-        - Stage 2 (Epoch 11-30): ViT layer 8-11, BERT layer 8-11 + 任务模块  
-        - Stage 3 (Epoch 31-60): ViT layer 4-11, BERT layer 4-11 + 任务模块
-        - Stage 4 (Epoch 61-80): 全部解冻，分层学习率
-        
-        Args:
-            stage: 训练阶段 (1-4)
+        Vim 分组映射:
+        - Low: layers 0-7
+        - Mid: layers 8-15
+        - High: layers 16-23
         """
+        is_vim = getattr(model, 'vision_backbone_type', 'vit') == 'vim'
+        
         # 初始化参数组
         bert_embed_params = []
         bert_low_params = []     # BERT layer 0-3
@@ -377,12 +427,12 @@ class Runner:
         bert_other_params = []
         
         vit_embed_params = []
-        vit_low_params = []      # ViT layer 0-3
-        vit_mid_params = []      # ViT layer 4-7
-        vit_high_params = []     # ViT layer 8-11
+        vit_low_params = []      # ViT 0-3 / Vim 0-7
+        vit_mid_params = []      # ViT 4-7 / Vim 8-15
+        vit_high_params = []     # ViT 8-11 / Vim 16-23
         vit_other_params = []
         
-        task_params = []         # G-S3, Fusion, Classifier等
+        task_params = []         # G-S3, Fusion, Classifier, Projection等
         
         for name, param in model.named_parameters():
             # 【关键修复】跳过冻结的参数
@@ -411,29 +461,57 @@ class Runner:
                 else:
                     task_params.append(param)
             
-            # 处理ViT参数
+            # 处理视觉编码器参数 (ViT or Vim)
             elif 'visual_encoder' in name:
-                if 'embeddings' in name:
+                # Embeddings
+                if 'embeddings' in name or 'patch_embed' in name or 'cls_token' in name or 'pos_embed' in name:
                     vit_embed_params.append(param)
-                elif 'encoder.layer.' in name:
+                    continue
+                    
+                # Layers
+                layer_num = -1
+                if is_vim and 'layers.' in name: # Vim: layers.X
+                    try:
+                        parts = name.split('layers.')[1].split('.')
+                        layer_num = int(parts[0])
+                    except (IndexError, ValueError):
+                        pass
+                elif not is_vim and 'encoder.layer.' in name: # ViT: encoder.layer.X
                     try:
                         parts = name.split('encoder.layer.')[1].split('.')
                         layer_num = int(parts[0])
-                        
+                    except (IndexError, ValueError):
+                        pass
+                
+                if layer_num != -1:
+                    if is_vim:
+                        # Vim 24 layers grouping
+                        if 0 <= layer_num <= 7:
+                            vit_low_params.append(param)
+                        elif 8 <= layer_num <= 15:
+                            vit_mid_params.append(param)
+                        elif 16 <= layer_num <= 23:
+                            vit_high_params.append(param)
+                        else:
+                            vit_other_params.append(param)
+                    else:
+                        # ViT 12 layers grouping
                         if 0 <= layer_num <= 3:
                             vit_low_params.append(param)
                         elif 4 <= layer_num <= 7:
                             vit_mid_params.append(param)
                         elif 8 <= layer_num <= 11:
                             vit_high_params.append(param)
-                    except (IndexError, ValueError):
-                        task_params.append(param)
-                elif 'layernorm' in name or 'pooler' in name:
+                        else:
+                            vit_other_params.append(param)
+                # Other parts (Norms etc.)
+                elif 'layernorm' in name or 'pooler' in name or 'norm_f' in name:
                     vit_other_params.append(param)
                 else:
+                    # 无法分类的视觉参数放入 task_params 或其他
                     task_params.append(param)
             
-            # 其他参数（任务特定模块）
+            # 其他参数（任务特定模块 + 投影层）
             else:
                 task_params.append(param)
         
@@ -514,7 +592,7 @@ class Runner:
 
     def load_param(self, model, trained_path):
         # 加载预训练模型参数
-        param_dict = torch.load(trained_path, map_location=self.device, weights_only=True)
+        param_dict = torch.load(trained_path, map_location=self.device, weights_only=False)
         param_dict = param_dict.get('state_dict', param_dict.get('model', param_dict))
         model_dict = model.state_dict()
         for i in param_dict:
@@ -640,6 +718,8 @@ class Runner:
         model_config = {
             'bert_base_path': args.bert_base_path,
             'vit_pretrained': args.vit_pretrained,
+            'vision_backbone': args.vision_backbone,
+            'vim_pretrained': args.vim_pretrained,
             'num_classes': args.num_classes,
             'disentangle_type': args.disentangle_type,
             'gs3': {
