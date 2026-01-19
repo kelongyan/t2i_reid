@@ -2,6 +2,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class TextGuidedDecouplingLoss(nn.Module):
+    """
+    文本引导的解耦损失 (Text-Guided Consistency Loss)
+    
+    目标：利用 CLIP 文本编码器的语义信息作为监督，约束视觉特征解耦的语义完整性。
+    逻辑：视觉 ID 特征 + 视觉衣服特征 重新组合后，应该能重建其对应的语义表达。
+    """
+    def __init__(self):
+        super().__init__()
+        self.loss_fn = nn.MSELoss()
+
+    def forward(self, vis_id_feat, vis_cloth_feat, target_feat):
+        """
+        Args:
+            vis_id_feat: 视觉 ID 特征
+            vis_cloth_feat: 视觉衣服特征
+            target_feat: 目标语义特征 (通常是融合后的特征 fused_embeds 或 文本特征)
+        """
+        # 简单的加和重建
+        vis_reconstructed = vis_id_feat + vis_cloth_feat
+        
+        # 归一化后计算距离，更关注方向一致性
+        vis_reconstructed = F.normalize(vis_reconstructed, dim=-1)
+        target_feat = F.normalize(target_feat, dim=-1)
+        
+        reconstruction_loss = self.loss_fn(vis_reconstructed, target_feat)
+        return reconstruction_loss
+
+
 class Loss(nn.Module):
     """
     === 深度重构的损失函数模块 ===
@@ -9,6 +38,7 @@ class Loss(nn.Module):
     - P0: 修复权重失衡（提高cls权重4倍）
     - P1: 动态权重调整（根据训练阶段自适应）
     - P2: 重新设计gate_adaptive（使用对比学习）
+    - P3: 新增文本引导的一致性重构损失 (TextGuidedDecouplingLoss)
     - 修复cloth_semantic去ID正则（添加维度转换）
     """
     def __init__(self, temperature=0.1, weights=None, num_classes=None, logger=None):
@@ -20,15 +50,19 @@ class Loss(nn.Module):
         # 使用Label Smoothing降低分类损失的初始值
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
         
+        # 新增：重构损失
+        self.reconstruction_loss = TextGuidedDecouplingLoss()
+        
         # === 修复方案：合理的初始权重配置 ===
         # 核心原则：让所有加权损失在同一数量级（~1.0）
         self.weights = weights if weights is not None else {
-            'info_nce': 1.0,        # 对比学习 - 主导 (损失~4.0，加权后~4.0)
-            'cls': 0.1,             # 分类损失 (损失~8.0，加权后~0.8，让其慢慢学习)
-            'cloth_semantic': 0.15, # 服装语义 (损失~4.5，加权后~0.7)
-            'orthogonal': 0.3,      # 正交约束 (损失~0.01，加权后~0.003)
-            'gate_adaptive': 0.02,  # 门控自适应 (损失~0.5，加权后~0.01)
-            'diversity': 0.05,      # 门控多样性正则（新增，软门控专用）
+            'info_nce': 1.0,        # 对比学习 - 主导
+            'cls': 0.5,             # 分类损失 (适当提高)
+            'cloth_semantic': 2.0,  # 衣服语义 (强力拉扯)
+            'id_triplet': 1.0,      # ID 一致性
+            'anti_collapse': 1.5,   # 防坍缩 (底线)
+            'gate_adaptive': 0.05,  # 辅助
+            'reconstruction': 0.1,  # 辅助
         }
         
         # 动态权重调整参数
@@ -54,44 +88,39 @@ class Loss(nn.Module):
     
     def update_epoch(self, epoch):
         """
-        === 优化后的动态权重调整 ===
-        核心改进：
-        1. 降低cloth_semantic初始权重（0.15 -> 0.1）
-        2. 降低cls增长速度（0.08+0.002*e -> 0.06+0.001*e）
-        3. 提高gate_adaptive权重（0.02 -> 0.05）
+        === 优化后的动态权重调整 (Relax & Constrain Schedule) ===
         """
         self.current_epoch = epoch
         
         if not self.enable_dynamic_weights:
             return
         
-        # 阶段1 (1-20): 预热期
-        if epoch <= 20:
+        # Stage 1 (Epoch 0-5): 强制生存期
+        # 目标：激活特征，防止全零坍缩
+        if epoch <= 5:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.06 + 0.001 * epoch  # 0.06->0.08 (更慢增长)
-            self.weights['cloth_semantic'] = 0.10  # 降低初始权重
-            self.weights['orthogonal'] = 0.2  # 降低初始权重
-            self.weights['gate_adaptive'] = 0.05  # 提高初始权重
-            self.weights['diversity'] = 0.05
+            self.weights['cls'] = 0.5
+            self.weights['anti_collapse'] = 2.0  # 极高权重，强制特征存在
+            self.weights['cloth_semantic'] = 0.5 # 先不要求太准
+            self.weights['id_triplet'] = 0.5     # 辅助
             
-        # 阶段2 (21-40): 稳定期
-        elif epoch <= 40:
-            progress = (epoch - 20) / 20
+        # Stage 2 (Epoch 6-30): 语义对齐期
+        # 目标：利用 CLIP 赋予特征语义
+        elif epoch <= 30:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.08 + 0.10 * progress  # 0.08->0.18
-            self.weights['cloth_semantic'] = 0.10 + 0.05 * progress  # 0.10->0.15
-            self.weights['orthogonal'] = 0.2 - 0.05 * progress  # 0.2->0.15
-            self.weights['gate_adaptive'] = 0.05 + 0.05 * progress  # 0.05->0.10
-            self.weights['diversity'] = 0.05
+            self.weights['cls'] = 0.5
+            self.weights['anti_collapse'] = 1.0  # 降低约束，允许特征变化
+            self.weights['cloth_semantic'] = 2.0 # 强力语义监督
+            self.weights['id_triplet'] = 1.0     # 增强 ID 一致性
             
-        # 阶段3 (41+): 收敛期
+        # Stage 3 (Epoch 31+): 精细微调期
+        # 目标：平衡解耦与识别
         else:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.20  # 适度降低
-            self.weights['cloth_semantic'] = 0.15
-            self.weights['orthogonal'] = 0.15
-            self.weights['gate_adaptive'] = 0.10
-            self.weights['diversity'] = 0.05
+            self.weights['cls'] = 0.5
+            self.weights['anti_collapse'] = 1.0
+            self.weights['cloth_semantic'] = 1.5 # 适度降低
+            self.weights['id_triplet'] = 1.0     # 保持 ID 约束
     
     def gate_adaptive_loss_v2(self, gate_stats, id_embeds, cloth_embeds, pids):
         """
@@ -258,22 +287,47 @@ class Loss(nn.Module):
         
         return ortho_loss
     
+    def triplet_loss(self, embeds, pids, margin=0.3):
+        """[方案 C] ID 一致性损失：确保同一 ID 在不同衣服下的特征一致性"""
+        if embeds is None or pids is None:
+            return torch.tensor(0.0, device=self._get_device())
+            
+        n = embeds.size(0)
+        # 计算欧氏距离矩阵
+        dist = torch.pow(embeds, 2).sum(dim=1, keepdim=True).expand(n, n)
+        dist = dist + dist.t()
+        dist.addmm_(embeds, embeds.t(), beta=1, alpha=-2)
+        dist = dist.clamp(min=1e-12).sqrt()
+
+        # Hard Mining Mask
+        mask = pids.expand(n, n).eq(pids.expand(n, n).t())
+        
+        # dist_ap: 每个anchor对应的最远正样本距离
+        dist_ap, _ = torch.max(dist * mask.float(), dim=1)
+        # dist_an: 每个anchor对应的最近负样本距离 (mask为0的地方加个大数1e6)
+        dist_an, _ = torch.min(dist * (1. - mask.float()) + 1e6 * mask.float(), dim=1)
+
+        loss = F.relu(dist_ap - dist_an + margin).mean()
+        return loss
+
+    def anti_collapse_loss(self, cloth_embeds, margin=1.0):
+        """[基础保障] 防坍缩正则：确保衣服特征存在，打破零和博弈"""
+        if cloth_embeds is None:
+            return torch.tensor(0.0, device=self._get_device())
+        
+        # 计算 L2 范数
+        norms = torch.norm(cloth_embeds, p=2, dim=-1)
+        # 惩罚模长过小的向量
+        loss = F.relu(margin - norms).mean()
+        return loss
+
     def forward(self, image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                 cloth_embeds, cloth_text_embeds, cloth_image_embeds, pids, 
                 is_matched=None, epoch=None, gate=None,
                 id_seq_features=None, cloth_seq_features=None, saliency_score=None,
-                id_cls_features=None, diversity_loss=None):
+                id_cls_features=None):
         """
         前向传播：计算所有损失
-        
-        === 软门控版本更新 ===
-        1. gate现在是gate_stats (dict)
-        2. 新增diversity_loss参数（从模型传入）
-        
-        Args:
-            gate: 现在是gate_stats字典，包含门控统计信息
-            diversity_loss: 门控多样性损失（从G-S3模块传入）
-            id_cls_features: 分类分支的中间特征 [B, 1024]
         """
         losses = {}
         
@@ -292,24 +346,31 @@ class Loss(nn.Module):
             if id_logits is not None and pids is not None \
             else torch.tensor(0.0, device=self._get_device())
         
-        # 3. 服装语义损失
+        # 3. 服装语义损失 (权重提升)
         losses['cloth_semantic'] = self.cloth_semantic_loss_v2(
             cloth_image_embeds, cloth_text_embeds, id_embeds
         )
         
-        # 4. 正交约束
-        losses['orthogonal'] = self.orthogonal_loss_v2(id_embeds, cloth_embeds)
+        # 4. ID 一致性 Triplet (新增)
+        losses['id_triplet'] = self.triplet_loss(id_embeds, pids)
         
-        # 5. 门控自适应（现在接收gate_stats）
+        # 5. 防坍缩正则 (新增)
+        losses['anti_collapse'] = self.anti_collapse_loss(cloth_embeds, margin=1.0)
+        
+        # 6. 门控自适应 (保留)
         losses['gate_adaptive'] = self.gate_adaptive_loss_v2(
             gate, id_embeds, cloth_embeds, pids
         )
         
-        # 6. 门控多样性正则（软门控新增）
-        if diversity_loss is not None:
-            losses['diversity'] = diversity_loss
+        # 7. 重构损失 (保留，作为辅助)
+        # 修复维度不匹配问题：使用投影后的 256d 特征进行重构
+        # image_embeds (256d) + cloth_image_embeds (256d) -> fused_embeds (256d)
+        if image_embeds is not None and cloth_image_embeds is not None and fused_embeds is not None:
+            losses['reconstruction'] = self.reconstruction_loss(
+                image_embeds, cloth_image_embeds, fused_embeds
+            )
         else:
-            losses['diversity'] = torch.tensor(0.0, device=self._get_device(), requires_grad=True)
+             losses['reconstruction'] = torch.tensor(0.0, device=self._get_device(), requires_grad=True)
         
         # === NaN/Inf检查 ===
         for key, value in losses.items():

@@ -35,7 +35,7 @@ NC='\033[0m' # No Color
 # 解析参数
 CONTINUE_ON_ERROR=false
 TRANSFER_LEARNING=false
-ENABLE_OPTIMIZATIONS=false
+ENABLE_OPTIMIZATIONS=true
 
 for arg in "$@"; do
     case $arg in

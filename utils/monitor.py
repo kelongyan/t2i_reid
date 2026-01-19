@@ -11,34 +11,7 @@ import json
 import os
 import logging
 from pathlib import Path
-
-# 创建logs目录
-LOG_DIR = Path("log")
-DEBUG_LOG_DIR = LOG_DIR / "debug"
-DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# 配置logger
-logger = logging.getLogger('train')
-logger.setLevel(logging.INFO)
-
-# 创建debug logger (详细日志)
-debug_logger = logging.getLogger('train.debug')
-debug_logger.setLevel(logging.DEBUG)
-
-# 配置文件处理器
-file_handler = logging.FileHandler(LOG_DIR / "log.txt", mode='a', encoding='utf-8')
-debug_file_handler = logging.FileHandler(DEBUG_LOG_DIR / "debug.txt", mode='a', encoding='utf-8')
-
-# 配置格式化输出
-formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-file_handler.setFormatter(formatter)
-debug_file_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
-debug_logger.addHandler(debug_file_handler)
-logger.addHandler(logging.StreamHandler())
-# debug_logger.addHandler(logging.StreamHandler())
+import torch.nn.functional as F
 
 class TrainingMonitor:
     """训练监控器，记录训练过程中的各种信息"""
@@ -46,24 +19,31 @@ class TrainingMonitor:
     def __init__(self, dataset_name: str, log_dir: str = "log"):
         self.dataset_name = dataset_name
         self.log_dir = Path(log_dir)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
         
-        # 创建数据集特定的日志目录
-        dataset_log_dir = self.log_dir / dataset_name
-        dataset_log_dir.mkdir(parents=True, exist_ok=True)
+        # 创建数据集特定的日志目录 (log_dir 应该是 log/dataset_name)
+        # 注意：传入的 log_dir 已经是 log/cuhk_pedes 这种形式
+        self.dataset_log_dir = self.log_dir / dataset_name
+        
+        # 如果传入的 log_dir 已经包含了 dataset_name (例如在 train.py 中构造的)，
+        # 我们就不需要再拼一层。这里做一个简单的判断。
+        if self.log_dir.name == dataset_name:
+             self.dataset_log_dir = self.log_dir
+        
+        self.dataset_log_dir.mkdir(parents=True, exist_ok=True)
         
         # 设置日志文件
-        self.log_file = dataset_log_dir / "log.txt"
-        self.debug_log_file = dataset_log_dir / "debug.txt"
-        self.metrics_file = dataset_log_dir / "metrics.json"
+        self.log_file = self.dataset_log_dir / "log.txt"
+        self.debug_log_file = self.dataset_log_dir / "debug.txt"
+        self.metrics_file = self.dataset_log_dir / "metrics.json"
         
-        # 清理旧日志
-        if self.log_file.exists():
-            self.log_file.unlink()
-        if self.debug_log_file.exists():
-            self.debug_log_file.unlink()
+        # 清理旧日志 (可选，根据需求决定是否保留)
+        # if self.log_file.exists():
+        #     self.log_file.unlink()
+        # if self.debug_log_file.exists():
+        #     self.debug_log_file.unlink()
         
         # 设置logger
+        # 使用独立的logger名称，避免冲突
         self.logger = logging.getLogger(f"train.{dataset_name}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
@@ -72,20 +52,24 @@ class TrainingMonitor:
         self.debug_logger.setLevel(logging.DEBUG)
         self.debug_logger.propagate = False
         
-        # 配置handler
-        if not self.logger.handlers:
-            file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
-            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            file_handler.setFormatter(formatter)
-            self.logger.addHandler(file_handler)
-            self.logger.addHandler(logging.StreamHandler())
+        # 清除旧的 handlers (防止重复)
+        if self.logger.hasHandlers():
+            self.logger.handlers.clear()
+        if self.debug_logger.hasHandlers():
+            self.debug_logger.handlers.clear()
         
-        if not self.debug_logger.handlers:
-            debug_file_handler = logging.FileHandler(self.debug_log_file, mode='a', encoding='utf-8')
-            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-            debug_file_handler.setFormatter(formatter)
-            self.debug_logger.addHandler(debug_file_handler)
-            # self.debug_logger.addHandler(logging.StreamHandler())
+        # 配置handler
+        file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
+        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        file_handler.setFormatter(formatter)
+        self.logger.addHandler(file_handler)
+        self.logger.addHandler(logging.StreamHandler())
+        
+        debug_file_handler = logging.FileHandler(self.debug_log_file, mode='a', encoding='utf-8')
+        debug_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        debug_file_handler.setFormatter(debug_formatter)
+        self.debug_logger.addHandler(debug_file_handler)
+        # self.debug_logger.addHandler(logging.StreamHandler()) # Debug不输出到终端
         
         # 存储训练指标
         self.metrics = []
@@ -281,7 +265,7 @@ class TrainingMonitor:
     
     def _format_loss_display(self, loss_meters):
         """【修复】格式化损失显示"""
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'orthogonal', 'gate_adaptive', 'total']
+        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'gate_adaptive', 'reconstruction', 'total']
         hidden_losses = set()
         
         avg_losses = []
@@ -525,14 +509,14 @@ def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> "Trainin
     
     Args:
         dataset_name: 数据集名称 ('cuhk_pedes', 'rstp', 'icfg', 或其他)
-        log_dir: 日志根目录
+        log_dir: 日志根目录 (e.g. 'log')
     
     Returns:
         TrainingMonitor实例
     """
-    # 规范化数据集名称 - 使用与检查点保存一致的命名规则
+    # 规范化数据集名称 - 保持与 train.py 中的 dataset_dir_name 一致
     if 'cuhk' in dataset_name.lower():
-        normalized_name = 'cuhk'
+        normalized_name = 'cuhk_pedes'
     elif 'rstp' in dataset_name.lower():
         normalized_name = 'rstp'
     elif 'icfg' in dataset_name.lower():

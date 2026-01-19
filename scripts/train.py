@@ -86,11 +86,14 @@ def configuration():
 
     # Loss weights
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=0.2, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight')
-    parser.add_argument('--loss-gate-adaptive', type=float, default=0.15, help='Gate adaptive loss weight')
-    parser.add_argument('--loss-diversity', type=float, default=0.05, help='Gate diversity regularization loss weight (soft gating)')
+    parser.add_argument('--loss-cls', type=float, default=0.5, help='Classification loss weight')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=2.0, help='Cloth semantic loss weight')
+    parser.add_argument('--loss-gate-adaptive', type=float, default=0.05, help='Gate adaptive loss weight')
+    
+    # [New] Relax & Constrain Losses
+    parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
+    parser.add_argument('--loss-anti-collapse', type=float, default=1.0, help='Anti-collapse loss weight')
+    parser.add_argument('--loss-reconstruction', type=float, default=0.1, help='Reconstruction loss weight')
 
     # Optimizer and scheduler
     parser.add_argument('--optimizer', type=str, default='Adam', help='Optimizer type')
@@ -111,9 +114,10 @@ def configuration():
             'info_nce': args.loss_info_nce,
             'cls': args.loss_cls,
             'cloth_semantic': args.loss_cloth_semantic,
-            'orthogonal': args.loss_orthogonal,
             'gate_adaptive': args.loss_gate_adaptive,
-            'diversity': args.loss_diversity
+            'id_triplet': args.loss_id_triplet,
+            'anti_collapse': args.loss_anti_collapse,
+            'reconstruction': args.loss_reconstruction
         }
 
     # 处理数据集配置
@@ -480,7 +484,14 @@ class Runner:
         # 创建数据集特定的日志目录
         if hasattr(args, 'dataset_configs') and args.dataset_configs:
             dataset_full_name = args.dataset_configs[0]['name'].lower()
-            dataset_dir_name = 'cuhk' if 'cuhk' in dataset_full_name else ('rstp' if 'rstp' in dataset_full_name else ('icfg' if 'icfg' in dataset_full_name else dataset_full_name))
+            if 'cuhk' in dataset_full_name:
+                dataset_dir_name = 'cuhk_pedes'
+            elif 'rstp' in dataset_full_name:
+                dataset_dir_name = 'rstp'
+            elif 'icfg' in dataset_full_name:
+                dataset_dir_name = 'icfg'
+            else:
+                dataset_dir_name = dataset_full_name
         else:
             dataset_dir_name = 'unknown'
 
@@ -578,8 +589,9 @@ class Runner:
 
         console_logger.info("Starting training loop...")
         trainer = Trainer(model, args, self.monitor, runner=self)
+        # Pass dataset_log_dir as checkpoint_dir so trainer can create model/ subdir inside it
         trainer.train(
-            train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=args.logs_dir
+            train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=str(dataset_log_dir)
         )
 
 if __name__ == '__main__':

@@ -178,15 +178,13 @@ class Trainer:
             cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
             id_cls_features = outputs
             
-            # 从模型获取diversity_loss
-            diversity_loss = self.model.diversity_loss if hasattr(self.model, 'diversity_loss') else None
-
+            # 损失计算
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
                 pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                id_cls_features=id_cls_features, diversity_loss=diversity_loss
+                id_cls_features=id_cls_features
             )
 
         # 记录模型内部状态信息
@@ -223,7 +221,7 @@ class Trainer:
             for image, cloth_captions, id_captions, pid, cam_id, is_matched in train_loader:
                 image = image.to(self.device)
                 outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
-                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights = outputs
+                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights, _, _ = outputs # Unpack correct number of outputs
                 sim = torch.matmul(image_feats, id_text_feats.t())
                 pos_sim = sim.diag().mean().item()
                 neg_sim = sim[~torch.eye(sim.shape[0], dtype=bool, device=self.device)].mean().item()
@@ -234,7 +232,7 @@ class Trainer:
 
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'orthogonal', 'gate_adaptive', 'total']
+        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'gate_adaptive', 'reconstruction', 'total']
         hidden_losses = set()  # 所有损失都显示
 
         avg_losses = []
@@ -487,47 +485,17 @@ class Trainer:
 
                     # 生成最佳检查点路径
                     if checkpoint_dir:
-                        # 根据数据集名称确定模型文件名
-                        dataset_short_name = self._get_dataset_name()
-
-                        # 获取数据集的标准名称用于目录结构
-                        if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
-                            dataset_full_name = self.args.dataset_configs[0]['name'].lower()
-                            if 'cuhk' in dataset_full_name:
-                                dataset_dir_name = 'cuhk_pedes'
-                            elif 'rstp' in dataset_full_name:
-                                dataset_dir_name = 'rstp'
-                            elif 'icfg' in dataset_full_name:
-                                dataset_dir_name = 'icfg'
-                            else:
-                                dataset_dir_name = dataset_full_name
-                        else:
-                            dataset_dir_name = dataset_short_name
-
-                        # 构建检查点保存路径为 PROJECT_ROOT/log/DATASET_DIR_NAME/model/best_DATASET_SHORTNAME.pth
-                        # 获取项目根目录（通过当前脚本路径向上两级）
-                        script_dir = Path(__file__).parent  # trainers/
-                        project_root = script_dir.parent   # 项目根目录
-
-                        # 根据数据集名称确定正确的目录名，不依赖于传入的checkpoint_dir
-                        if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
-                            dataset_full_name = self.args.dataset_configs[0]['name'].lower()
-                            if 'cuhk' in dataset_full_name:
-                                dataset_dir_name_correct = 'cuhk'
-                            elif 'rstp' in dataset_full_name:
-                                dataset_dir_name_correct = 'rstp'
-                            elif 'icfg' in dataset_full_name:
-                                dataset_dir_name_correct = 'icfg'
-                            else:
-                                dataset_dir_name_correct = dataset_short_name
-                        else:
-                            dataset_dir_name_correct = dataset_short_name
-
-                        log_base_path = project_root / 'log'
-
-                        model_dir = log_base_path / dataset_dir_name_correct / 'model'
+                        # 确保 checkpoint_dir 是 Path 对象
+                        ckpt_dir_path = Path(checkpoint_dir)
+                        
+                        # 创建 model 子目录
+                        model_dir = ckpt_dir_path / 'model'
                         model_dir.mkdir(parents=True, exist_ok=True)
 
+                        # 获取数据集短名称用于文件名 (例如 cuhk, rstp, icfg)
+                        dataset_short_name = self._get_dataset_name()
+                        
+                        # 构建完整路径: log/dataset_name/model/best_dataset.pth
                         new_best_checkpoint_path = str(model_dir / f"best_{dataset_short_name}.pth")
 
                         # 删除旧的最佳检查点

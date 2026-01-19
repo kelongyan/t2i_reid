@@ -30,7 +30,7 @@ BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
 # 解析参数
-ENABLE_OPTIMIZATIONS=false
+ENABLE_OPTIMIZATIONS=true
 TRANSFER_LEARNING=false
 
 for arg in "$@"; do
@@ -147,11 +147,12 @@ BASE_CMD="python scripts/train.py \
 # 添加优化损失权重
 BASE_CMD="$BASE_CMD \
     --loss-info-nce 1.0 \
-    --loss-cls 0.08 \
-    --loss-cloth-semantic 0.15 \
-    --loss-orthogonal 0.2 \
+    --loss-cls 0.5 \
+    --loss-cloth-semantic 2.0 \
     --loss-gate-adaptive 0.05 \
-    --loss-diversity 0.05"
+    --loss-id-triplet 1.0 \
+    --loss-anti-collapse 1.5 \
+    --loss-reconstruction 0.1"
 
 # 如果有resume路径，添加--resume参数
 if [ -n "$RESUME_PATH" ]; then

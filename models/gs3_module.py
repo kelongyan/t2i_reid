@@ -56,6 +56,10 @@ class OrthogonalProjectionAttention(nn.Module):
         self.norm_id = nn.LayerNorm(dim)
         self.norm_cloth = nn.LayerNorm(dim)
         
+        # === 改进：可学习的正交化缩放参数 ===
+        # 初始化为 0.1，允许模型自适应调整正交化强度
+        self.orth_scale = nn.Parameter(torch.tensor(0.1))
+        
         # 初始化权重：使用Xavier初始化降低初始梯度
         self._init_weights()
     
@@ -71,54 +75,39 @@ class OrthogonalProjectionAttention(nn.Module):
         执行正交投影: Q_id_perp = Q_id - proj_{Q_cloth}(Q_id)
         
         数学公式：
-        Q_id_perp = Q_id - <Q_id, Q_cloth> / ||Q_cloth||^2 * Q_cloth
-        
-        Args:
-            q_id: 身份查询向量 [B, num_heads, N, head_dim]
-            q_cloth: 服装查询向量 [B, num_heads, N, head_dim]
-            
-        Returns:
-            q_id_ortho: 正交化后的身份查询向量
-            saliency_score: 服装显著性分数 (用于后续 Mamba Filter)
+        Q_id_perp = Q_id - scale * (<Q_id, Q_cloth> / ||Q_cloth||^2 * Q_cloth)
         """
         # 计算点积 <Q_id, Q_cloth>
         dot_product = (q_id * q_cloth).sum(dim=-1, keepdim=True)  # [B, num_heads, N, 1]
         
-        # 计算 ||Q_cloth||^2，增大eps防止数值不稳定
-        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-6  # 更大的eps防止除零
+        # 计算 ||Q_cloth||^2，使用更大的 eps 防止数值不稳定
+        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-5
         
-        # 计算投影系数并进行梯度裁剪
+        # 计算投影系数并进行更严格的梯度裁剪
         projection_coeff = dot_product / norm_sq
-        projection_coeff = torch.clamp(projection_coeff, min=-2.0, max=2.0)  # 更严格的裁剪防止爆炸
+        projection_coeff = torch.clamp(projection_coeff, min=-1.0, max=1.0)
         
         # 计算投影分量
         projection = projection_coeff * q_cloth  # [B, num_heads, N, head_dim]
         
-        # 执行正交化：减去投影分量，降低正交化强度避免信息丢失
-        # 进一步降低正交化强度到0.1，减少数值不稳定性
-        q_id_ortho = q_id - 0.1 * projection
+        # === 改进：使用可学习参数进行自适应正交化 ===
+        # 限制 scale 范围在 [0.0, 1.0]，防止反向缩放或过度矫正
+        scale = torch.clamp(self.orth_scale, 0.0, 1.0)
+        q_id_ortho = q_id - scale * projection
         
-        # 计算服装显著性分数 (归一化的点积，范围 [0, 1])
-        # 使用更稳定的计算方式
-        norm_sqrt = torch.sqrt(norm_sq.clamp(min=1e-6))  # 避免sqrt(0)
-        saliency_score = torch.abs(dot_product) / (norm_sqrt + 1e-6)
-        saliency_score = torch.clamp(saliency_score.mean(dim=1), min=0.0, max=1.0)  # 对所有头取平均 [B, N, 1]
+        # 计算服装显著性分数 (归一化的点积)
+        norm_sqrt = torch.sqrt(norm_sq)
+        saliency_score = torch.abs(dot_product) / norm_sqrt
+        saliency_score = torch.clamp(saliency_score.mean(dim=1), min=0.0, max=1.0)  # 对所有头取平均
         
         return q_id_ortho, saliency_score
     
     def forward(self, x, return_attention=False):
+        # ... (后续代码保持不变，通过 _init_weights 等 helper function 复用) ...
+        # 注意：为了replace调用的简洁性，我们只需替换 OrthogonalProjectionAttention 类的定义
+        # 下面的 forward 代码会随着类定义的替换一并替换
         """
         前向传播
-        
-        Args:
-            x: 输入特征 [batch_size, seq_len, dim]
-            return_attention: 是否返回注意力图
-            
-        Returns:
-            id_features: 身份特征 [batch_size, seq_len, dim]
-            cloth_features: 服装特征 [batch_size, seq_len, dim]
-            saliency_score: 服装显著性分数 [batch_size, seq_len, 1]
-            (可选) attn_weights_id, attn_weights_cloth: 注意力权重
         """
         B, N, C = x.shape
         
@@ -177,11 +166,11 @@ class OrthogonalProjectionAttention(nn.Module):
 
 class ContentAwareMambaFilter(nn.Module):
     """
-    内容感知的 Mamba 过滤器
+    内容感知的 Mamba 过滤器 (FiLM 增强版)
     
     核心思想：
-    - 利用 OPA 计算的服装显著性分数，动态调节 Mamba 的输入门控
-    - 当显著性分数高时（包含服装信息），抑制信息流入 Mamba 状态
+    - 利用 OPA 计算的服装显著性分数，通过 FiLM (Feature-wise Linear Modulation) 机制
+    - 动态调制特征分布，引导 Mamba 关注或抑制特定区域
     """
     
     def __init__(self, dim, d_state=16, d_conv=4, expand=2, logger=None):
@@ -204,17 +193,22 @@ class ContentAwareMambaFilter(nn.Module):
             expand=expand
         )
         
-        # 显著性评分网络：将原始分数映射为门控信号
-        self.saliency_mlp = nn.Sequential(
+        # === 改进：FiLM 调制层 ===
+        # 将显著性分数 (scalar) 映射为 affine 参数 gamma (scale) 和 beta (shift)
+        # 输入: [B, N, 1] -> 输出: [B, N, 2*dim]
+        self.saliency_proj = nn.Sequential(
             nn.Linear(1, dim // 4),
             nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim // 4, 1),
-            nn.Sigmoid()  # 输出范围 [0, 1]
+            nn.Linear(dim // 4, dim * 2)  # chunk(2) -> gamma, beta
         )
         
-        # LayerNorm
-        self.norm = nn.LayerNorm(dim)
+        # 初始化 FiLM 层
+        # gamma 初始化为 0 (scale=1)，beta 初始化为 0 (shift=0)，保证初始状态为恒等变换
+        nn.init.constant_(self.saliency_proj[-1].weight, 0)
+        nn.init.constant_(self.saliency_proj[-1].bias, 0)
+        
+        # Pre-Norm
+        self.norm_pre = nn.LayerNorm(dim)
         
     def forward(self, x, saliency_score):
         """
@@ -233,28 +227,33 @@ class ContentAwareMambaFilter(nn.Module):
                 self.logger.debug_logger.warning("⚠️  ContentAwareMambaFilter: Input contains NaN, returning original x")
             return x
         
-        # === 步骤 1: 计算门控信号 ===
-        gate_signal = self.saliency_mlp(saliency_score)  # [B, N, 1]
-        gate_signal = torch.clamp(gate_signal, min=0.0, max=1.0)  # 确保在有效范围
+        # === 步骤 1: 生成 FiLM 调制参数 ===
+        # [B, N, 1] -> [B, N, 2*dim]
+        affine_params = self.saliency_proj(saliency_score)
+        gamma, beta = affine_params.chunk(2, dim=-1)  # gamma: [B, N, dim], beta: [B, N, dim]
         
-        # === 步骤 2: 输入级抑制（降低抑制强度）===
-        # 完全移除门控抑制，避免数值不稳定
-        # 让Mamba直接处理原始输入
-        x_gated = x  # 不再应用门控抑制
+        # 限制 gamma 范围，防止过度缩放导致梯度爆炸
+        gamma = torch.tanh(gamma)  # 限制在 [-1, 1] 之间，对应 scale 范围 [0, 2]
+        
+        # === 步骤 2: 应用 FiLM 调制 ===
+        # x_modulated = x * (1 + gamma) + beta
+        # 这种方式比硬门控 (x * (1-gate)) 更稳定，保留了梯度流
+        x_modulated = x * (1 + gamma) + beta
         
         # === 步骤 3: Mamba 状态空间建模 ===
-        # Mamba 会对序列进行时序建模
-        x_filtered = self.mamba(x_gated)
+        # Mamba 会对调制后的序列进行时序建模
+        x_mamba = self.mamba(x_modulated)
         
         # 检查Mamba输出NaN
-        if torch.isnan(x_filtered).any():
+        if torch.isnan(x_mamba).any():
             if self.logger:
                 self.logger.debug_logger.warning("⚠️  ContentAwareMambaFilter: Mamba output contains NaN, using identity")
-            x_filtered = x
+            x_mamba = x
         
-        # === 步骤 4: 残差连接 + LayerNorm===
-        # 降低Mamba输出权重到0.1，提高稳定性
-        out = self.norm(x + 0.1 * x_filtered)
+        # === 步骤 4: 残差连接 + LayerNorm ===
+        # 残差连接到原始 x，Mamba 分支作为一个修正项
+        # 初始时 scale 较小，让模型慢慢学习
+        out = self.norm_pre(x + 0.1 * x_mamba)
         
         # 最终NaN检查
         if torch.isnan(out).any():
@@ -324,38 +323,6 @@ class GS3Module(nn.Module):
         self.pool_id = nn.AdaptiveAvgPool1d(1)
         self.pool_cloth = nn.AdaptiveAvgPool1d(1)
     
-    def compute_gate_diversity_loss(self, gate_id, gate_cloth):
-        """
-        === 改进：更稳定的门控多样性损失 ===
-        目标：鼓励gate_id和gate_cloth都不要太接近0或1
-        """
-        # 方案1：熵正则（鼓励门控接近0.5）
-        entropy_id = -(gate_id * torch.log(gate_id + 1e-8) + 
-                       (1-gate_id) * torch.log(1-gate_id + 1e-8)).mean()
-        entropy_cloth = -(gate_cloth * torch.log(gate_cloth + 1e-8) + 
-                         (1-gate_cloth) * torch.log(1-gate_cloth + 1e-8)).mean()
-        
-        # 方案2：差异正则（鼓励两个gate不同）
-        diversity = -torch.abs(gate_id - gate_cloth).mean()
-        
-        # 组合损失：熵正则（0.3） + 差异正则（0.7）
-        loss = 0.3 * (2.0 - entropy_id - entropy_cloth) + 0.7 * diversity
-        
-        # 调试信息
-        if hasattr(self, '_debug_diversity_counter'):
-            self._debug_diversity_counter += 1
-        else:
-            self._debug_diversity_counter = 0
-        
-        if self._debug_diversity_counter % 200 == 0 and self.logger:
-            self.logger.debug_logger.debug(
-                f"Gate Diversity: entropy_id={entropy_id:.4f}, "
-                f"entropy_cloth={entropy_cloth:.4f}, "
-                f"diversity={diversity:.4f}, total={loss:.6f}"
-            )
-        
-        return loss
-        
     def forward(self, x, return_attention=False):
         """
         前向传播
@@ -366,12 +333,11 @@ class GS3Module(nn.Module):
             
         Returns:
             如果 return_attention=False:
-                (id_feat, cloth_feat, gate_stats, diversity_loss)
+                (id_feat, cloth_feat, gate_stats)
             如果 return_attention=True:
-                (id_feat, cloth_feat, gate_stats, diversity_loss, id_attn_map, cloth_attn_map)
+                (id_feat, cloth_feat, gate_stats, id_attn_map, cloth_attn_map)
                 
             gate_stats: dict包含gate_id和gate_cloth的统计信息
-            diversity_loss: 多样性正则损失
         """
         batch_size, seq_len, dim = x.size()
         
@@ -399,12 +365,19 @@ class GS3Module(nn.Module):
         gate_id = self.gate_id(concat_feat)      # [B, dim]
         gate_cloth = self.gate_cloth(concat_feat)  # [B, dim]
         
-        # 应用门控（独立调节，不再互补）
-        id_feat_gated = gate_id * id_feat        # [B, dim]
-        cloth_feat_gated = gate_cloth * cloth_feat  # [B, dim]
+        # === 关键修复：防止门控塌缩 ===
+        # 限制门控范围在 [0.05, 0.95]，保证始终有梯度流过
+        gate_id = torch.clamp(gate_id, min=0.05, max=0.95)
+        gate_cloth = torch.clamp(gate_cloth, min=0.05, max=0.95)
         
-        # === 计算改进的多样性正则损失 ===
-        diversity_loss = self.compute_gate_diversity_loss(gate_id, gate_cloth)
+        # 应用门控
+        # ID特征保持门控，因为我们需要它去除衣服信息
+        id_feat_gated = gate_id * id_feat        # [B, dim]
+        
+        # [架构松绑] 服装特征不再应用门控！
+        # 原因：防止模型通过关闭门控来制造特征坍缩 (Zero Feature Collapse)
+        # 我们希望服装特征始终存在，并由 semantic loss 赋予语义
+        cloth_feat_gated = cloth_feat            # [B, dim] (直通)
         
         # === 门控统计信息（用于监控和调试）===
         gate_stats = {
@@ -428,6 +401,6 @@ class GS3Module(nn.Module):
             }
         
         if return_attention:
-            return id_feat_gated, cloth_feat_gated, gate_stats, diversity_loss, id_attn_map, cloth_attn_map
+            return id_feat_gated, cloth_feat_gated, gate_stats, id_attn_map, cloth_attn_map
         else:
-            return id_feat_gated, cloth_feat_gated, gate_stats, diversity_loss
+            return id_feat_gated, cloth_feat_gated, gate_stats

@@ -9,7 +9,7 @@ from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
 from .gs3_module import GS3Module
-from .residual_classifier import ResidualClassifier, DeepResidualClassifier
+# from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
 from .vim import VisionMamba
 
 # 设置transformers库日志级别
@@ -314,40 +314,25 @@ class Model(nn.Module):
                 self.debug_logger.info("Using simplified disentangle module")
 
         # ================================================================
-        # === 方案C：分支解耦 - 为分类和检索使用不同的特征分支 ===
+        # === 方案C (优化版)：BNNeck 监督 - 使用 BNNeck 替代深层残差分类器 ===
         # ================================================================
         
         # === 分支1：专用于分类的id特征处理 ===
-        # 使用残差分类器（方案B）提取判别性特征
-        classifier_config = net_config.get('classifier', {})
-        classifier_type = classifier_config.get('type', 'residual')  # 'residual' or 'deep_residual'
+        # 使用 BNNeck (BatchNorm1d) 规范化特征分布
+        # 这一步将特征拉向超球面，有利于 CrossEntropy 收敛，同时不破坏流形结构
+        self.id_bn = nn.BatchNorm1d(self.text_width)
+        # 初始化 BNNeck：weight=1, bias=0 (标准做法)
+        nn.init.constant_(self.id_bn.weight, 1.0)
+        nn.init.constant_(self.id_bn.bias, 0.0)
         
-        if classifier_type == 'deep_residual':
-            # 深层残差分类器（适合大数据集）
-            self.id_for_classification = DeepResidualClassifier(
-                in_dim=self.text_width,      # 768
-                hidden_dim=2048,              # 更高的中间维度
-                output_dim=1024,              # 输出到1024维
-                num_blocks=3,                 # 3个残差块
-                dropout=0.25
-            )
-            if self.logger:
-                self.debug_logger.info("Using DeepResidualClassifier for classification branch")
-        else:
-            # 标准残差分类器（默认）
-            self.id_for_classification = ResidualClassifier(
-                in_dim=self.text_width,      # 768
-                hidden_dim=1536,              # 中间维度
-                output_dim=1024,              # 输出到1024维
-                num_blocks=2,                 # 2个残差块
-                dropout=0.2
-            )
-            if self.logger:
-                self.debug_logger.info("Using ResidualClassifier for classification branch")
-        
-        # 身份分类器：从1024维映射到类别数
-        # 这里只需要一个简单的线性层，因为id_for_classification已经提取了高质量特征
-        self.id_classifier = nn.Linear(1024, num_classes)
+        if self.logger:
+            self.debug_logger.info("Using BNNeck (BatchNorm1d) for classification branch")
+
+        # 身份分类器：从 text_width (768) 直接映射到类别数
+        # bias=False 是 ReID 常见 Trick，让模型关注向量角度而非模长
+        self.id_classifier = nn.Linear(self.text_width, num_classes, bias=False)
+        # 初始化分类器权重
+        nn.init.normal_(self.id_classifier.weight, std=0.001)
         
         # === 分支2：专用于检索的id特征处理（保持原有设计）===
         # 共享MLP：用于降维
@@ -375,8 +360,8 @@ class Model(nn.Module):
         
         if self.logger:
             self.debug_logger.info("=" * 60)
-            self.debug_logger.info("Branch Decoupling Architecture:")
-            self.debug_logger.info(f"  - Classification Branch: {self.text_width} → 1024 → {num_classes}")
+            self.debug_logger.info("Branch Decoupling Architecture (Optimized):")
+            self.debug_logger.info(f"  - Classification Branch: {self.text_width} → BNNeck(768) → {num_classes}")
             self.debug_logger.info(f"  - Retrieval Branch: {self.text_width} → 512 → 256")
             self.debug_logger.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
             self.debug_logger.info("=" * 60)
@@ -406,7 +391,7 @@ class Model(nn.Module):
     
     def _count_classifier_params(self):
         """计算分类分支的参数量"""
-        params = sum(p.numel() for p in self.id_for_classification.parameters())
+        params = sum(p.numel() for p in self.id_bn.parameters())
         params += sum(p.numel() for p in self.id_classifier.parameters())
         return params
 
@@ -581,14 +566,11 @@ class Model(nn.Module):
             # 步骤1：G-S3解耦，得到id和cloth特征
             # ============================================================
             if return_attention:
-                id_embeds, cloth_embeds, gate_stats, diversity_loss, id_attn_map, cloth_attn_map = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats, id_attn_map, cloth_attn_map = self.disentangle(
                     image_embeds_raw, return_attention=True)
             else:
-                id_embeds, cloth_embeds, gate_stats, diversity_loss = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats = self.disentangle(
                     image_embeds_raw, return_attention=False)
-            
-            # 存储diversity_loss用于后续loss计算
-            self.diversity_loss = diversity_loss
             
             # NaN检查
             if torch.isnan(id_embeds).any():
@@ -622,13 +604,18 @@ class Model(nn.Module):
                     self._debug_features.update(self.disentangle._debug_info)
             
             # ============================================================
-            # 步骤2：分支1 - 分类分支（独立优化）
+            # 步骤2：分支1 - 分类分支（BNNeck 隐式监督）
             # ============================================================
-            # id_embeds [B, 768] → id_for_classification [B, 1024]
-            id_cls_features = self.id_for_classification(id_embeds)
+            # 1. 通过 BNNeck 进行特征规范化
+            # id_embeds [B, 768] → id_cls_features [B, 768]
+            id_cls_features = self.id_bn(id_embeds)
             
-            # id_cls_features [B, 1024] → id_logits [B, num_classes]
+            # 2. 计算分类 Logits
+            # id_cls_features [B, 768] → id_logits [B, num_classes]
             id_logits = self.id_classifier(id_cls_features)
+            
+            # 注意：检索分支依然使用原始 id_embeds，这使得 id_embeds 同时受到 
+            # BNNeck(分类) 和 MLP(检索) 的双重梯度约束，促进特征鲁棒性
             
             # ============================================================
             # 步骤3：分支2 - 检索分支（用于info_nce）
