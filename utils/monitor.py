@@ -1,6 +1,7 @@
 # src/utils/monitor.py
 import torch
 import torch.nn as nn
+from typing import Dict, List, Tuple, Optional
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
@@ -37,7 +38,7 @@ debug_file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 debug_logger.addHandler(debug_file_handler)
 logger.addHandler(logging.StreamHandler())
-debug_logger.addHandler(logging.StreamHandler())
+# debug_logger.addHandler(logging.StreamHandler())
 
 class TrainingMonitor:
     """训练监控器，记录训练过程中的各种信息"""
@@ -65,9 +66,11 @@ class TrainingMonitor:
         # 设置logger
         self.logger = logging.getLogger(f"train.{dataset_name}")
         self.logger.setLevel(logging.INFO)
+        self.logger.propagate = False
         
         self.debug_logger = logging.getLogger(f"train.{dataset_name}.debug")
         self.debug_logger.setLevel(logging.DEBUG)
+        self.debug_logger.propagate = False
         
         # 配置handler
         file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
@@ -81,7 +84,7 @@ class TrainingMonitor:
         self.logger.addHandler(logging.StreamHandler())
         
         self.debug_logger.addHandler(debug_file_handler)
-        self.debug_logger.addHandler(logging.StreamHandler())
+        # self.debug_logger.addHandler(logging.StreamHandler())
         
         # 存储训练指标
         self.metrics = []
@@ -142,8 +145,8 @@ class TrainingMonitor:
     def log_batch_info(self, epoch: int, batch_idx: int, total_batches: int,
                        loss_meters: Dict[str, float], lr: float):
         """记录批次信息"""
-        loss_str = ', '.join([f"{k}: {v.avg:.4f}" for k, v in loss_meters.items()])
-        self.logger.debug(f"Epoch {epoch}, Batch {batch_idx}/{total_batches}, LR: {lr:.6f}, {loss_str}")
+        loss_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss_meters.items()])
+        self.debug_logger.info(f"Epoch {epoch}, Batch {batch_idx}/{total_batches}, LR: {lr:.6f}, {loss_str}")
     
     def log_epoch_info(self, epoch: int, total_epochs: int, metrics: Dict[str, float]):
         """记录epoch信息"""
@@ -514,47 +517,30 @@ class TrainingMonitor:
         if hasattr(self, 'gs3_debug_info'):
             self.debug_logger.debug(f"G-S3 debug info: {self.gs3_debug_info}")
     
-    def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> TrainingMonitor:
-        """
-        根据数据集名称获取对应的监控器
-        
-        Args:
-            dataset_name: 数据集名称 ('cuhk_pedes', 'rstp', 'icfg', 或其他)
-            log_dir: 日志根目录
-        
-        Returns:
-            TrainingMonitor实例
-        """
-        # 规范化数据集名称 - 使用与检查点保存一致的命名规则
-        if 'cuhk' in dataset_name.lower():
-            normalized_name = 'cuhk'
-        elif 'rstp' in dataset_name.lower():
-            normalized_name = 'rstp'
-        elif 'icfg' in dataset_name.lower():
-            normalized_name = 'icfg'
-        else:
-            normalized_name = dataset_name.lower()
-        
-        return TrainingMonitor(dataset_name=normalized_name, log_dir=log_dir)
+
+def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> "TrainingMonitor":
+    """
+    根据数据集名称获取对应的监控器
     
-    @staticmethod
-    def _get_tensor_stats(tensor: torch.Tensor, name: str = "") -> Dict[str, float]:
-        """获取张量统计信息"""
-        if tensor is None:
-            return {"value": "None"}
-        
-        # 确保tensor在CPU上以便计算统计信息
-        tensor_cpu = tensor.detach().cpu()
-        
-        stats = {
-            "mean": tensor_cpu.mean().item(),
-            "std": tensor_cpu.std().item(),
-            "min": tensor_cpu.min().item(),
-            "max": tensor_cpu.max().item(),
-            "shape": list(tensor_cpu.shape),
-            "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
-        }
-        return stats
+    Args:
+        dataset_name: 数据集名称 ('cuhk_pedes', 'rstp', 'icfg', 或其他)
+        log_dir: 日志根目录
+    
+    Returns:
+        TrainingMonitor实例
+    """
+    # 规范化数据集名称 - 使用与检查点保存一致的命名规则
+    if 'cuhk' in dataset_name.lower():
+        normalized_name = 'cuhk'
+    elif 'rstp' in dataset_name.lower():
+        normalized_name = 'rstp'
+    elif 'icfg' in dataset_name.lower():
+        normalized_name = 'icfg'
+    else:
+        normalized_name = dataset_name.lower()
+    
+    return TrainingMonitor(dataset_name=normalized_name, log_dir=log_dir)
+
 
 # 示例使用方法
 if __name__ == "__main__":
