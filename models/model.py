@@ -635,7 +635,8 @@ class Model(nn.Module):
         else:
             image_embeds = None
             cloth_image_embeds = None
-        
+            gate_stats = None
+
         # ============================================================
         # 步骤5：文本编码和融合
         # ============================================================
@@ -646,6 +647,11 @@ class Model(nn.Module):
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
             fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
             fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1, eps=1e-8)
+        else:
+            # Fusion模块未激活时，使用image_embeds作为fallback
+            # 确保fused_embeds始终有值参与损失计算
+            if image_embeds is not None:
+                fused_embeds = image_embeds
         
         # ============================================================
         # 返回值（更新gate为gate_stats）

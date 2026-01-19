@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class TextGuidedDecouplingLoss(nn.Module):
     """
-    文本引导的解耦损失 (Text-Guided Consistency Loss)
+    文本引导的解耦损失 (Text-Guided Consistency Loss) 
     
     目标：利用 CLIP 文本编码器的语义信息作为监督，约束视觉特征解耦的语义完整性。
     逻辑：视觉 ID 特征 + 视觉衣服特征 重新组合后，应该能重建其对应的语义表达。
@@ -112,6 +112,8 @@ class Loss(nn.Module):
             self.weights['anti_collapse'] = 1.0  # 降低约束，允许特征变化
             self.weights['cloth_semantic'] = 2.0 # 强力语义监督
             self.weights['id_triplet'] = 1.0     # 增强 ID 一致性
+            self.weights['gate_adaptive'] = 0.05  # 固定
+            self.weights['reconstruction'] = 0.1  # 固定
             
         # Stage 3 (Epoch 31+): 精细微调期
         # 目标：平衡解耦与识别
@@ -121,6 +123,8 @@ class Loss(nn.Module):
             self.weights['anti_collapse'] = 1.0
             self.weights['cloth_semantic'] = 1.5 # 适度降低
             self.weights['id_triplet'] = 1.0     # 保持 ID 约束
+            self.weights['gate_adaptive'] = 0.05  # 固定
+            self.weights['reconstruction'] = 0.1  # 固定
     
     def gate_adaptive_loss_v2(self, gate_stats, id_embeds, cloth_embeds, pids):
         """
@@ -187,16 +191,25 @@ class Loss(nn.Module):
         
         return torch.clamp(total_loss, min=0.0, max=10.0)
     
-    def info_nce_loss(self, image_embeds, text_embeds):
-        """InfoNCE对比学习损失"""
+    def info_nce_loss(self, image_embeds, text_embeds, fused_embeds=None):
+        """
+        InfoNCE对比学习损失
+        
+        修复：支持使用fused_embeds参与对比学习
+        让Fusion模块真正影响主任务，避免梯度死亡
+        """
         if image_embeds is None or text_embeds is None:
             return torch.tensor(0.0, device=self._get_device())
         
-        bsz = image_embeds.size(0)
-        image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-8)
+        # 优先使用fused_embeds（融合后的特征）
+        # 如果没有fusion或fusion未激活，则使用image_embeds
+        visual_embeds = fused_embeds if fused_embeds is not None else image_embeds
+        
+        bsz = visual_embeds.size(0)
+        visual_embeds = F.normalize(visual_embeds, dim=-1, eps=1e-8)
         text_embeds = F.normalize(text_embeds, dim=-1, eps=1e-8)
         
-        sim = torch.matmul(image_embeds, text_embeds.t()) / self.temperature
+        sim = torch.matmul(visual_embeds, text_embeds.t()) / self.temperature
         sim = torch.clamp(sim, min=-50, max=50)
         
         labels = torch.arange(bsz, device=sim.device, dtype=torch.long)
@@ -241,7 +254,7 @@ class Loss(nn.Module):
         
         bsz = cloth_image_embeds.size(0)
         
-        # === 标准对比学习损失（与InfoNCE一致）===
+        # === 标准对比学习损失（与InfoNCE一致）=== 
         cloth_image_norm = F.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
         cloth_text_norm = F.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
         
@@ -336,8 +349,8 @@ class Loss(nn.Module):
             self.update_epoch(epoch)
         
         # === 核心损失计算 ===
-        # 1. InfoNCE损失
-        losses['info_nce'] = self.info_nce_loss(image_embeds, id_text_embeds) \
+        # 1. InfoNCE损失 (修复：让fusion参与主任务)
+        losses['info_nce'] = self.info_nce_loss(image_embeds, id_text_embeds, fused_embeds) \
             if image_embeds is not None and id_text_embeds is not None \
             else torch.tensor(0.0, device=self._get_device())
         
@@ -362,10 +375,11 @@ class Loss(nn.Module):
             gate, id_embeds, cloth_embeds, pids
         )
         
-        # 7. 重构损失 (保留，作为辅助)
-        # 修复维度不匹配问题：使用投影后的 256d 特征进行重构
-        # image_embeds (256d) + cloth_image_embeds (256d) -> fused_embeds (256d)
-        if image_embeds is not None and cloth_image_embeds is not None and fused_embeds is not None:
+        # 7. 重构损失 (可选辅助)
+        # 注意：由于fusion现在参与info_nce，reconstruction loss可以设置较小权重避免冲突
+        # 如果reconstruction权重>0，则计算；否则跳过以节省计算
+        if self.weights.get('reconstruction', 0) > 0 and \
+           image_embeds is not None and cloth_image_embeds is not None and fused_embeds is not None:
             losses['reconstruction'] = self.reconstruction_loss(
                 image_embeds, cloth_image_embeds, fused_embeds
             )
