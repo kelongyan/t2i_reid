@@ -19,10 +19,15 @@ class Evaluator:
         self.gallery_labels = None
         self.device = next(model.parameters()).device
 
-        # Define default loss weights (与loss.py保持一致)
+        # Define default loss weights (与loss.py对称解耦配置保持一致)
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 0.1, 'cloth_semantic': 0.5, 
-            'orthogonal': 0.1, 'gate_adaptive': 0.01
+            'info_nce': 1.0, 
+            'cls': 0.1, 
+            'cloth_semantic': 1.0, 
+            'orthogonal': 0.3,           # 使用增强版
+            'gate_adaptive': 0.02,
+            'reconstruction': 0.5,       # 对称重构
+            'semantic_alignment': 0.3,   # CLIP语义对齐
         }
         # Get loss weights from config file, merge with defaults
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
@@ -31,6 +36,10 @@ class Evaluator:
             if key not in loss_weights:
                 loss_weights[key] = value
         self.combined_loss = Loss(temperature=0.1, weights=loss_weights).to(self.device)
+        
+        # === 设置语义引导模块（如果模型有）===
+        if hasattr(model, 'semantic_guidance'):
+            self.combined_loss.set_semantic_guidance(model.semantic_guidance)
 
     @torch.no_grad()
     def evaluate(self, query_loader, gallery_loader, query, gallery, checkpoint_path=None, epoch=None):
@@ -74,20 +83,20 @@ class Evaluator:
             with torch.amp.autocast('cuda', enabled=self.args.fp16):
                 outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-                # 模型返回 11 个输出（包含id_cls_features）
-                if len(outputs) != 11:
-                    raise ValueError(f"Expected 11 model outputs during validation, got {len(outputs)}")
+                # === 对称解耦：模型返回12个输出 ===
+                if len(outputs) != 12:
+                    raise ValueError(f"Expected 12 model outputs during validation, got {len(outputs)}")
 
                 image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-                cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights, \
-                id_cls_features = outputs
+                cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
+                id_cls_features, original_feat = outputs
 
                 loss_dict = self.combined_loss(
                     image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                     id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                     cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                    pids=pid, is_matched=is_matched, epoch=None, gate=gate,
-                    id_cls_features=id_cls_features
+                    pids=pid, is_matched=is_matched, epoch=None, gate=gate_stats,
+                    id_cls_features=id_cls_features, original_feat=original_feat
                 )
 
             # Update loss records
@@ -127,13 +136,14 @@ class Evaluator:
                         if use_id_text:
                             if id_only:
                                 outputs = self.model(imgs, cloth_instruction=None, id_instruction=id_captions)
-                                fused_feats, gate_weights = outputs[2], outputs[-1]
+                                # 对称解耦：12个输出，fused_feats=outputs[2], gate_weights=outputs[9]
+                                fused_feats, gate_weights = outputs[2], outputs[9]
                             else:
                                 outputs = self.model(imgs, cloth_instruction=cloth_captions, id_instruction=id_captions)
-                                fused_feats, gate_weights = outputs[2], outputs[-1]
+                                fused_feats, gate_weights = outputs[2], outputs[9]
                         else:
                             outputs = self.model(imgs, cloth_instruction=None, id_instruction=None)
-                            fused_feats, gate_weights = outputs[2], outputs[-1]
+                            fused_feats, gate_weights = outputs[2], outputs[9]
                 except AttributeError as e:
                     logging.error(f"Model failed to extract fused features: {e}")
                     raise

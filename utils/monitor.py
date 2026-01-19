@@ -3,537 +3,211 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib
-matplotlib.use('Agg')
 from datetime import datetime
 import json
-import os
 import logging
 from pathlib import Path
 import torch.nn.functional as F
 
 class TrainingMonitor:
-    """训练监控器，记录训练过程中的各种信息"""
+    """
+    训练监控器：旨在使训练过程透明化
+    功能：
+    1. 记录特征统计信息（单行紧凑格式）
+    2. 梯度健康度分析（摘要 + 异常检测）
+    3. 关键模块（G-S3, Fusion）内部状态监控
+    4. 自动记录指标到 JSON
+    """
     
     def __init__(self, dataset_name: str, log_dir: str = "log"):
         self.dataset_name = dataset_name
         self.log_dir = Path(log_dir)
-        
-        # 创建数据集特定的日志目录 (log_dir 应该是 log/dataset_name)
-        # 注意：传入的 log_dir 已经是 log/cuhk_pedes 这种形式
         self.dataset_log_dir = self.log_dir / dataset_name
-        
-        # 如果传入的 log_dir 已经包含了 dataset_name (例如在 train.py 中构造的)，
-        # 我们就不需要再拼一层。这里做一个简单的判断。
-        if self.log_dir.name == dataset_name:
-             self.dataset_log_dir = self.log_dir
-        
         self.dataset_log_dir.mkdir(parents=True, exist_ok=True)
         
-        # 设置日志文件
+        # 文件路径
         self.log_file = self.dataset_log_dir / "log.txt"
         self.debug_log_file = self.dataset_log_dir / "debug.txt"
         self.metrics_file = self.dataset_log_dir / "metrics.json"
         
-        # 清理旧日志 (可选，根据需求决定是否保留)
-        # if self.log_file.exists():
-        #     self.log_file.unlink()
-        # if self.debug_log_file.exists():
-        #     self.debug_log_file.unlink()
-        
-        # 设置logger
-        # 使用独立的logger名称，避免冲突
+        # 1. 设置主 Logger (Console + File)
         self.logger = logging.getLogger(f"train.{dataset_name}")
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
+        self._setup_handler(self.logger, self.log_file, level=logging.INFO, console=True)
         
+        # 2. 设置调试 Logger (File Only)
         self.debug_logger = logging.getLogger(f"train.{dataset_name}.debug")
         self.debug_logger.setLevel(logging.DEBUG)
         self.debug_logger.propagate = False
+        self._setup_handler(self.debug_logger, self.debug_log_file, level=logging.DEBUG, console=False)
         
-        # 清除旧的 handlers (防止重复)
-        if self.logger.hasHandlers():
-            self.logger.handlers.clear()
-        if self.debug_logger.hasHandlers():
-            self.debug_logger.handlers.clear()
+        self.metrics_history = []
+
+    def _setup_handler(self, logger, log_path, level, console=False):
+        if logger.hasHandlers():
+            logger.handlers.clear()
         
-        # 配置handler
-        file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(logging.StreamHandler())
         
-        debug_file_handler = logging.FileHandler(self.debug_log_file, mode='a', encoding='utf-8')
-        debug_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        debug_file_handler.setFormatter(debug_formatter)
-        self.debug_logger.addHandler(debug_file_handler)
-        # self.debug_logger.addHandler(logging.StreamHandler()) # Debug不输出到终端
+        # File Handler
+        fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
+        fh.setFormatter(formatter)
+        fh.setLevel(level)
+        logger.addHandler(fh)
         
-        # 存储训练指标
-        self.metrics = []
-        
+        # Optional Console Handler
+        if console:
+            ch = logging.StreamHandler()
+            ch.setFormatter(formatter)
+            ch.setLevel(level)
+            logger.addHandler(ch)
+
+    # --- 1. 特征统计 (透明化数据流) ---
+    
     def log_feature_statistics(self, features: torch.Tensor, name: str):
-        """记录特征统计信息"""
-        stats = self._get_tensor_stats(features, name)
-        self.debug_logger.debug(f"{name} statistics: {stats}")
-    
-    def _get_tensor_stats(self, tensor: torch.Tensor, name: str = "") -> Dict[str, float]:
-        """获取张量统计信息"""
-        if tensor is None:
-            return {"value": "None"}
+        """记录特征统计信息 (Compact format)"""
+        if features is None: return
+        t = features.detach().cpu().float()
         
-        # 确保tensor在CPU上以便计算统计信息
-        tensor_cpu = tensor.detach().cpu()
+        stats_str = (
+            f"[{name}] shape={list(t.shape)} | μ={t.mean():.4f} σ={t.std():.4f} | "
+            f"min={t.min():.4f} max={t.max():.4f}"
+        )
         
-        stats = {
-            "mean": tensor_cpu.mean().item(),
-            "std": tensor_cpu.std().item(),
-            "min": tensor_cpu.min().item(),
-            "max": tensor_cpu.max().item(),
-            "shape": list(tensor_cpu.shape),
-            "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
-        }
-        return stats
-    
-    def log_gate_weights(self, gate_weights: torch.Tensor, module_name: str):
-        """记录门控权重信息"""
-        if gate_weights is not None:
-            stats = self._get_tensor_stats(gate_weights, f"{module_name}_weights")
-            self.debug_logger.debug(f"{module_name} weights: {stats}")
-    
-    def log_loss_components(self, loss_dict: Dict[str, torch.Tensor]):
-        """【修复】记录损失组件信息 - 只在debug模式下输出"""
-        # 只在debug模式下输出详细信息，避免与_format_loss_display重复
-        if self.debug_logger.level >= 10:  # DEBUG level
-            loss_info = {}
-            for key, value in loss_dict.items():
-                if isinstance(value, torch.Tensor):
-                    loss_info[key] = value.item()
-                else:
-                    loss_info[key] = value
-            self.debug_logger.debug(f"Loss components: {loss_info}")
-        # 不在info级别输出，避免与_format_loss_display重复
-    
-    def log_memory_usage(self):
-        """记录GPU内存使用情况"""
-        if torch.cuda.is_available():
-            memory_info = {
-                'allocated': torch.cuda.memory_allocated(),
-                'cached': torch.cuda.memory_reserved(),
-                'max_allocated': torch.cuda.max_memory_allocated(),
-                'max_cached': torch.cuda.max_memory_reserved()
-            }
-            self.debug_logger.debug(f"GPU Memory usage: {memory_info}")
-    
+        if torch.isnan(t).any() or torch.isinf(t).any():
+            self.debug_logger.warning(f"⚠️  NAN/INF DETECTED: {stats_str}")
+        else:
+            self.debug_logger.debug(stats_str)
+
+    # --- 2. 梯度健康度 (透明化训练稳定性) ---
+
+    def log_gradients(self, model, step_name: str):
+        """记录梯度摘要和异常"""
+        grads = []
+        names = []
+        for n, p in model.named_parameters():
+            if p.grad is not None:
+                g_norm = p.grad.norm().item()
+                grads.append(g_norm)
+                names.append(n)
+        
+        if not grads: return
+        grads = np.array(grads)
+        
+        # 摘要记录
+        self.debug_logger.debug(
+            f"Grad Summary [{step_name}]: Count={len(grads)} | Mean={grads.mean():.6f} | "
+            f"Max={grads.max():.4f} | Min={grads.min():.8f}"
+        )
+        
+        # 异常检测
+        exploding = [(n, g) for n, g in zip(names, grads) if g > 5.0]
+        if exploding:
+            self.debug_logger.warning(f"⚠️  EXPLODING Gradients detected in {len(exploding)} layers!")
+            for n, g in sorted(exploding, key=lambda x: x[1], reverse=True)[:3]:
+                self.debug_logger.warning(f"   - {n}: {g:.4f}")
+
+        # Top 活跃层 (确认哪些层在学)
+        top_idx = grads.argsort()[::-1][:3]
+        top_str = " | ".join([f"{names[i]}={grads[i]:.4f}" for i in top_idx])
+        self.debug_logger.debug(f"🔥 Top Active Layers: {top_str}")
+
+    def log_gradient_flow(self, model):
+        """保持接口兼容，逻辑已并入 log_gradients"""
+        pass
+
+    # --- 3. 损失与批次 (透明化进度) ---
+
     def log_batch_info(self, epoch: int, batch_idx: int, total_batches: int,
                        loss_meters: Dict[str, float], lr: float):
-        """记录批次信息"""
-        loss_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss_meters.items()])
-        self.debug_logger.info(f"Epoch {epoch}, Batch {batch_idx}/{total_batches}, LR: {lr:.6f}, {loss_str}")
-    
+        """记录每一批次的简要状态"""
+        loss_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss_meters.items() if 'total' not in k])
+        self.debug_logger.info(
+            f"Epoch {epoch} [{batch_idx}/{total_batches}] | LR: {lr:.2e} | "
+            f"Total: {loss_meters.get('total', 0):.4f} | {loss_str}"
+        )
+
+    def log_loss_breakdown(self, loss_dict: Dict[str, torch.Tensor], epoch: int, batch_idx: int):
+        """记录损失占比"""
+        total = loss_dict['total'].item() if isinstance(loss_dict['total'], torch.Tensor) else loss_dict['total']
+        if total == 0: return
+        
+        parts = []
+        for k, v in loss_dict.items():
+            if k == 'total': continue
+            val = v.item() if isinstance(v, torch.Tensor) else v
+            parts.append((val / total * 100, k, val))
+        
+        parts.sort(key=lambda x: -x[0])
+        msg = f"Loss Breakdown E{epoch}B{batch_idx}: Total={total:.4f} | "
+        msg += " | ".join([f"{k}:{v:.3f}({p:.1f}%)" for p, k, v in parts[:5]])
+        self.debug_logger.debug(msg)
+
     def log_epoch_info(self, epoch: int, total_epochs: int, metrics: Dict[str, float]):
-        """记录epoch信息"""
-        # 记录到metrics字典
-        self.metrics.append({
+        """保存指标到历史记录"""
+        entry = {
             'epoch': epoch,
             'timestamp': datetime.now().isoformat(),
             **metrics
-        })
-        
-        # 保存到文件
+        }
+        self.metrics_history.append(entry)
         with open(self.metrics_file, 'w') as f:
-            json.dump(self.metrics, f, indent=2)
-    
-    def _get_tensor_stats(self, tensor: torch.Tensor, name: str = "") -> Dict[str, float]:
-        """获取张量统计信息"""
-        if tensor is None:
-            return {"value": "None"}
-        
-        # 确保tensor在CPU上以便计算统计信息
-        tensor_cpu = tensor.detach().cpu()
-        
-        stats = {
-            "mean": tensor_cpu.mean().item(),
-            "std": tensor_cpu.std().item(),
-            "min": tensor_cpu.min().item(),
-            "max": tensor_cpu.max().item(),
-            "shape": list(tensor_cpu.shape),
-            "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
-        }
-        return stats
-    
-    def log_gradients(self, model, step_name: str):
-        """记录梯度信息"""
-        self.debug_logger.debug(f"Gradients epoch_{step_name} state:")
-        gradient_info = {}
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                gradient_info[name] = f"grad_norm={grad_norm:.4f}"
-        self.debug_logger.debug("Gradients epoch_{step_name} state:")
-        for name, value in gradient_info.items():
-            self.debug_logger.debug(f"   {name}: {value}")
-    
-    def log_gradient_flow(self, model):
-        """记录梯度流动情况，检测梯度消失/爆炸"""
-        self.debug_logger.debug("Gradient flow analysis:")
-        
-        ave_grads = []
-        max_grads = []
-        layers = []
-        
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                layers.append(name)
-                ave_grads.append(param.grad.abs().mean().item())
-                max_grads.append(param.grad.abs().max().item())
-        
-        # 检测异常梯度
-        for i, (layer, ave_grad, max_grad) in enumerate(zip(layers, ave_grads, max_grads)):
-            status = ""
-            if i < 5 or i >= len(layers) - 5:  # 只记录前5层和后5层
-                status = ""
-                if ave_grad < 1e-7:
-                    status = " [WARNING: Vanishing gradient]"
-                if max_grad > 100:
-                    status = " [WARNING: Exploding gradient]"
-                if status:
-                    self.debug_logger.debug(f"   {name}: grad_avg={ave_grad:.6f}, max={max_grad:.6f}{status}")
-        
-        # 检查CLIP文本编码器的bias梯度
-        clip_bias_grads = []
-        for name, param in model.named_parameters():
-            if 'text_encoder' in name and 'bias' in name and param.grad is not None:
-                if param.grad.abs().max().item() < 1e-7:
-                    clip_bias_grads.append(name)
-        
-        if clip_bias_grads:
-            self.debug_logger.warning(f"CLIP text encoder bias with vanishing gradient: {clip_bias_grads[:3]}")
-    
-    def log_loss_breakdown(self, loss_dict, epoch: int, batch_idx: int):
-        """记录详细损失分解"""
-        total = loss_dict['total'].item() if isinstance(loss_dict['total'], torch.Tensor) else loss_dict['total']
-        loss_info = {}
-        for key, value in loss_dict.items():
-            if isinstance(value, torch.Tensor):
-                loss_info[key] = value.item()
-            else:
-                loss_info[key] = value
-            
-        # 计算百分比
-        breakdown = f"Loss breakdown [Epoch {epoch}, Batch {batch_idx}]:"
-        breakdown += f"   Total loss: {total:.4f}"
-        
-        # 按百分比排序
-        loss_percentages = []
-        for key, value in loss_dict.items():
-            if key != 'total' and isinstance(value, torch.Tensor):
-                percent = value.item() / total * 100
-                loss_percentages.append((percent, key))
-        
-        loss_percentages.sort(key=lambda x: -x[0])
-        for percent, key in loss_percentages[:10]:  # 显示前10个
-            breakdown += f"     - {key}: {loss_dict[key].item():.4f} ({percent:.2f}%)"
-        
-        self.debug_logger.debug(breakdown)
-    
-    def log_data_batch_info(self, batch_data: Dict[str, torch.Tensor], batch_idx: int):
-        """记录数据批次信息"""
-        self.debug_logger.debug(f"Batch {batch_idx} data info:")
-        
-        for key, value in batch_data.items():
-            if isinstance(value, torch.Tensor):
-                self.debug_logger.debug(f"  {key}: shape={list(value.shape)}, dtype={value.dtype}")
-            elif isinstance(value, (list, tuple)):
-                self.debug_logger.debug(f"  {key}: type={type(value).__name__}, len={len(value)}")
-    
-    def log_optimizer_state(self, optimizer: torch.optim.Optimizer, epoch: int):
-        """记录优化器状态"""
-        self.debug_logger.debug(f"Optimizer state [Epoch {epoch}]:")
-        
-        for i, param_group in enumerate(optimizer.param_groups):
-            self.debug_logger.debug(f"  Param group {i}:")
-            self.debug_logger.debug(f"    LR: {param_group['lr']:.8f}")
-            self.debug_logger.debug(f"    Weight decay: {param_group.get('weight_decay', 0):.6f}")
-            self.debug_logger.debug(f"    Num params: {len(param_group['params'])}")
-        
-        self.logger.info("=" * 60)
-        self.logger.info(f"Epoch {epoch} Validation Loss : {self._format_loss_display(loss_meters)}")
-        self.logger.info("=" * 60)
-    
-    def _format_loss_display(self, loss_meters):
-        """【修复】格式化损失显示"""
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'gate_adaptive', 'reconstruction', 'total']
-        hidden_losses = set()
-        
-        avg_losses = []
-        for key in display_order:
-            if key in loss_meters and loss_meters[key].count > 0:
-                avg_losses.append(f"{key}={loss_meters[key].avg:.4f}")
-        
-        return avg_losses
-    
-    def _get_tensor_stats(self, tensor: torch.Tensor, name: str = "") -> Dict[str, float]:
-        """获取张量统计信息"""
-        if tensor is None:
-            return {"value": "None"}
-        
-        # 确保tensor在CPU上以便计算统计信息
-        tensor_cpu = tensor.detach().cpu()
-        
-        stats = {
-            "mean": tensor_cpu.mean().item(),
-            "std": tensor_cpu.std().item(),
-            "min": tensor_cpu.min().item(),
-            "max": tensor_cpu.max().item(),
-            "shape": list(tensor_cpu.shape),
-            "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
-        }
-        return stats
-    
-    def log_attention_weights(self, attention_weights: torch.Tensor, layer_name: str):
-        """记录注意力权重信息"""
-        if attention_weights is not None:
-            stats = self._get_tensor_stats(attention_weights, f"{layer_name}_weights")
-            self.debug_logger.debug(f"{layer_name} weights: {stats}")
-    
-    def log_gate_weights(self, gate_weights: torch.Tensor, module_name: str):
-        """记录门控权重信息"""
-        if gate_weights is not None:
-            stats = self._get_tensor_stats(gate_weights, f"{module_name}_weights")
-            self.debug_logger.debug(f"{module_name} weights: {stats}")
-    
-    def log_fusion_info(self, fused_features: torch.Tensor, gate_weights: torch.Tensor = None):
-        """记录融合模块信息"""
-        self.debug_logger.debug("Fusion module information:")
-        self.log_feature_statistics(fused_features, "fused_features")
-        if gate_weights is not None:
-            self.log_gate_weights(gate_weights, "fusion_gate")
-    
-    def log_disentangle_info(self, id_features: torch.Tensor, cloth_features: torch.Tensor,
-                           gate: torch.Tensor = None):
-        """记录解耦模块信息"""
-        self.debug_logger.debug("Disentangle module information:")
-        self.log_feature_statistics(id_features, "identity_features")
-        self.log_feature_statistics(cloth_features, "clothing_features")
-        if gate is not None:
-            self.log_gate_weights(gate, "disentangle_gate")
-    
-    def log_gs3_module_info(self, id_seq: torch.Tensor, cloth_seq: torch.Tensor, 
-                           saliency_score: torch.Tensor = None, 
-                           id_filtered: torch.Tensor = None):
-        """记录G-S3模块详细信息"""
-        self.debug_logger.debug("=" * 50)
-        self.debug_logger.debug("G-S3 Module Debug Info:")
-        
-        # OPA输出
-        if id_seq is not None:
-            stats = self._get_tensor_stats(id_seq, "id_seq_after_opa")
-            self.debug_logger.debug(f" ID sequence (after OPA): {stats}")
-        
-        if cloth_seq is not None:
-            stats = self._get_tensor_stats(cloth_seq, "cloth_seq_after_opa")
-            self.debug_logger.debug(f" Cloth sequence (after OPA): {stats}")
-        
-        # 正交性检查
-        if id_seq is not None and cloth_seq is not None:
-            import torch.nn.functional as F
-            id_norm = F.normalize(id_seq, dim=-1)
-            cloth_norm = F.normalize(cloth_seq, dim=-1)
-            cosine_sim = (id_norm * cloth_norm).sum(dim=-1).mean().item()
-            self.debug_logger.debug(f" Orthogonality (cosine sim): {cosine_sim:.6f} (should be close to 0)")
-        
-        # 显著性分数
-        if saliency_score is not None:
-            stats = self._get_tensor_stats(saliency_score, "saliency_score")
-            self.debug_logger.debug(f" Saliency score: {stats}")
-            # 统计高/中/低显著性的比例
-            flat_score = saliency_score.flatten()
-            high_salient = (flat_score > 0.7).sum().item() / flat_score.numel()
-            low_salient = (flat_score < 0.3).sum().item() / flat_score.numel()
-            self.debug_logger.debug(f" High salient: {high_salient:.2%}, Low salient: {low_salient:.2%}")
-        
-        # 过滤后的ID序列
-        if id_filtered is not None:
-            stats = self._get_tensor_stats(id_filtered, "id_seq_filtered")
-            self.debug_logger.debug(f" ID sequence (after Mamba): {stats}")
-    
-    def log_gradients(self, model, step_name: str):
-        """记录梯度信息"""
-        self.debug_logger.debug(f"Gradients epoch_{step_name} state:")
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.norm().item()
-                self.debug_logger.debug(f"   {name}: grad_norm={grad_norm:.4f}")
-    
-    def log_gradient_flow(self, model):
-        """记录梯度流动情况，检测梯度消失/爆炸"""
-        self.debug_logger.debug("Gradient flow analysis:")
-        
-        ave_grads = []
-        max_grads = []
-        layers = []
-        
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                layers.append(name)
-                ave_grads.append(param.grad.abs().mean().item())
-                max_grads.append(param.grad.abs().max().item())
-        
-        # 检测异常梯度
-        for i, (layer, ave_grad, max_grad) in enumerate(zip(layers, ave_grads, max_grads)):
-            status = ""
-            if i < 5 or i >= len(layers) - 5:
-                status = ""
-                if ave_grad < 1e-7:
-                    status = " [WARNING: Vanishing gradient]"
-                if max_grad > 100:
-                    status = " [WARNING: Exploding gradient]"
-                if status:
-                    self.debug_logger.debug(f"   {name}: grad_avg={ave_grad:.6f}, max={max_grad:.6f}{status}")
-        
-        # 检查CLIP文本编码器的bias梯度
-        clip_bias_grads = []
-        for name, param in model.named_parameters():
-            if 'text_encoder' in name and 'bias' in name and param.grad is not None:
-                if param.grad.abs().max().item() < 1e-7:
-                    clip_bias_grads.append(name)
-        
-        if clip_bias_grads:
-            self.debug_logger.warning(f"CLIP text encoder bias with vanishing gradient: {clip_bias_grads[:3]}")
-    
-    def log_loss_components(self, loss_dict: Dict[str, torch.Tensor]):
-        """记录损失组件信息"""
-        loss_info = {}
-        for key, value in loss_dict.items():
-            if isinstance(value, torch.Tensor):
-                loss_info[key] = value.item()
-            else:
-                loss_info[key] = value
-        self.debug_logger.debug(f"Loss components: {loss_info}")
-    
-    def log_memory_usage(self):
-        """记录GPU内存使用情况"""
-        if torch.cuda.is_available():
-            memory_info = {
-                'allocated': torch.cuda.memory_allocated(),
-                'cached': torch.cuda.memory_reserved(),
-                'max_allocated': torch.cuda.max_memory_allocated(),
-                'max_cached': torch.cuda.max_memory_reserved()
-            }
-            self.debug_logger.debug(f"GPU Memory usage: {memory_info}")
-    
-    def _get_tensor_stats(self, tensor: torch.Tensor, name: str = "") -> Dict[str, float]:
-        """获取张量统计信息"""
-        if tensor is None:
-            return {"value": "None"}
-        
-        # 确保tensor在CPU上以便计算统计信息
-        tensor_cpu = tensor.detach().cpu()
-        
-        stats = {
-            "mean": tensor_cpu.mean().item(),
-            "std": tensor_cpu.std().item(),
-            "min": tensor_cpu.min().item(),
-            "max": tensor_cpu.max().item(),
-            "shape": list(tensor_cpu.shape),
-            "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
-        }
+            json.dump(self.metrics_history, f, indent=2)
 
-        # 记录调试信息
-        self.debug_logger.debug(f"{name} statistics: {stats}")
-        return stats
-    
-    def log_attention_weights(self, attention_weights: torch.Tensor, layer_name: str):
-        """记录注意力权重信息"""
-        if attention_weights is not None:
-            stats = self._get_tensor_stats(attention_weights, f"{layer_name}_weights")
-            self.debug_logger.debug(f"{layer_name} weights: {stats}")
-    
-    def log_gate_weights(self, gate_weights: torch.Tensor, module_name: str):
-        """记录门控权重信息"""
-        if gate_weights is not None:
-            stats = self._get_tensor_stats(gate_weights, f"{module_name}_weights")
-            self.debug_logger.debug(f"{module_name} weights: {stats}")
-    
-    def log_fusion_info(self, fused_features: torch.Tensor, gate_weights: torch.Tensor = None):
-        """记录融合模块信息"""
-        self.debug_logger.debug("Fusion module information:")
-        self.debug_logger.debug(f"Fused features stats: {self._get_tensor_stats(fused_features, 'fused_features')}")
-        if gate_weights is not None:
-            self.debug_logger.debug(f"Fusion gate weights: {self._get_tensor_stats(gate_weights, 'fused_gate_weights')}")
-    
-    def log_disentangle_info(self, id_features: torch.Tensor, cloth_features: torch.Tensor,
-                           gate: torch.Tensor = None):
-        """记录解耦模块信息"""
-        self.debug_logger.debug("Disentangle module information:")
-        self.debug_logger.debug(f"ID features stats: {self._get_tensor_stats(id_features, 'id_features')}")
-        self.debug_logger.debug(f"Cloth features stats: {self._get_tensor_stats(cloth_features, 'clothing_features')}")
-        if gate is not None:
-            self.debug_logger.debug(f"Disentangle gate weights: {self._get_tensor_stats(gate, 'gate_weights')}")
-    
-    def log_gs3_module_info(self, id_seq: torch.Tensor, cloth_seq: torch.Tensor, 
-                           saliency_score: torch.Tensor = None, 
-                           id_filtered: torch.Tensor = None):
-        """记录G-S3模块详细信息"""
-        self.debug_logger.debug("=" * 50)
-        self.debug_logger.debug("G-S3 Module Debug Info:")
-        if id_seq is not None:
-            self.debug_logger.debug(f"ID sequence stats: {self._get_tensor_stats(id_seq, 'id_seq')}")
-        if cloth_seq is not None:
-            self.debug_logger.debug(f"Cloth sequence stats: {self._get_tensor_stats(cloth_seq, 'cloth_seq')}")
-        if saliency_score is not None:
-            self.debug_logger.debug(f"Saliency score stats: {self._get_tensor_stats(saliency_score, 'saliency_score')}")
-        if id_filtered is not None:
-            self.debug_logger.debug(f"Filtered ID sequence stats: {self._get_tensor_stats(id_filtered, 'id_seq_filtered')}")
-        if id_seq is not None and cloth_seq is not None:
-            id_norm = F.normalize(id_seq, dim=-1)
-            cloth_norm = F.normalize(cloth_seq, dim=-1)
-            cosine_sim = (id_norm * cloth_norm).sum(dim=-1).mean().item()
-            self.debug_logger.debug(f"Orthogonality check: {cosine_sim:.6f}")
+    # --- 4. 模块特定状态 (透明化模型内部) ---
+
+    def log_gs3_module_info(self, id_feat, cloth_feat, gate_stats=None):
+        """监控 G-S3 解耦质量"""
+        self.debug_logger.debug("--- G-S3 Internal State ---")
+        self.log_feature_statistics(id_feat, "GS3_ID_Final")
+        self.log_feature_statistics(cloth_feat, "GS3_Cloth_Final")
         
-        # 记录G-S3模块参数
-        if hasattr(self, 'disentangle'):
-            self.debug_logger.debug("G-S3 module: {self.disentangle}")
-        
-        # 注意：G-S3模块现在返回gate_stats字典而不是单个gate张量
-        if hasattr(self, 'gs3_debug_info'):
-            self.debug_logger.debug(f"G-S3 debug info: {self.gs3_debug_info}")
-    
+        # 检查正交性
+        if id_feat is not None and cloth_feat is not None:
+            cos_sim = F.cosine_similarity(id_feat, cloth_feat, dim=-1).abs().mean().item()
+            self.debug_logger.debug(f"[Decouple] Absolute Cosine Similarity: {cos_sim:.6f} (target: 0.0)")
+            
+        if isinstance(gate_stats, dict):
+            g_str = " | ".join([f"{k}={v:.4f}" for k, v in gate_stats.items()])
+            self.debug_logger.debug(f"[Gate] {g_str}")
+
+    def log_gate_weights(self, weights: torch.Tensor, name: str):
+        """记录门控权重分布"""
+        if weights is None: return
+        w = weights.detach().cpu().numpy()
+        self.debug_logger.debug(f"[{name}] distribution: mean={w.mean():.4f}, std={w.std():.4f}, min={w.min():.4f}, max={w.max():.4f}")
+
+    def log_fusion_info(self, fused_feat, gate_weights=None):
+        self.log_feature_statistics(fused_feat, "Fused_Embeds")
+        if gate_weights is not None:
+            self.log_gate_weights(gate_weights, "Fusion_Gate")
+
+    # --- 5. 系统与辅助 ---
+
+    def log_memory_usage(self):
+        if torch.cuda.is_available():
+            alloc = torch.cuda.memory_allocated() / 1024**2
+            max_alloc = torch.cuda.max_memory_allocated() / 1024**2
+            self.debug_logger.debug(f"GPU Memory: {alloc:.0f}MB / Max: {max_alloc:.0f}MB")
+
+    def log_optimizer_state(self, optimizer, epoch):
+        lrs = [pg['lr'] for pg in optimizer.param_groups]
+        self.debug_logger.debug(f"Optimizer LRs [Epoch {epoch}]: {lrs}")
+
+    def log_loss_components(self, loss_dict):
+        """仅在 Debug 中记录原始 Loss"""
+        info = {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in loss_dict.items()}
+        self.debug_logger.debug(f"Raw Loss: {info}")
+
+    def log_data_batch_info(self, batch_data, batch_idx):
+        self.debug_logger.debug(f"Batch {batch_idx} data shapes: { {k: list(v.shape) for k, v in batch_data.items() if hasattr(v, 'shape')} }")
+
+    def log_attention_weights(self, weights, name):
+        self.log_feature_statistics(weights, f"Attn_{name}")
+
+    def log_disentangle_info(self, id_feat, cloth_feat, gate=None):
+        self.log_gs3_module_info(id_feat, cloth_feat, gate_stats=gate if isinstance(gate, dict) else None)
 
 def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> "TrainingMonitor":
-    """
-    根据数据集名称获取对应的监控器
-    
-    Args:
-        dataset_name: 数据集名称 ('cuhk_pedes', 'rstp', 'icfg', 或其他)
-        log_dir: 日志根目录 (e.g. 'log')
-    
-    Returns:
-        TrainingMonitor实例
-    """
-    # 规范化数据集名称 - 保持与 train.py 中的 dataset_dir_name 一致
-    if 'cuhk' in dataset_name.lower():
-        normalized_name = 'cuhk_pedes'
-    elif 'rstp' in dataset_name.lower():
-        normalized_name = 'rstp'
-    elif 'icfg' in dataset_name.lower():
-        normalized_name = 'icfg'
-    else:
-        normalized_name = dataset_name.lower()
-    
-    return TrainingMonitor(dataset_name=normalized_name, log_dir=log_dir)
-
-
-# 示例使用方法
-if __name__ == "__main__":
-    # 创建监控器示例
-    monitor = TrainingMonitor(dataset_name="cuhk_pedes")
-    
-    # 记录一些示例信息
-    monitor.logger.info("This is a test log entry")
-    monitor.debug_logger.debug("This is a test debug entry")
-    print(f"Log directory created at: {monitor.log_dir}")
-    print("Monitor initialization completed!")
+    return TrainingMonitor(dataset_name=dataset_name, log_dir=log_dir)

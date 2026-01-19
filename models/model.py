@@ -8,7 +8,8 @@ from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
 from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
-from .gs3_module import GS3Module
+from .gs3_module import GS3Module  # 兼容性别名，实际使用SymmetricGS3Module
+from .semantic_guidance import SemanticGuidedDecoupling  # 新增CLIP语义引导
 # from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
 from .vim import VisionMamba
 
@@ -294,7 +295,7 @@ class Model(nn.Module):
             if self.logger:
                 self.debug_logger.info("Using ViT-Base backbone")
 
-        # 初始化 G-S3 特征分离模块
+        # 初始化 G-S3 特征分离模块（对称解耦版本）
         disentangle_type = net_config.get('disentangle_type', 'gs3')
         if disentangle_type == 'gs3':
             gs3_config = net_config.get('gs3', {})
@@ -307,11 +308,22 @@ class Model(nn.Module):
                 logger=self.logger
             )
             if self.logger:
-                self.debug_logger.info("Using G-S3 (Geometry-Guided Selective State Space) disentangle module")
+                self.debug_logger.info("Using Symmetric G-S3 (对称解耦) disentangle module")
         else:
             self.disentangle = DisentangleModule(dim=self.text_width)
             if self.logger:
                 self.debug_logger.info("Using simplified disentangle module")
+        
+        # === 新增：CLIP语义引导模块 ===
+        # 使用已加载的CLIP Text Encoder和Tokenizer
+        self.semantic_guidance = SemanticGuidedDecoupling(
+            text_encoder=self.text_encoder,
+            tokenizer=self.tokenizer,
+            dim=self.text_width,
+            logger=self.logger
+        )
+        if self.logger:
+            self.debug_logger.info("✅ Initialized CLIP Semantic Guidance for ID/Attr decoupling")
 
         # ================================================================
         # === 方案C (优化版)：BNNeck 监督 - 使用 BNNeck 替代深层残差分类器 ===
@@ -563,13 +575,13 @@ class Model(nn.Module):
                 image_embeds_raw = torch.zeros_like(image_embeds_raw)
             
             # ============================================================
-            # 步骤1：G-S3解耦，得到id和cloth特征
+            # 步骤1：对称G-S3解耦，得到id和attr特征
             # ============================================================
             if return_attention:
-                id_embeds, cloth_embeds, gate_stats, id_attn_map, cloth_attn_map = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats, original_feat, id_attn_map, cloth_attn_map = self.disentangle(
                     image_embeds_raw, return_attention=True)
             else:
-                id_embeds, cloth_embeds, gate_stats = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats, original_feat = self.disentangle(
                     image_embeds_raw, return_attention=False)
             
             # NaN检查
@@ -588,7 +600,7 @@ class Model(nn.Module):
                 if self._log_counter_gate % 200 == 0:
                     self.debug_logger.debug(
                         f"Gate stats: ID[mean={gate_stats['gate_id_mean']:.4f}, std={gate_stats['gate_id_std']:.4f}], "
-                        f"Cloth[mean={gate_stats['gate_cloth_mean']:.4f}, std={gate_stats['gate_cloth_std']:.4f}], "
+                        f"Attr[mean={gate_stats['gate_attr_mean']:.4f}, std={gate_stats['gate_attr_std']:.4f}], "
                         f"Diversity={gate_stats['diversity']:.4f}"
                     )
             
@@ -654,12 +666,12 @@ class Model(nn.Module):
                 fused_embeds = image_embeds
         
         # ============================================================
-        # 返回值（更新gate为gate_stats）
+        # 返回值（新增：original_feat用于重构监督）
         # ============================================================
         # 注意：gate_stats是dict，包含门控统计信息
         base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                        cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights,
-                       id_cls_features)  # gate_stats替代原来的gate
+                       id_cls_features, original_feat)  # 新增original_feat
         
         if return_attention:
             return base_outputs + (id_attn_map, cloth_attn_map)

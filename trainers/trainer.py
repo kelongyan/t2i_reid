@@ -44,21 +44,37 @@ class Trainer:
         self.monitor = monitor  # 添加监控器
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        # 定义默认损失权重（与loss.py保持一致）
+        
+        # === 对称解耦权重配置 ===
         default_loss_weights = {
-            'info_nce': 1.0, 'cls': 0.05, 'cloth_semantic': 0.5, 
-            'orthogonal': 0.1, 'gate_adaptive': 0.05
+            'info_nce': 1.0, 
+            'cls': 0.1,
+            'cloth_semantic': 1.0, 
+            'orthogonal': 0.3,           # 提高正交约束权重（增强版）
+            'gate_adaptive': 0.02,
+            'reconstruction': 0.5,       # 新增：对称重构损失
+            'semantic_alignment': 0.3,   # 新增：CLIP语义对齐
         }
+        
         # 从配置文件获取损失权重，合并默认值
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
-        # 确保所有必要的键都存在
         for key, value in default_loss_weights.items():
             if key not in loss_weights:
                 loss_weights[key] = value
+        
+        # 初始化Loss模块
         self.combined_loss = Loss(temperature=0.1, weights=loss_weights, logger=monitor).to(self.device)
+        
+        # === 设置语义引导模块到Loss（关键！）===
+        if hasattr(model, 'semantic_guidance'):
+            self.combined_loss.set_semantic_guidance(model.semantic_guidance)
+            if self.monitor:
+                self.monitor.debug_logger.info("✅ Semantic guidance module connected to Loss system")
+        
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
         if args.fp16 and self.device.type != 'cuda':
-            if self.monitor: self.monitor.logger.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
+            if self.monitor: 
+                self.monitor.logger.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
 
     def reinit_clip_bias_layers(self, model, logger=None):
         """重新初始化CLIP文本编码器的bias，防止梯度消失"""
@@ -152,7 +168,7 @@ class Trainer:
             self.monitor.logger.info(f"BatchNorm warmup enabled with momentum={momentum}")
 
     def run(self, inputs, epoch, batch_idx, total_batches):
-        # 执行单次训练步骤，计算所有损失
+        # 执行单次训练步骤，计算所有损失（对称解耦版本）
         image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
         image = image.to(self.device)
         pid = pid.to(self.device)
@@ -170,21 +186,21 @@ class Trainer:
             # 训练时不需要注意力图，return_attention=False（默认值）
             outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-            # 训练时模型返回 11 个输出（gate现在是gate_stats字典）
-            if len(outputs) != 11:
-                raise ValueError(f"Expected 11 model outputs during training, got {len(outputs)}")
+            # === 对称解耦更新：模型返回12个输出（新增original_feat）===
+            if len(outputs) != 12:
+                raise ValueError(f"Expected 12 model outputs during training, got {len(outputs)}")
 
             image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
             cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
-            id_cls_features = outputs
+            id_cls_features, original_feat = outputs
             
-            # 损失计算
+            # 损失计算（新增original_feat参数）
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
                 pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                id_cls_features=id_cls_features
+                id_cls_features=id_cls_features, original_feat=original_feat
             )
 
         # 记录模型内部状态信息
@@ -201,7 +217,7 @@ class Trainer:
             if gate_stats is not None and isinstance(gate_stats, dict):
                 self.monitor.debug_logger.debug(
                     f"Gate stats: ID[{gate_stats.get('gate_id_mean', 0):.4f}], "
-                    f"Cloth[{gate_stats.get('gate_cloth_mean', 0):.4f}], "
+                    f"Attr[{gate_stats.get('gate_attr_mean', 0):.4f}], "
                     f"Diversity[{gate_stats.get('diversity', 0):.4f}]"
                 )
             if gate_weights is not None:
@@ -221,7 +237,8 @@ class Trainer:
             for image, cloth_captions, id_captions, pid, cam_id, is_matched in train_loader:
                 image = image.to(self.device)
                 outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
-                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights, _, _ = outputs # Unpack correct number of outputs
+                # 对称解耦：12个输出
+                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights, _, _, _ = outputs
                 sim = torch.matmul(image_feats, id_text_feats.t())
                 pos_sim = sim.diag().mean().item()
                 neg_sim = sim[~torch.eye(sim.shape[0], dtype=bool, device=self.device)].mean().item()
@@ -359,6 +376,16 @@ class Trainer:
                 dynamic_ncols=True, leave=True, total=total_batches
             )
 
+            # 记录Epoch初始状态 (LR & Loss Weights) -> 仅写入调试日志，不显示在终端
+            if self.monitor:
+                current_lrs = [pg['lr'] for pg in optimizer.param_groups]
+                lr_str = ", ".join([f"{lr:.2e}" for lr in current_lrs])
+                
+                # 获取当前Loss权重
+                weight_str = ", ".join([f"{k}={v:.2f}" for k, v in self.combined_loss.weights.items() if v > 0])
+                
+                self.monitor.debug_logger.info(f"Epoch {epoch} Start | LRs: [{lr_str}] | Active Weights: [{weight_str}]")
+
             for i, inputs in enumerate(progress_bar):
                 # 【新增】学习率预热
                 if stage_changed and global_step < warmup_steps:
@@ -380,13 +407,11 @@ class Trainer:
                     if has_grads:
                         # 【修改】使用分层梯度裁剪
                         self.scaler.unscale_(optimizer)
-                        self.clip_grad_norm_by_layer(self.model, max_norm=2.0)
+                        self.clip_grad_norm_by_layer(self.model, max_norm=5.0)
 
-                        # 记录梯度流动（每1000个batch记录一次）
-                        if self.monitor and i % 1000 == 0:
-                            self.monitor.log_gradient_flow(self.model)
-                        # 记录基础梯度信息（每100个batch）
-                        elif self.monitor and i % 100 == 0:
+                        # 记录梯度信息（每100个batch）
+                        if self.monitor and i % 100 == 0:
+                            # log_gradients 现在包含了原来的 flow analysis 功能
                             self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
 
                         self.scaler.step(optimizer)
@@ -408,13 +433,10 @@ class Trainer:
                     loss.backward()
                     
                     # 【修改】使用分层梯度裁剪
-                    self.clip_grad_norm_by_layer(self.model, max_norm=2.0)
+                    self.clip_grad_norm_by_layer(self.model, max_norm=5.0)
 
-                    # 记录梯度流动（每1000个batch记录一次）
-                    if self.monitor and i % 1000 == 0:
-                        self.monitor.log_gradient_flow(self.model)
-                    # 记录基础梯度信息（每100个batch）
-                    elif self.monitor and i % 100 == 0:
+                    # 记录梯度信息（每100个batch）
+                    if self.monitor and i % 100 == 0:
                         self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
 
                     optimizer.step()
