@@ -552,7 +552,7 @@ class Trainer:
                         best_checkpoint_path = new_best_checkpoint_path
 
                         if self.monitor:
-                            self.monitor.logger.info(f"New best checkpoint saved: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
+                            self.monitor.debug_logger.debug(f"New best checkpoint saved: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
                     else:
                         if self.monitor:
                             self.monitor.logger.warning("checkpoint_dir not provided, cannot save best checkpoint")

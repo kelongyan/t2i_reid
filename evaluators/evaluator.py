@@ -55,33 +55,6 @@ class Evaluator:
         distmat = self.pairwise_distance(query_features, self.gallery_features, query, gallery)
         metrics = self.eval(distmat, query, gallery, epoch=epoch)
 
-        if epoch is not None:
-            # Log evaluation results instead of displaying in terminal
-            if hasattr(self, 'args') and hasattr(self.args, 'logs_dir'):
-                # If log directory exists, use monitor for logging
-                from utils.monitor import get_monitor_for_dataset
-                if hasattr(self.args, 'dataset_configs') and self.args.dataset_configs:
-                    dataset_name = self.args.dataset_configs[0]['name']
-                else:
-                    dataset_name = 'unknown'
-                # Use log directory, avoid duplicate replacement
-                log_dir = self.args.logs_dir.replace('\\', '/')
-                monitor = get_monitor_for_dataset(dataset_name, log_dir)
-                monitor.logger.info(f"Epoch {epoch}: "
-                             f"mAP: {metrics['mAP']:.4f}, Rank-1: {metrics['rank1']:.4f}")
-            else:
-                logging.info(f"Epoch {epoch}: "
-                             f"mAP: {metrics['mAP']:.4f}, Rank-1: {metrics['rank1']:.4f}")
-
-            # Print validation loss in terminal
-            print(f"[Epoch {epoch} Validation Loss] : ", end="")
-            loss_items = []
-            for key, val in val_loss_dict.items():
-                if key != 'total':  # Exclude total loss as we add it at the end
-                    loss_items.append(f"{key}={val:.4f}")
-            loss_items.append(f"total={val_loss_dict.get('total', 0):.4f}")
-            print(", ".join(loss_items))
-
         return metrics
 
     def _compute_validation_loss(self, data_loader):

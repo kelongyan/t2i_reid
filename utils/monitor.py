@@ -73,18 +73,19 @@ class TrainingMonitor:
         self.debug_logger.propagate = False
         
         # 配置handler
-        file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
-        debug_file_handler = logging.FileHandler(self.debug_log_file, mode='a', encoding='utf-8')
+        if not self.logger.handlers:
+            file_handler = logging.FileHandler(self.log_file, mode='a', encoding='utf-8')
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            self.logger.addHandler(file_handler)
+            self.logger.addHandler(logging.StreamHandler())
         
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-        file_handler.setFormatter(formatter)
-        debug_file_handler.setFormatter(formatter)
-        
-        self.logger.addHandler(file_handler)
-        self.logger.addHandler(logging.StreamHandler())
-        
-        self.debug_logger.addHandler(debug_file_handler)
-        # self.debug_logger.addHandler(logging.StreamHandler())
+        if not self.debug_logger.handlers:
+            debug_file_handler = logging.FileHandler(self.debug_log_file, mode='a', encoding='utf-8')
+            formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+            debug_file_handler.setFormatter(formatter)
+            self.debug_logger.addHandler(debug_file_handler)
+            # self.debug_logger.addHandler(logging.StreamHandler())
         
         # 存储训练指标
         self.metrics = []
