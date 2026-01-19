@@ -447,13 +447,15 @@ class TrainingMonitor:
         
         stats = {
             "mean": tensor_cpu.mean().item(),
-            "debug_logger.debug(f"{name} statistics: {stats}")
             "std": tensor_cpu.std().item(),
             "min": tensor_cpu.min().item(),
             "max": tensor_cpu.max().item(),
             "shape": list(tensor_cpu.shape),
             "requires_grad": tensor.requires_grad if hasattr(tensor, 'requires_grad') else False
         }
+
+        # 记录调试信息
+        self.debug_logger.debug(f"{name} statistics: {stats}")
         return stats
     
     def log_attention_weights(self, attention_weights: torch.Tensor, layer_name: str):
