@@ -23,19 +23,21 @@ class OrthogonalProjectionAttention(nn.Module):
     - 通过 Gram-Schmidt 正交化避免身份特征"偷看"服装信息
     """
     
-    def __init__(self, dim, num_heads=8, qkv_bias=False, dropout=0.1):
+    def __init__(self, dim, num_heads=8, qkv_bias=False, dropout=0.1, logger=None):
         """
         Args:
             dim (int): 输入特征维度
             num_heads (int): 多头注意力的头数
             qkv_bias (bool): QKV投影是否使用偏置
             dropout (float): Dropout比率
+            logger: TrainingMonitor实例
         """
         super().__init__()
         self.dim = dim
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+        self.logger = logger
         
         # 身份分支的 QKV 投影
         self.qkv_id = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -60,7 +62,7 @@ class OrthogonalProjectionAttention(nn.Module):
     def _init_weights(self):
         """初始化权重，防止梯度爆炸"""
         for m in [self.qkv_id, self.qkv_cloth, self.proj_id, self.proj_cloth]:
-            nn.init.xavier_uniform_(m.weight, gain=0.5)
+            nn.init.xavier_uniform_(m.weight, gain=1.0)  # 使用标准gain，避免初始化过小
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         
@@ -83,21 +85,23 @@ class OrthogonalProjectionAttention(nn.Module):
         dot_product = (q_id * q_cloth).sum(dim=-1, keepdim=True)  # [B, num_heads, N, 1]
         
         # 计算 ||Q_cloth||^2，增大eps防止数值不稳定
-        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-8  # 防止除零
+        norm_sq = (q_cloth * q_cloth).sum(dim=-1, keepdim=True) + 1e-6  # 更大的eps防止除零
         
         # 计算投影系数并进行梯度裁剪
         projection_coeff = dot_product / norm_sq
-        projection_coeff = torch.clamp(projection_coeff, min=-5.0, max=5.0)  # 放宽裁剪范围
+        projection_coeff = torch.clamp(projection_coeff, min=-2.0, max=2.0)  # 更严格的裁剪防止爆炸
         
         # 计算投影分量
         projection = projection_coeff * q_cloth  # [B, num_heads, N, head_dim]
         
         # 执行正交化：减去投影分量，降低正交化强度避免信息丢失
-        q_id_ortho = q_id - 0.3 * projection  # 进一步降低正交化强度（从0.5到0.3）
+        # 进一步降低正交化强度到0.1，减少数值不稳定性
+        q_id_ortho = q_id - 0.1 * projection
         
         # 计算服装显著性分数 (归一化的点积，范围 [0, 1])
-        # 点积越大，说明当前 token 包含越多服装信息
-        saliency_score = torch.abs(dot_product) / (torch.sqrt(norm_sq) + 1e-8)
+        # 使用更稳定的计算方式
+        norm_sqrt = torch.sqrt(norm_sq.clamp(min=1e-6))  # 避免sqrt(0)
+        saliency_score = torch.abs(dot_product) / (norm_sqrt + 1e-6)
         saliency_score = torch.clamp(saliency_score.mean(dim=1), min=0.0, max=1.0)  # 对所有头取平均 [B, N, 1]
         
         return q_id_ortho, saliency_score
@@ -135,16 +139,22 @@ class OrthogonalProjectionAttention(nn.Module):
         # === 步骤 3: 计算注意力 ===
         # 身份分支：使用正交化后的查询
         attn_id = (q_id_ortho @ k_id.transpose(-2, -1)) * self.scale  # [B, num_heads, N, N]
-        # 裁剪防止softmax溢出
-        attn_id = torch.clamp(attn_id, min=-50.0, max=50.0)
+        # 更严格的裁剪防止softmax溢出导致NaN
+        attn_id = torch.clamp(attn_id, min=-20.0, max=20.0)
         attn_id = attn_id.softmax(dim=-1)
+        # 检查NaN
+        if torch.isnan(attn_id).any():
+            attn_id = torch.where(torch.isnan(attn_id), torch.zeros_like(attn_id), attn_id)
         attn_id = self.attn_dropout(attn_id)
         out_id = (attn_id @ v_id).transpose(1, 2).reshape(B, N, C)  # [B, N, C]
         
         # 服装分支：正常计算
         attn_cloth = (q_cloth @ k_cloth.transpose(-2, -1)) * self.scale
-        attn_cloth = torch.clamp(attn_cloth, min=-50.0, max=50.0)
+        attn_cloth = torch.clamp(attn_cloth, min=-20.0, max=20.0)
         attn_cloth = attn_cloth.softmax(dim=-1)
+        # 检查NaN
+        if torch.isnan(attn_cloth).any():
+            attn_cloth = torch.where(torch.isnan(attn_cloth), torch.zeros_like(attn_cloth), attn_cloth)
         attn_cloth = self.attn_dropout(attn_cloth)
         out_cloth = (attn_cloth @ v_cloth).transpose(1, 2).reshape(B, N, C)
         
@@ -174,15 +184,17 @@ class ContentAwareMambaFilter(nn.Module):
     - 当显著性分数高时（包含服装信息），抑制信息流入 Mamba 状态
     """
     
-    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2, logger=None):
         """
         Args:
             dim (int): 特征维度
             d_state (int): Mamba 状态维度
             d_conv (int): Mamba 卷积核大小
             expand (int): Mamba 扩展因子
+            logger: TrainingMonitor实例
         """
         super().__init__()
+        self.logger = logger
         
         # Mamba SSM 核心
         self.mamba = Mamba(
@@ -215,21 +227,40 @@ class ContentAwareMambaFilter(nn.Module):
         Returns:
             filtered_features: 过滤后的特征 [batch_size, seq_len, dim]
         """
+        # 检查输入NaN
+        if torch.isnan(x).any() or torch.isnan(saliency_score).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  ContentAwareMambaFilter: Input contains NaN, returning original x")
+            return x
+        
         # === 步骤 1: 计算门控信号 ===
         gate_signal = self.saliency_mlp(saliency_score)  # [B, N, 1]
+        gate_signal = torch.clamp(gate_signal, min=0.0, max=1.0)  # 确保在有效范围
         
         # === 步骤 2: 输入级抑制（降低抑制强度）===
-        # 门控逻辑：(1 - 0.2*gate_signal) 表示"保留比例"，进一步降低抑制强度
-        # 当 gate_signal ≈ 1（服装显著性高）时，输入被轻微抑制
-        # 当 gate_signal ≈ 0（身份显著性高）时，输入正常通过
-        x_gated = x * (1 - 0.2 * gate_signal)  # [B, N, dim]（从0.3降到0.2）
+        # 完全移除门控抑制，避免数值不稳定
+        # 让Mamba直接处理原始输入
+        x_gated = x  # 不再应用门控抑制
         
         # === 步骤 3: Mamba 状态空间建模 ===
-        # Mamba 会对序列进行时序建模，门控后的输入确保服装信息不会污染隐状态
+        # Mamba 会对序列进行时序建模
         x_filtered = self.mamba(x_gated)
         
-        # === 步骤 4: 残差连接 + LayerNorm（进一步降低Mamba输出权重）===
-        out = self.norm(x + 0.3 * x_filtered)  # 进一步降低Mamba输出的影响（从0.5到0.3）
+        # 检查Mamba输出NaN
+        if torch.isnan(x_filtered).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  ContentAwareMambaFilter: Mamba output contains NaN, using identity")
+            x_filtered = x
+        
+        # === 步骤 4: 残差连接 + LayerNorm===
+        # 降低Mamba输出权重到0.1，提高稳定性
+        out = self.norm(x + 0.1 * x_filtered)
+        
+        # 最终NaN检查
+        if torch.isnan(out).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  ContentAwareMambaFilter: Output contains NaN, returning original x")
+            return x
         
         return out
 
@@ -242,7 +273,7 @@ class GS3Module(nn.Module):
     可直接替换原有的 DisentangleModule
     """
     
-    def __init__(self, dim, num_heads=8, d_state=16, d_conv=4, dropout=0.1):
+    def __init__(self, dim, num_heads=8, d_state=16, d_conv=4, dropout=0.1, logger=None):
         """
         Args:
             dim (int): 特征维度
@@ -250,35 +281,80 @@ class GS3Module(nn.Module):
             d_state (int): Mamba 状态维度
             d_conv (int): Mamba 卷积核大小
             dropout (float): Dropout 比率
+            logger: TrainingMonitor实例
         """
         super().__init__()
+        self.logger = logger
         
         # 阶段 1: 正交投影注意力
         self.opa = OrthogonalProjectionAttention(
             dim=dim,
             num_heads=num_heads,
-            dropout=dropout
+            dropout=dropout,
+            logger=logger
         )
         
         # 阶段 2: 内容感知 Mamba 过滤器
         self.mamba_filter = ContentAwareMambaFilter(
             dim=dim,
             d_state=d_state,
-            d_conv=d_conv
+            d_conv=d_conv,
+            logger=logger
         )
         
-        # 门控机制 (保持与原接口兼容)
-        self.gate = nn.Sequential(
-            nn.Linear(dim * 2, dim),
+        # === 软门控机制 (Soft Gating) - 独立调节 ===
+        # 改进：使用两个独立的门控网络，避免强制互补
+        self.gate_id = nn.Sequential(
+            nn.Linear(dim * 2, dim // 4),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim, 1),
-            nn.Sigmoid()
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid()  # 输出 [0, 1]
+        )
+        
+        self.gate_cloth = nn.Sequential(
+            nn.Linear(dim * 2, dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid()  # 输出 [0, 1]
         )
         
         # 全局池化方式
         self.pool_id = nn.AdaptiveAvgPool1d(1)
         self.pool_cloth = nn.AdaptiveAvgPool1d(1)
+    
+    def compute_gate_diversity_loss(self, gate_id, gate_cloth):
+        """
+        === 改进：更稳定的门控多样性损失 ===
+        目标：鼓励gate_id和gate_cloth都不要太接近0或1
+        """
+        # 方案1：熵正则（鼓励门控接近0.5）
+        entropy_id = -(gate_id * torch.log(gate_id + 1e-8) + 
+                       (1-gate_id) * torch.log(1-gate_id + 1e-8)).mean()
+        entropy_cloth = -(gate_cloth * torch.log(gate_cloth + 1e-8) + 
+                         (1-gate_cloth) * torch.log(1-gate_cloth + 1e-8)).mean()
+        
+        # 方案2：差异正则（鼓励两个gate不同）
+        diversity = -torch.abs(gate_id - gate_cloth).mean()
+        
+        # 组合损失：熵正则（0.3） + 差异正则（0.7）
+        loss = 0.3 * (2.0 - entropy_id - entropy_cloth) + 0.7 * diversity
+        
+        # 调试信息
+        if hasattr(self, '_debug_diversity_counter'):
+            self._debug_diversity_counter += 1
+        else:
+            self._debug_diversity_counter = 0
+        
+        if self._debug_diversity_counter % 200 == 0 and self.logger:
+            self.logger.debug_logger.debug(
+                f"Gate Diversity: entropy_id={entropy_id:.4f}, "
+                f"entropy_cloth={entropy_cloth:.4f}, "
+                f"diversity={diversity:.4f}, total={loss:.6f}"
+            )
+        
+        return loss
         
     def forward(self, x, return_attention=False):
         """
@@ -290,9 +366,12 @@ class GS3Module(nn.Module):
             
         Returns:
             如果 return_attention=False:
-                (id_feat, cloth_feat, gate)
+                (id_feat, cloth_feat, gate_stats, diversity_loss)
             如果 return_attention=True:
-                (id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map)
+                (id_feat, cloth_feat, gate_stats, diversity_loss, id_attn_map, cloth_attn_map)
+                
+            gate_stats: dict包含gate_id和gate_cloth的统计信息
+            diversity_loss: 多样性正则损失
         """
         batch_size, seq_len, dim = x.size()
         
@@ -312,27 +391,43 @@ class GS3Module(nn.Module):
         id_feat = self.pool_id(id_seq_filtered.transpose(1, 2)).squeeze(-1)  # [B, dim]
         cloth_feat = self.pool_cloth(cloth_seq.transpose(1, 2)).squeeze(-1)  # [B, dim]
         
-        # === 阶段 4: 门控平衡 ===
-        gate = self.gate(torch.cat([id_feat, cloth_feat], dim=-1))  # [B, 1]
-        gate = gate.expand(-1, dim)  # [B, dim]
+        # === 阶段 4: 软门控 (Soft Gating) ===
+        # 拼接特征用于门控预测
+        concat_feat = torch.cat([id_feat, cloth_feat], dim=-1)  # [B, dim*2]
         
-        # 应用门控
-        id_feat = gate * id_feat
-        cloth_feat = (1 - gate) * cloth_feat
+        # 独立预测两个门控权重
+        gate_id = self.gate_id(concat_feat)      # [B, dim]
+        gate_cloth = self.gate_cloth(concat_feat)  # [B, dim]
+        
+        # 应用门控（独立调节，不再互补）
+        id_feat_gated = gate_id * id_feat        # [B, dim]
+        cloth_feat_gated = gate_cloth * cloth_feat  # [B, dim]
+        
+        # === 计算改进的多样性正则损失 ===
+        diversity_loss = self.compute_gate_diversity_loss(gate_id, gate_cloth)
+        
+        # === 门控统计信息（用于监控和调试）===
+        gate_stats = {
+            'gate_id_mean': gate_id.mean().item(),
+            'gate_id_std': gate_id.std().item(),
+            'gate_cloth_mean': gate_cloth.mean().item(),
+            'gate_cloth_std': gate_cloth.std().item(),
+            'diversity': torch.abs(gate_id - gate_cloth).mean().item()
+        }
         
         # === 调试信息（不要在训练中频繁调用）===
-        # 注意：这些调试信息会在 monitor 中被调用
-        # 这里只存储必要的中间结果用于后续分析
         if hasattr(self, '_debug_mode') and self._debug_mode:
             self._debug_info = {
                 'id_seq': id_seq,
                 'cloth_seq': cloth_seq,
                 'saliency_score': saliency_score,
                 'id_seq_filtered': id_seq_filtered,
-                'gate': gate
+                'gate_id': gate_id,
+                'gate_cloth': gate_cloth,
+                'gate_stats': gate_stats
             }
         
         if return_attention:
-            return id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map
+            return id_feat_gated, cloth_feat_gated, gate_stats, diversity_loss, id_attn_map, cloth_attn_map
         else:
-            return id_feat, cloth_feat, gate
+            return id_feat_gated, cloth_feat_gated, gate_stats, diversity_loss

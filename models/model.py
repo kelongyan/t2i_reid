@@ -1,22 +1,25 @@
 # src/models/model.py
-import logging
 import math
 from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import BertModel, BertTokenizer, ViTModel
+from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
+from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
 from .gs3_module import GS3Module
 from .residual_classifier import ResidualClassifier, DeepResidualClassifier
 from .vim import VisionMamba
 
-# 设置transformers库的日志级别为ERROR，减少不必要的日志输出
-logging.getLogger("transformers").setLevel(logging.ERROR)
+# 设置transformers库日志级别
+import logging as _logging
+import warnings
+_logging.getLogger("transformers").setLevel(_logging.ERROR)
+warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
 
 
-def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True):
+def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, logger=None):
     """
     Rescale the grid of position embeddings when loading from state_dict. Adapted from DEIT/Vim.
     
@@ -26,13 +29,26 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True):
         num_tokens: Number of special tokens (CLS, etc.).
         gs_new: Target grid size (h, w).
         mid_cls: Whether the CLS token is in the middle (Vim style).
+        logger: Logger instance for debugging
     """
-    logging.info(f"Resizing position embedding: shape {posemb.shape} -> {posemb_new.shape}")
+    if logger:
+        debug_logger.debug(f"Resizing position embedding: {posemb.shape} -> {posemb_new.shape}")
+    
     ntok_new = posemb_new.shape[1]
     
-    # Handle CLS token(s)
+    # 1. 解析输入权重 (Handle Input CLS position)
+    # 如果加载的是 vim_midclstok 权重，CLS token 通常已经在中间了
     if num_tokens:
-        posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[:, num_tokens:]
+        if mid_cls:
+            # 假设预训练权重也是 Mid-CLS 结构
+            old_cls_idx = posemb.shape[1] // 2
+            posemb_tok = posemb[:, old_cls_idx:old_cls_idx+num_tokens]
+            # 拼接除了 CLS 以外的部分
+            posemb_grid = torch.cat([posemb[:, :old_cls_idx], posemb[:, old_cls_idx+num_tokens:]], dim=1)
+        else:
+            # 标准 ViT 结构 [CLS, Grid]
+            posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[:, num_tokens:]
+            
         ntok_new -= num_tokens
     else:
         posemb_tok, posemb_grid = posemb[:, :0], posemb
@@ -40,18 +56,21 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True):
     gs_old = int(math.sqrt(len(posemb_grid[0])))
     
     if ntok_new != len(posemb_grid[0]):
-        logging.info(f'Position embedding grid resize from {gs_old}x{gs_old} to {gs_new[0]}x{gs_new[1]}')
+        if logger:
+            debug_logger.debug(f'Position embedding grid resize from {gs_old}x{gs_old} to {gs_new[0]}x{gs_new[1]}')
         posemb_grid = posemb_grid.reshape(1, gs_old, gs_old, -1).permute(0, 3, 1, 2)
         posemb_grid = F.interpolate(posemb_grid, size=gs_new, mode='bicubic', align_corners=False)
         posemb_grid = posemb_grid.permute(0, 2, 3, 1).flatten(1, 2)
         
-        # Re-assemble
+        # 2. 组装输出权重 (Re-assemble Output)
         if mid_cls:
-            # Vim typically stores pos_embed as [CLS, Patch1, ... PatchN] in checkpoint
-            # but uses it with CLS in middle during forward.
-            # Here we assume the checkpoint format is standard [CLS, Grid].
-            # Interpolation is done on the Grid part.
-            posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
+            # === 关键修复：将 CLS 放回新序列的中间 ===
+            new_cls_idx = posemb_grid.shape[1] // 2
+            posemb = torch.cat([
+                posemb_grid[:, :new_cls_idx], 
+                posemb_tok, 
+                posemb_grid[:, new_cls_idx:]
+            ], dim=1)
         else:
             posemb = torch.cat([posemb_tok, posemb_grid], dim=1)
             
@@ -130,28 +149,93 @@ class DisentangleModule(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, net_config):
+    def __init__(self, net_config, logger=None):
         """
         文本-图像行人重识别模型（消融实验版本），移除了复杂的解纠缠模块。
 
         Args:
             net_config (dict): 模型配置字典，包含BERT路径、ViT路径、融合模块配置等。
+            logger: TrainingMonitor实例，用于记录日志
         """
         super().__init__()
         self.net_config = net_config
-        bert_base_path = Path(net_config.get('bert_base_path', 'pretrained/bert-base-uncased'))
+        self.logger = logger
+        
+        # === Upgrade: Switch to CLIP Text Encoder ===
+        clip_base_path = Path(net_config.get('clip_pretrained', 'pretrained/openai/clip-vit-base-patch16'))
         vit_base_path = Path(net_config.get('vit_pretrained', 'pretrained/vit-base-patch16-224'))
         fusion_config = net_config.get('fusion', {})
         num_classes = net_config.get('num_classes', 8000)
 
         # 验证预训练模型路径
-        if not bert_base_path.exists() or not vit_base_path.exists():
-            raise FileNotFoundError(f"Model path not found: {bert_base_path} or {vit_base_path}")
+        if not clip_base_path.exists():
+            # Fallback to searching in pretrained folder if exact path not found
+            fallback = list(Path("pretrained").glob("**/clip-vit-base-patch16"))
+            if fallback:
+                clip_base_path = fallback[0]
+                if self.logger:
+                    self.debug_logger.warning(f"Exact CLIP path not found, using fallback: {clip_base_path}")
+            else:
+                 # Last resort: try checking parent directories if relative path issue
+                if (Path.cwd() / "pretrained/clip-vit-base-patch16").exists():
+                    clip_base_path = Path.cwd() / "pretrained/clip-vit-base-patch16"
 
-        # 初始化文本编码器和分词器
-        self.tokenizer = BertTokenizer.from_pretrained(str(bert_base_path), do_lower_case=True, use_fast=True)
-        self.text_encoder = BertModel.from_pretrained(str(bert_base_path), weights_only=False)
-        self.text_width = self.text_encoder.config.hidden_size  # BERT隐藏层维度（768）
+        if not clip_base_path.exists() or not vit_base_path.exists():
+             # If strictly not found, still raise error
+            if not clip_base_path.exists():
+                 raise FileNotFoundError(f"CLIP model path not found: {clip_base_path}")
+            if not vit_base_path.exists():
+                 raise FileNotFoundError(f"ViT model path not found: {vit_base_path}")
+
+        # 初始化文本编码器 (CLIP)
+        if self.logger:
+            self.debug_logger.info(f"Loading CLIP Text Encoder from: {clip_base_path}")
+        self.tokenizer = CLIPTokenizer.from_pretrained(str(clip_base_path))
+        
+        # 初始化 CLIPTextModel (使用 safetensors 加载以规避安全检查)
+        self.text_encoder = CLIPTextModel.from_pretrained(str(clip_base_path))
+        
+        # 尝试加载 safetensors 权重 (如果有)
+        safetensors_path = clip_base_path / "model.safetensors"
+        if safetensors_path.exists():
+            if self.logger:
+                self.debug_logger.info(f"Loading CLIP weights from safetensors: {safetensors_path}")
+            state_dict = load_file(str(safetensors_path))
+            
+            # CLIPModel 包含 text_model. 前缀，我们需要剥离它以适配 CLIPTextModel
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith("text_model."):
+                    new_key = k[len("text_model."):]  # remove "text_model." prefix
+                    new_state_dict[new_key] = v
+            
+            if new_state_dict:
+                missing, unexpected = self.text_encoder.load_state_dict(new_state_dict, strict=False)
+                if missing and self.logger:
+                    self.debug_logger.info(f"Loaded CLIP with missing keys (expected for visual part): {len(missing)}")
+            else:
+                if self.logger:
+                    self.debug_logger.warning("No 'text_model.' keys found in safetensors. Assuming pure TextModel format.")
+        
+        self.clip_dim = self.text_encoder.config.hidden_size # 通常是 512
+        self.text_width = 768  # 系统目标维度 (适配 G-S3/Vim)
+
+        # === 维度适配层 (Adapter) ===
+        # 将 CLIP 的 512 维映射到系统的 768 维
+        # 使用 Linear -> LayerNorm -> GELU 增强表达能力
+        if self.clip_dim != self.text_width:
+            self.text_proj = nn.Sequential(
+                nn.Linear(self.clip_dim, self.text_width),
+                nn.LayerNorm(self.text_width),
+                nn.GELU()
+            )
+            # 初始化
+            nn.init.xavier_uniform_(self.text_proj[0].weight)
+            nn.init.zeros_(self.text_proj[0].bias)
+            if self.logger:
+                self.debug_logger.info(f"Added CLIP Adapter: {self.clip_dim} -> {self.text_width} (Linear+LN+GELU)")
+        else:
+            self.text_proj = nn.Identity()
 
         # 初始化图像编码器
         self.vision_backbone_type = net_config.get('vision_backbone', 'vit')
@@ -184,26 +268,31 @@ class Model(nn.Module):
                         state_dict['pos_embed'], 
                         self.visual_encoder.pos_embed, 
                         num_tokens=1, 
-                        gs_new=(grid_h, grid_w)
+                        gs_new=(grid_h, grid_w),
+                        logger=self.logger
                     )
                 
                 # 加载权重 (非严格模式，允许部分不匹配，如头部)
                 missing, unexpected = self.visual_encoder.load_state_dict(state_dict, strict=False)
-                logging.info(f"Loaded Vim backbone from {vim_pretrained_path}")
-                if missing:
-                    logging.warning(f"Missing keys in Vim: {missing}")
+                if self.logger:
+                    self.debug_logger.info(f"Loaded Vim backbone from {vim_pretrained_path}")
+                    if missing:
+                        self.debug_logger.warning(f"Missing keys in Vim: {missing}")
             else:
-                logging.warning(f"Vim pretrained path not found: {vim_pretrained_path}. Using random init.")
+                if self.logger:
+                    self.debug_logger.warning(f"Vim pretrained path not found: {vim_pretrained_path}. Using random init.")
             
             # 投影层：将 Vim 的 384 维映射到 768 维以适配后续模块
             self.visual_proj = nn.Linear(384, self.text_width)
-            logging.info(f"Using Vision Mamba (Vim-S) backbone with projection (384->768), img_size={img_size}")
+            if self.logger:
+                self.debug_logger.info(f"Using Vision Mamba (Vim-S) backbone with projection (384->768), img_size={img_size}")
             
         else:
             # ViT-Base (默认)
             self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
             self.visual_proj = nn.Identity() # ViT 输出已经是 768，无需投影
-            logging.info("Using ViT-Base backbone")
+            if self.logger:
+                self.debug_logger.info("Using ViT-Base backbone")
 
         # 初始化 G-S3 特征分离模块
         disentangle_type = net_config.get('disentangle_type', 'gs3')
@@ -214,12 +303,15 @@ class Model(nn.Module):
                 num_heads=gs3_config.get('num_heads', 8),
                 d_state=gs3_config.get('d_state', 16),
                 d_conv=gs3_config.get('d_conv', 4),
-                dropout=gs3_config.get('dropout', 0.1)
+                dropout=gs3_config.get('dropout', 0.1),
+                logger=self.logger
             )
-            logging.info("Using G-S3 (Geometry-Guided Selective State Space) disentangle module")
+            if self.logger:
+                self.debug_logger.info("Using G-S3 (Geometry-Guided Selective State Space) disentangle module")
         else:
             self.disentangle = DisentangleModule(dim=self.text_width)
-            logging.info("Using simplified disentangle module")
+            if self.logger:
+                self.debug_logger.info("Using simplified disentangle module")
 
         # ================================================================
         # === 方案C：分支解耦 - 为分类和检索使用不同的特征分支 ===
@@ -239,7 +331,8 @@ class Model(nn.Module):
                 num_blocks=3,                 # 3个残差块
                 dropout=0.25
             )
-            logging.info("Using DeepResidualClassifier for classification branch")
+            if self.logger:
+                self.debug_logger.info("Using DeepResidualClassifier for classification branch")
         else:
             # 标准残差分类器（默认）
             self.id_for_classification = ResidualClassifier(
@@ -249,7 +342,8 @@ class Model(nn.Module):
                 num_blocks=2,                 # 2个残差块
                 dropout=0.2
             )
-            logging.info("Using ResidualClassifier for classification branch")
+            if self.logger:
+                self.debug_logger.info("Using ResidualClassifier for classification branch")
         
         # 身份分类器：从1024维映射到类别数
         # 这里只需要一个简单的线性层，因为id_for_classification已经提取了高质量特征
@@ -279,12 +373,13 @@ class Model(nn.Module):
         # cloth_embeds也使用shared_mlp和image_mlp进行投影
         # 这样可以确保cloth特征和id特征在同一空间中对比
         
-        logging.info("=" * 60)
-        logging.info("Branch Decoupling Architecture:")
-        logging.info(f"  - Classification Branch: {self.text_width} → {1024} → {num_classes}")
-        logging.info(f"  - Retrieval Branch: {self.text_width} → 512 → 256")
-        logging.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
-        logging.info("=" * 60)
+        if self.logger:
+            self.debug_logger.info("=" * 60)
+            self.debug_logger.info("Branch Decoupling Architecture:")
+            self.debug_logger.info(f"  - Classification Branch: {self.text_width} → 1024 → {num_classes}")
+            self.debug_logger.info(f"  - Retrieval Branch: {self.text_width} → 512 → 256")
+            self.debug_logger.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
+            self.debug_logger.info("=" * 60)
 
         # 修改为 3 层文本自注意力模块
         self.text_attn_layers = nn.ModuleList([
@@ -302,8 +397,9 @@ class Model(nn.Module):
         self.scale = nn.Parameter(torch.ones(1), requires_grad=True)
 
         # 日志记录初始化信息
-        logging.info(
-            f"Initialized model with scale: {self.scale.item():.4f}, fusion: {fusion_config.get('type', 'None')}")
+        if self.logger:
+            self.debug_logger.info(
+                f"Initialized model with scale: {self.scale.item():.4f}, fusion: {fusion_config.get('type', 'None')}")
 
         # 文本分词结果缓存
         self.text_cache = {}
@@ -347,18 +443,15 @@ class Model(nn.Module):
         id_embeds, _, _ = self.disentangle(image_embeds_raw)  # [batch_size, hidden_size]
         image_embeds = self.shared_mlp(id_embeds)
         image_embeds = self.image_mlp(image_embeds)
-        image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1)
+        image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
         return image_embeds
 
     def encode_text(self, instruction):
         """
-        编码文本，提取文本特征并进行标准化，使用所有 token 进行全局建模。
-
-        Args:
-            instruction (str or list): 输入文本，单个字符串或字符串列表。
-
-        Returns:
-            torch.Tensor: 标准化后的文本嵌入，形状为 [batch_size, 256] 或 [256]（单文本）。
+        编码文本，提取文本特征并进行标准化。
+        Adapted for CLIP:
+        1. Max length 77
+        2. Projection 512 -> 768
         """
         if instruction is None:
             return None
@@ -373,10 +466,11 @@ class Model(nn.Module):
         if cache_key in self.text_cache:
             tokenized = self.text_cache[cache_key]
         else:
+            # CLIP Limit is 77
             tokenized = self.tokenizer(
                 texts,
                 padding='max_length',
-                max_length=64,  # 适合CUHK-PEDES数据集的文本长度
+                max_length=77,  # CLIP specific
                 truncation=True,
                 return_tensors="pt",
                 return_attention_mask=True
@@ -386,19 +480,27 @@ class Model(nn.Module):
         input_ids = tokenized['input_ids'].to(device)
         attention_mask = tokenized['attention_mask'].to(device)
 
-        # BERT编码，禁用梯度以提升效率
-        with torch.no_grad():
-            text_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
-        text_embeds = text_outputs.last_hidden_state  # [batch_size, seq_len, hidden_size]
+        # CLIP编码
+        # CLIP output: last_hidden_state=[B, 77, 512], pooler_output=[B, 512]
+        # 我们使用 last_hidden_state 以保留序列信息用于后续 Attention
+        text_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
+        text_embeds = text_outputs.last_hidden_state 
+        
+        # === 维度适配: 512 -> 768 ===
+        text_embeds = self.text_proj(text_embeds) # [B, 77, 768]
 
         # 3 层自注意力处理
+        # 注意: CLIP attention mask 是 1 (attend), 0 (ignore)
+        # nn.MultiheadAttention key_padding_mask 需要 True (ignore), False (attend)
+        # 所以使用 ~attention_mask.bool()
+        
         text_embeds = text_embeds.transpose(0, 1)  # [seq_len, batch_size, hidden_size]
         for attn, norm in zip(self.text_attn_layers, self.text_attn_norm_layers):
             attn_output, _ = attn(
                 query=text_embeds,
                 key=text_embeds,
                 value=text_embeds,
-                key_padding_mask=~attention_mask.bool()  # 忽略填充 token
+                key_padding_mask=~attention_mask.bool()
             )
             text_embeds = attn_output + text_embeds  # 残差连接
             text_embeds = norm(text_embeds)
@@ -412,7 +514,8 @@ class Model(nn.Module):
         # 降维和标准化
         text_embeds = self.shared_mlp(text_embeds)
         text_embeds = self.text_mlp(text_embeds)
-        text_embeds = torch.nn.functional.normalize(text_embeds, dim=-1)
+        # 使用更稳定的归一化，添加eps避免除零
+        text_embeds = torch.nn.functional.normalize(text_embeds, dim=-1, eps=1e-8)
 
         if not isinstance(instruction, list):
             text_embeds = text_embeds.squeeze(0)
@@ -458,18 +561,54 @@ class Model(nn.Module):
                 image_outputs = self.visual_encoder(image)
                 image_embeds_raw = image_outputs.last_hidden_state  # [B, 197, 768]
             
+            # 检查编码器输出NaN
+            if torch.isnan(image_embeds_raw).any():
+                if self.logger:
+                    self.debug_logger.error("⚠️  CRITICAL: Visual encoder output contains NaN!")
+                # 返回零张量避免崩溃
+                image_embeds_raw = torch.zeros_like(image_embeds_raw)
+            
             # === 维度对齐 (Vim 384 -> 768, ViT 768 -> 768) ===
             image_embeds_raw = self.visual_proj(image_embeds_raw)
+            
+            # 检查投影后NaN
+            if torch.isnan(image_embeds_raw).any():
+                if self.logger:
+                    self.debug_logger.error("⚠️  CRITICAL: Visual projection output contains NaN!")
+                image_embeds_raw = torch.zeros_like(image_embeds_raw)
             
             # ============================================================
             # 步骤1：G-S3解耦，得到id和cloth特征
             # ============================================================
             if return_attention:
-                id_embeds, cloth_embeds, gate, id_attn_map, cloth_attn_map = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats, diversity_loss, id_attn_map, cloth_attn_map = self.disentangle(
                     image_embeds_raw, return_attention=True)
             else:
-                id_embeds, cloth_embeds, gate = self.disentangle(
+                id_embeds, cloth_embeds, gate_stats, diversity_loss = self.disentangle(
                     image_embeds_raw, return_attention=False)
+            
+            # 存储diversity_loss用于后续loss计算
+            self.diversity_loss = diversity_loss
+            
+            # NaN检查
+            if torch.isnan(id_embeds).any():
+                if self.logger:
+                    self.debug_logger.error("⚠️  CRITICAL: id_embeds contains NaN after disentangle!")
+                id_embeds = torch.zeros_like(id_embeds)
+            if torch.isnan(cloth_embeds).any():
+                if self.logger:
+                    self.debug_logger.error("⚠️  CRITICAL: cloth_embeds contains NaN after disentangle!")
+                cloth_embeds = torch.zeros_like(cloth_embeds)
+            
+            # gate_stats现在是一个dict，记录到日志
+            if self.logger and hasattr(self, '_log_counter_gate'):
+                self._log_counter_gate = getattr(self, '_log_counter_gate', 0) + 1
+                if self._log_counter_gate % 200 == 0:
+                    self.debug_logger.debug(
+                        f"Gate stats: ID[mean={gate_stats['gate_id_mean']:.4f}, std={gate_stats['gate_id_std']:.4f}], "
+                        f"Cloth[mean={gate_stats['gate_cloth_mean']:.4f}, std={gate_stats['gate_cloth_std']:.4f}], "
+                        f"Diversity={gate_stats['diversity']:.4f}"
+                    )
             
             # 存储中间特征用于调试（仅在 debug 模式下）
             if hasattr(self, '_debug_mode') and self._debug_mode:
@@ -477,7 +616,7 @@ class Model(nn.Module):
                     'image_embeds_raw': image_embeds_raw,
                     'id_embeds': id_embeds,
                     'cloth_embeds': cloth_embeds,
-                    'gate': gate
+                    'gate_stats': gate_stats
                 }
                 if hasattr(self.disentangle, '_debug_info'):
                     self._debug_features.update(self.disentangle._debug_info)
@@ -497,7 +636,7 @@ class Model(nn.Module):
             # id_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             image_embeds = self.shared_mlp(id_embeds)
             image_embeds = self.image_mlp(image_embeds)
-            image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1)
+            image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
             
             # ============================================================
             # 步骤4：分支3 - cloth检索分支（用于cloth_semantic）
@@ -505,7 +644,7 @@ class Model(nn.Module):
             # cloth_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             cloth_image_embeds = self.shared_mlp(cloth_embeds)
             cloth_image_embeds = self.image_mlp(cloth_image_embeds)
-            cloth_image_embeds = torch.nn.functional.normalize(cloth_image_embeds, dim=-1)
+            cloth_image_embeds = torch.nn.functional.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
         else:
             image_embeds = None
             cloth_image_embeds = None
@@ -519,14 +658,15 @@ class Model(nn.Module):
         fused_embeds, gate_weights = None, None
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
             fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
-            fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1)
+            fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1, eps=1e-8)
         
         # ============================================================
-        # 返回值（新增id_cls_features）
+        # 返回值（更新gate为gate_stats）
         # ============================================================
+        # 注意：gate_stats是dict，包含门控统计信息
         base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
-                       cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights,
-                       id_cls_features)  # 新增：用于高级损失（如center loss）
+                       cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights,
+                       id_cls_features)  # gate_stats替代原来的gate
         
         if return_attention:
             return base_outputs + (id_attn_map, cloth_attn_map)
@@ -547,5 +687,6 @@ class Model(nn.Module):
         checkpoint = torch.load(trained_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
         self = copy_state_dict(state_dict, self)
-        logging.info(f"Loaded checkpoint from {trained_path}, scale: {self.scale.item():.4f}")
+        if self.logger:
+            self.debug_logger.info(f"Loaded checkpoint from {trained_path}, scale: {self.scale.item():.4f}")
         return self

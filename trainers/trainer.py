@@ -1,12 +1,40 @@
 # src/trainer/trainer.py
-import logging
 import torch
+import torch.nn as nn
 from pathlib import Path
 from tqdm import tqdm
 from losses.loss import Loss
 from evaluators.evaluator import Evaluator
 from utils.serialization import save_checkpoint
 from utils.meters import AverageMeter
+
+class EarlyStopping:
+    """早停机制，防止过拟合"""
+    def __init__(self, patience=10, min_delta=0.001, logger=None):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.logger = logger
+        self.best_score = None
+        self.counter = 0
+        self.early_stop = False
+    
+    def __call__(self, mAP):
+        if self.best_score is None:
+            self.best_score = mAP
+        elif mAP < self.best_score - self.min_delta:
+            self.counter += 1
+            if self.logger:
+                self.logger.debug_logger.info(
+                    f"EarlyStopping: {self.counter}/{self.patience} "
+                    f"(best={self.best_score:.4f}, current={mAP:.4f})"
+                )
+            if self.counter >= self.patience:
+                self.early_stop = True
+                if self.logger:
+                    self.logger.warning("Early stopping triggered!")
+        else:
+            self.best_score = mAP
+            self.counter = 0
 
 class Trainer:
     def __init__(self, model, args, monitor=None, runner=None):
@@ -27,10 +55,101 @@ class Trainer:
         for key, value in default_loss_weights.items():
             if key not in loss_weights:
                 loss_weights[key] = value
-        self.combined_loss = Loss(temperature=0.1, weights=loss_weights).to(self.device)
+        self.combined_loss = Loss(temperature=0.1, weights=loss_weights, logger=monitor).to(self.device)
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
         if args.fp16 and self.device.type != 'cuda':
-            logging.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
+            if self.monitor: self.monitor.logger.warning("FP16 is enabled but no CUDA device is available. Disabling mixed precision.")
+
+    def reinit_clip_bias_layers(self, model, logger=None):
+        """重新初始化CLIP文本编码器的bias，防止梯度消失"""
+        reinitialized_count = 0
+        for name, param in model.named_parameters():
+            if 'text_encoder' in name and 'bias' in name and param.requires_grad:
+                # 使用较小的std初始化
+                nn.init.normal_(param, std=0.02)
+                reinitialized_count += 1
+                if logger and reinitialized_count <= 5:  # 只打印前5个
+                    logger.debug_logger.info(f"Reinitialized CLIP bias: {name}")
+        if logger:
+            logger.debug_logger.info(f"Total CLIP bias params reinitialized: {reinitialized_count}")
+    
+    def build_optimizer_with_lr_groups(self, model, stage):
+        """为新解冻层设置独立学习率"""
+        if stage >= 2:
+            # CLIP文本编码器后几层使用0.5倍学习率
+            clip_params = []
+            other_params = []
+            
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    if 'text_encoder.text_model.encoder' in name:
+                        try:
+                            layer_num = int(name.split('.')[4])  # text_model.encoder.layers.11
+                            if layer_num >= 11:
+                                clip_params.append(param)
+                                continue
+                        except (IndexError, ValueError):
+                            pass
+                    other_params.append(param)
+            
+            if clip_params:
+                param_groups = [
+                    {'params': clip_params, 'lr': self.args.lr * 0.5, 'name': 'clip_text', 'weight_decay': self.args.weight_decay},
+                    {'params': other_params, 'lr': self.args.lr, 'name': 'others', 'weight_decay': self.args.weight_decay}
+                ]
+                if self.monitor:
+                    self.monitor.logger.info(f"Built optimizer with {len(clip_params)} CLIP params (0.5x lr) and {len(other_params)} other params")
+                return torch.optim.AdamW(param_groups)
+        return self._build_default_optimizer(model)
+    
+    def _build_default_optimizer(self, model):
+        """默认优化器构建方法"""
+        return torch.optim.AdamW(
+            [p for p in model.parameters() if p.requires_grad],
+            lr=self.args.lr,
+            weight_decay=self.args.weight_decay
+        )
+    
+    def _get_warmup_lr(self, base_lr, current_step, warmup_steps):
+        """学习率预热"""
+        if current_step < warmup_steps:
+            return base_lr * (current_step / warmup_steps)
+        return base_lr
+    
+    def build_scheduler_with_cosine_warmup(self, optimizer, num_training_steps, num_warmup_steps):
+        """余弦退火+预热学习率"""
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=num_training_steps - num_warmup_steps
+        )
+    
+    def clip_grad_norm_by_layer(self, model, max_norm=1.0):
+        """对不同层使用不同的梯度裁剪阈值"""
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                # CLIP文本编码器：更严格的裁剪
+                if 'text_encoder' in name:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.5)
+                # 新解冻的层：较宽松的裁剪
+                elif 'layers' in name:
+                    try:
+                        layer_num = int([s for s in name.split('.') if s.isdigit()][0])
+                        if layer_num >= 11:
+                            torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 2.0)
+                        else:
+                            torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
+                    except (IndexError, ValueError):
+                        torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
+                else:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
+    
+    def enable_batch_norm_warmup(self, model, momentum=0.01):
+        """为新解冻的层启用BatchNorm预热"""
+        for module in model.modules():
+            if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d)):
+                module.momentum = momentum  # 降低momentum，加快统计量更新
+                module.track_running_stats = True
+        if self.monitor:
+            self.monitor.logger.info(f"BatchNorm warmup enabled with momentum={momentum}")
 
     def run(self, inputs, epoch, batch_idx, total_batches):
         # 执行单次训练步骤，计算所有损失
@@ -51,20 +170,23 @@ class Trainer:
             # 训练时不需要注意力图，return_attention=False（默认值）
             outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-            # 训练时模型返回 11 个输出（增加了id_cls_features）
+            # 训练时模型返回 11 个输出（gate现在是gate_stats字典）
             if len(outputs) != 11:
                 raise ValueError(f"Expected 11 model outputs during training, got {len(outputs)}")
 
             image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights, \
+            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
             id_cls_features = outputs
+            
+            # 从模型获取diversity_loss
+            diversity_loss = self.model.diversity_loss if hasattr(self.model, 'diversity_loss') else None
 
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate,
-                id_cls_features=id_cls_features  # 新增：传入分类分支特征
+                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
+                id_cls_features=id_cls_features, diversity_loss=diversity_loss
             )
 
         # 记录模型内部状态信息
@@ -74,11 +196,16 @@ class Trainer:
             self.monitor.log_feature_statistics(fused_feats, "fused_features")
             self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
             self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
-            self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_features")
-            self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_features")
+            self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
+            self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
 
-            if gate is not None:
-                self.monitor.log_gate_weights(gate, "disentangle_gate")
+            # gate_stats是dict，记录统计信息
+            if gate_stats is not None and isinstance(gate_stats, dict):
+                self.monitor.debug_logger.debug(
+                    f"Gate stats: ID[{gate_stats.get('gate_id_mean', 0):.4f}], "
+                    f"Cloth[{gate_stats.get('gate_cloth_mean', 0):.4f}], "
+                    f"Diversity[{gate_stats.get('diversity', 0):.4f}]"
+                )
             if gate_weights is not None:
                 self.monitor.log_gate_weights(gate_weights, "fusion_gate")
 
@@ -96,7 +223,7 @@ class Trainer:
             for image, cloth_captions, id_captions, pid, cam_id, is_matched in train_loader:
                 image = image.to(self.device)
                 outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
-                image_feats, id_text_feats, _, _, _, _, _, _, _, gate_weights = outputs
+                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights = outputs
                 sim = torch.matmul(image_feats, id_text_feats.t())
                 pos_sim = sim.diag().mean().item()
                 neg_sim = sim[~torch.eye(sim.shape[0], dtype=bool, device=self.device)].mean().item()
@@ -124,63 +251,106 @@ class Trainer:
         best_checkpoint_path = None
         total_batches = len(train_loader)
         loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
+        
+        # 【新增】早停机制
+        early_stopping = EarlyStopping(patience=10, min_delta=0.001, logger=self.monitor)
+        
+        # 【新增】学习率预热和全局步数
+        warmup_steps = 1000
+        global_step = 0
 
         for epoch in range(1, self.args.epochs + 1):
             # 【方案B：渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
             stage_changed = False
             if self.runner:
-                if epoch == 11:  # Stage 2: 解冻ViT后4层 (关键修复！)
+                if epoch == 11:  # Stage 2: Vim后8层 + CLIP后1层
                     print("\n" + "="*70)
-                    print("🔓 Progressive Unfreezing: Stage 2")
-                    print("="*70)
-                    print("Epoch 11-30: Unfreezing ViT last 4 layers (layer 8-11)")
-                    print("             + BERT last 4 layers (layer 8-11)")
-                    print("Goal: Let classification head see learnable ViT features")
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 2")
+                    if self.monitor: self.monitor.logger.info("=" * 70)
+                    if self.monitor: self.monitor.logger.info("Epoch 11-30: Unfreezing Vim last 8 layers (layer 16-23)")
+                    if self.monitor: self.monitor.logger.info("             + CLIP last 1 layer (layer 11)")
+                    if self.monitor: self.monitor.logger.info("Goal: Initial adaptation of CLIP semantic space")
                     print("="*70 + "\n")
-                    self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=8)
-                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=8)
-                    # 重新构建优化器和调度器
-                    optimizer = self.runner.build_optimizer(self.model, stage=2)
-                    lr_scheduler = self.runner.build_scheduler(optimizer)
-                    stage_changed = True
-                elif epoch == 31:  # Stage 3: 解冻ViT后8层
-                    print("\n" + "="*70)
-                    print("🔓 Progressive Unfreezing: Stage 3")
-                    print("="*70)
-                    print("Epoch 31-60: Unfreezing ViT last 8 layers (layer 4-11)")
-                    print("             + BERT last 8 layers (layer 4-11)")
-                    print("Goal: Deep feature adaptation for ReID task")
-                    print("="*70 + "\n")
-                    self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=4)
+                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=11)
                     self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
-                    optimizer = self.runner.build_optimizer(self.model, stage=3)
-                    lr_scheduler = self.runner.build_scheduler(optimizer)
+                    
+                    # 【新增】重新初始化CLIP bias防止梯度消失
+                    self.reinit_clip_bias_layers(self.model, self.monitor)
+                    
+                    # 【新增】使用分层学习率优化器
+                    optimizer = self.build_optimizer_with_lr_groups(self.model, stage=2)
+                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                        optimizer, 
+                        num_training_steps=(self.args.epochs - 10) * total_batches,
+                        num_warmup_steps=warmup_steps
+                    )
+                    
+                    # 【新增】启用BatchNorm预热
+                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                    
                     stage_changed = True
+                    global_step = 0  # 重置全局步数
+                elif epoch == 31:  # Stage 3: Vim后12层 + CLIP后6层
+                    print("\n" + "="*70)
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 3")
+                    if self.monitor: self.monitor.logger.info("=" * 70)
+                    if self.monitor: self.monitor.logger.info("Epoch 31-60: Unfreezing Vim last 12 layers")
+                    if self.monitor: self.monitor.logger.info("             + CLIP last 6 layers (layer 6-11)")
+                    if self.monitor: self.monitor.logger.info("Goal: Deep interaction tuning")
+                    print("="*70 + "\n")
+                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=6)
+                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=6)
+                    
+                    # 【新增】使用分层学习率优化器
+                    optimizer = self.build_optimizer_with_lr_groups(self.model, stage=3)
+                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                        optimizer,
+                        num_training_steps=(self.args.epochs - 30) * total_batches,
+                        num_warmup_steps=warmup_steps
+                    )
+                    
+                    # 【新增】启用BatchNorm预热
+                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                    
+                    stage_changed = True
+                    global_step = 0  # 重置全局步数
                 elif epoch == 61:  # Stage 4: 全部解冻
                     print("\n" + "="*70)
-                    print("🔓 Progressive Unfreezing: Stage 4")
-                    print("="*70)
-                    print("Epoch 61-80: Unfreezing all BERT and ViT layers")
-                    print("Goal: End-to-end fine-tuning")
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 4")
+                    if self.monitor: self.monitor.logger.info("=" * 70)
+                    if self.monitor: self.monitor.logger.info("Epoch 61-80: Unfreezing all CLIP and Vim layers")
+                    if self.monitor: self.monitor.logger.info("Goal: End-to-end fine-tuning")
                     print("="*70 + "\n")
-                    self.runner.freeze_bert_layers(self.model, unfreeze_from_layer=0)
+                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=0)
                     self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
-                    optimizer = self.runner.build_optimizer(self.model, stage=4)
-                    lr_scheduler = self.runner.build_scheduler(optimizer)
-                    stage_changed = True
                     
+                    # 【新增】使用默认优化器（所有层相同学习率）
+                    optimizer = self._build_default_optimizer(self.model)
+                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                        optimizer,
+                        num_training_steps=(self.args.epochs - 60) * total_batches,
+                        num_warmup_steps=warmup_steps
+                    )
+                    
+                    # 【新增】启用BatchNorm预热
+                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                    
+                    stage_changed = True
+                    global_step = 0  # 重置全局步数
+            
             if stage_changed and self.monitor:
                 self.monitor.logger.info(f"Stage changed at epoch {epoch}")
+                if self.monitor:
+                    self.monitor.logger.info(f"Learning rate warmup enabled for {warmup_steps} steps")
             
-            # 打印上一个 epoch 的平均损失
+            # 显示上一个epoch的平均损失（仅记录到日志，不在终端显示以避免重复）
             if epoch > 1:
                 avg_losses = self._format_loss_display(loss_meters)
                 if avg_losses:
-                    # 将平均损失记录到日志，而不是打印到终端
+                    avg_loss_str = ', '.join(avg_losses)
+                    # 仅记录到日志，评估阶段会单独打印损失
                     if self.monitor:
-                        self.monitor.logger.info(f"[Epoch {epoch-1} Avg Loss:] : {', '.join(avg_losses)}")
-                    else:
-                        print(f"[Avg Loss:] : {', '.join(avg_losses)}")
+                        self.monitor.logger.info(f"[Epoch {epoch-1} Avg Loss]: {avg_loss_str}")
 
             # 重置损失记录器
             for meter in loss_meters.values():
@@ -192,6 +362,13 @@ class Trainer:
             )
 
             for i, inputs in enumerate(progress_bar):
+                # 【新增】学习率预热
+                if stage_changed and global_step < warmup_steps:
+                    for param_group in optimizer.param_groups:
+                        base_lr = param_group.get('initial_lr', param_group['lr'])
+                        warmup_lr = self._get_warmup_lr(base_lr, global_step, warmup_steps)
+                        param_group['lr'] = warmup_lr
+                
                 optimizer.zero_grad()
                 loss_dict = self.run(inputs, epoch, i, total_batches)
                 loss = loss_dict['total']
@@ -199,29 +376,41 @@ class Trainer:
                 if self.scaler:
                     self.scaler.scale(loss).backward()
                     
-                    # 梯度裁剪：放宽限制，允许分类损失更快下降
-                    self.scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
-
-                    # 记录梯度流动（每1000个batch记录一次）
-                    if self.monitor and i % 1000 == 0:
-                        self.monitor.log_gradient_flow(self.model)
-                    # 记录基础梯度信息（每100个batch）
-                    elif self.monitor and i % 100 == 0:
-                        self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
-
-                    # 检查是否有有效梯度
+                    # [Fix] Check for gradients BEFORE unscale to prevent scaler errors
                     has_grads = any(p.grad is not None for group in optimizer.param_groups for p in group['params'])
+                    
                     if has_grads:
+                        # 【修改】使用分层梯度裁剪
+                        self.scaler.unscale_(optimizer)
+                        self.clip_grad_norm_by_layer(self.model, max_norm=2.0)
+
+                        # 记录梯度流动（每1000个batch记录一次）
+                        if self.monitor and i % 1000 == 0:
+                            self.monitor.log_gradient_flow(self.model)
+                        # 记录基础梯度信息（每100个batch）
+                        elif self.monitor and i % 100 == 0:
+                            self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
+
                         self.scaler.step(optimizer)
                         self.scaler.update()
                     else:
-                        logging.warning(f"⚠️  Skipping step at epoch {epoch} batch {i}: No gradients found (likely due to NaN loss).")
+                        if self.monitor: self.monitor.debug_logger.warning(f"⚠️  Skipping step at epoch {epoch} batch {i}: No gradients found (likely disconnected graph or unused params).")
+                        # Debug info for first occurrence
+                        if i == 0:
+                            trainable_params = [n for n, p in self.model.named_parameters() if p.requires_grad]
+                            if self.monitor: self.monitor.debug_logger.warning(f"Trainable params count: {len(trainable_params)}")
+                            if self.monitor: self.monitor.debug_logger.warning("Sample trainable params with None grad:")
+                            count = 0
+                            for n, p in self.model.named_parameters():
+                                if p.requires_grad and p.grad is None:
+                                    if self.monitor: self.monitor.debug_logger.warning(f"  - {n}")
+                                    count += 1
+                                    if count > 10: break
                 else:
                     loss.backward()
                     
-                    # 梯度裁剪：放宽限制
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=2.0)
+                    # 【修改】使用分层梯度裁剪
+                    self.clip_grad_norm_by_layer(self.model, max_norm=2.0)
 
                     # 记录梯度流动（每1000个batch记录一次）
                     if self.monitor and i % 1000 == 0:
@@ -247,6 +436,8 @@ class Trainer:
                     self.monitor.log_batch_info(epoch, i, total_batches,
                                               {k: v.avg for k, v in loss_meters.items()},
                                               current_lr)
+                
+                global_step += 1
 
             progress_bar.close()
             
@@ -270,16 +461,25 @@ class Trainer:
 
                 current_mAP = metrics['mAP']
 
-                # 记录评估结果到日志
-                if self.monitor:
-                    self.monitor.logger.info(f"Epoch {epoch} - Evaluation Results: {metrics}")
-                
-                # 按照用户要求，在终端竖列显示评估指标
-                print(f"\n[Epoch {epoch} Evaluation Results]")
+                # 同时在终端和日志显示评估结果
+                print(f"\n{'='*60}")
+                print(f"Epoch {epoch} Evaluation Results:")
                 print(f"  mAP:    {metrics['mAP']:.4f}")
                 print(f"  Rank-1: {metrics['rank1']:.4f}")
                 print(f"  Rank-5: {metrics['rank5']:.4f}")
-                print(f"  Rank-10: {metrics['rank10']:.4f}\n")
+                print(f"  Rank-10: {metrics['rank10']:.4f}")
+                print(f"{'='*60}\n")
+                
+                # 同时记录到日志文件
+                if self.monitor:
+                    self.monitor.logger.info(f"Epoch {epoch}: mAP={metrics['mAP']:.4f}, R1={metrics['rank1']:.4f}, R5={metrics['rank5']:.4f}, R10={metrics['rank10']:.4f}")
+
+                # 【新增】早停检查
+                early_stopping(current_mAP)
+                if early_stopping.early_stop:
+                    if self.monitor:
+                        self.monitor.logger.info(f"Training stopped early at epoch {epoch}")
+                    break
 
                 # 保存最优检查点
                 if current_mAP > best_mAP:
@@ -357,21 +557,27 @@ class Trainer:
                         if self.monitor:
                             self.monitor.logger.warning("checkpoint_dir not provided, cannot save best checkpoint")
 
-        # 记录最终结果
+        # 显示训练完成信息（终端+日志）
+        print(f"\n{'='*60}")
+        print(f"🎉 Training Completed!")
+        print(f"   Best mAP: {best_mAP:.4f}")
+        if best_checkpoint_path:
+            print(f"   Best Model: {best_checkpoint_path}")
+        print(f"{'='*60}\n")
+        
         if self.monitor:
             self.monitor.logger.info(f"Training completed. Best mAP: {best_mAP:.4f}")
 
-        # 打印最终平均损失
+        # 显示最终平均损失
         avg_losses = self._format_loss_display(loss_meters)
         if avg_losses:
-            # 将最终平均损失记录到日志，而不是打印到终端
+            avg_loss_str = ', '.join(avg_losses)
+            print(f"[Final Avg Loss]: {avg_loss_str}")
             if self.monitor:
-                self.monitor.logger.info(f"[Final Avg Loss:] : {', '.join(avg_losses)}")
-            else:
-                print(f"[Avg Loss:] : {', '.join(avg_losses)}")
+                self.monitor.logger.info(f"[Final Avg Loss]: {avg_loss_str}")
 
         if best_checkpoint_path:
-            logging.info(f"Final best checkpoint: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
+            if self.monitor: self.monitor.logger.info(f"Final best checkpoint: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
 
     def _get_dataset_name(self):
         """获取数据集名称用于模型文件命名"""

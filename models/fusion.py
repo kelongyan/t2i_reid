@@ -5,7 +5,7 @@ from mamba_ssm import Mamba
 class EnhancedMambaFusion(nn.Module):
     """优化后的 Mamba SSM 融合模块，门控机制前置，用于高效整合图像和文本特征。"""
     
-    def __init__(self, dim, d_state=16, d_conv=4, num_layers=3, output_dim=256, dropout=0.1):
+    def __init__(self, dim, d_state=16, d_conv=4, num_layers=3, output_dim=256, dropout=0.1, logger=None):
         """
         初始化增强 Mamba 融合模块。
 
@@ -16,8 +16,10 @@ class EnhancedMambaFusion(nn.Module):
             num_layers (int): Mamba 层数，默认为 3。
             output_dim (int): 输出特征维度，默认为 256。
             dropout (float): Dropout 比率，默认为 0.1。
+            logger: TrainingMonitor实例
         """
         super().__init__()
+        self.logger = logger
         # 模态对齐层：三层 MLP，带 ReLU 和 LayerNorm
         self.image_align = nn.Sequential(
             nn.Linear(dim, dim),  # 第一层线性变换
@@ -83,13 +85,36 @@ class EnhancedMambaFusion(nn.Module):
                 - fused_features: 融合特征，形状为 [batch_size, output_dim]。
                 - gate_weights: 门控权重，形状为 [batch_size, 2]，用于正则化损失。
         """
+        # NaN检查输入
+        if torch.isnan(image_features).any() or torch.isnan(text_features).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  EnhancedMambaFusion: Input contains NaN, returning zeros")
+            batch_size = image_features.size(0) if not torch.isnan(image_features).any() else text_features.size(0)
+            device = image_features.device if not torch.isnan(image_features).any() else text_features.device
+            return torch.zeros(batch_size, self.fc.out_features, device=device), \
+                   torch.ones(batch_size, 2, device=device) * 0.5
+        
         # 模态对齐：通过三层 MLP 处理图像和文本特征
         image_features = self.image_align(image_features)  # [batch_size, dim]
         text_features = self.text_align(text_features)    # [batch_size, dim]
         
+        # NaN检查对齐后特征
+        if torch.isnan(image_features).any() or torch.isnan(text_features).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  EnhancedMambaFusion: Aligned features contain NaN")
+            image_features = torch.where(torch.isnan(image_features), torch.zeros_like(image_features), image_features)
+            text_features = torch.where(torch.isnan(text_features), torch.zeros_like(text_features), text_features)
+        
         # 前置门控：基于对齐特征生成权重
         concat_features = torch.cat([image_features, text_features], dim=-1)  # [batch_size, dim*2]
         gate_weights = self.gate(concat_features)  # [batch_size, 2]
+        
+        # NaN检查门控权重
+        if torch.isnan(gate_weights).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  EnhancedMambaFusion: gate_weights contain NaN, using uniform weights")
+            gate_weights = torch.ones_like(gate_weights) * 0.5
+        
         image_weight, text_weight = gate_weights[:, 0:1], gate_weights[:, 1:2]  # [batch_size, 1]
         
         # 加权拼接：对对齐特征进行加权后拼接
@@ -103,6 +128,13 @@ class EnhancedMambaFusion(nn.Module):
         for mamba, norm in zip(self.mamba_layers, self.mamba_norms):
             residual = mamba_output
             mamba_output = mamba(mamba_output)  # [batch_size, 1, dim*2]
+            
+            # NaN检查Mamba输出
+            if torch.isnan(mamba_output).any():
+                if self.logger:
+                    self.logger.debug_logger.warning("⚠️  EnhancedMambaFusion: Mamba output contains NaN, using residual")
+                mamba_output = residual
+            
             mamba_output = norm(mamba_output + residual)  # 残差连接
         
         mamba_output = mamba_output.squeeze(1)  # [batch_size, dim*2]
@@ -111,6 +143,12 @@ class EnhancedMambaFusion(nn.Module):
         fused_features = self.fc(mamba_output)  # [batch_size, output_dim]
         fused_features = self.dropout(fused_features)
         fused_features = self.norm_final(fused_features)
+        
+        # 最终NaN检查
+        if torch.isnan(fused_features).any():
+            if self.logger:
+                self.logger.debug_logger.warning("⚠️  EnhancedMambaFusion: Output contains NaN, returning zeros")
+            fused_features = torch.zeros_like(fused_features)
         
         return fused_features, gate_weights
 

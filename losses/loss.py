@@ -11,10 +11,11 @@ class Loss(nn.Module):
     - P2: 重新设计gate_adaptive（使用对比学习）
     - 修复cloth_semantic去ID正则（添加维度转换）
     """
-    def __init__(self, temperature=0.1, weights=None, num_classes=None):
+    def __init__(self, temperature=0.1, weights=None, num_classes=None, logger=None):
         super().__init__()
         self.temperature = temperature
         self.num_classes = num_classes
+        self.logger = logger
         
         # 使用Label Smoothing降低分类损失的初始值
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -27,6 +28,7 @@ class Loss(nn.Module):
             'cloth_semantic': 0.15, # 服装语义 (损失~4.5，加权后~0.7)
             'orthogonal': 0.3,      # 正交约束 (损失~0.01，加权后~0.003)
             'gate_adaptive': 0.02,  # 门控自适应 (损失~0.5，加权后~0.01)
+            'diversity': 0.05,      # 门控多样性正则（新增，软门控专用）
         }
         
         # 动态权重调整参数
@@ -36,6 +38,13 @@ class Loss(nn.Module):
         # 移除额外的投影层，简化cloth_semantic
         # 原因：增加不必要的复杂度和训练难度
         self.use_decouple_penalty = False  # 禁用去ID正则
+        
+        # 注册一个dummy参数用于获取设备
+        self.register_buffer('_dummy', torch.zeros(1))
+    
+    def _get_device(self):
+        """安全获取设备"""
+        return self._dummy.device
     
     def _initialize_projection_layers(self, device):
         """动态初始化投影层"""
@@ -45,70 +54,64 @@ class Loss(nn.Module):
     
     def update_epoch(self, epoch):
         """
-        === 修复方案：渐进式权重调整 ===
-        让CLS权重逐步提高，cloth_semantic保持稳定
+        === 优化后的动态权重调整 ===
+        核心改进：
+        1. 降低cloth_semantic初始权重（0.15 -> 0.1）
+        2. 降低cls增长速度（0.08+0.002*e -> 0.06+0.001*e）
+        3. 提高gate_adaptive权重（0.02 -> 0.05）
         """
         self.current_epoch = epoch
         
         if not self.enable_dynamic_weights:
             return
         
-        # 阶段1 (1-20): 预热期，让模型适应任务
-        # CLS缓慢学习，主要靠InfoNCE建立基础特征空间
+        # 阶段1 (1-20): 预热期
         if epoch <= 20:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.08 + 0.002 * epoch  # 0.08→0.12 线性增长
-            self.weights['cloth_semantic'] = 0.15
-            self.weights['orthogonal'] = 0.3 + 0.01 * epoch  # 0.3→0.5 逐步增强
-            self.weights['gate_adaptive'] = 0.02
+            self.weights['cls'] = 0.06 + 0.001 * epoch  # 0.06->0.08 (更慢增长)
+            self.weights['cloth_semantic'] = 0.10  # 降低初始权重
+            self.weights['orthogonal'] = 0.2  # 降低初始权重
+            self.weights['gate_adaptive'] = 0.05  # 提高初始权重
+            self.weights['diversity'] = 0.05
             
-        # 阶段2 (21-40): 加速期，CLS开始主导
+        # 阶段2 (21-40): 稳定期
         elif epoch <= 40:
-            progress = (epoch - 20) / 20  # 0→1
+            progress = (epoch - 20) / 20
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.12 + 0.18 * progress  # 0.12→0.3
-            self.weights['cloth_semantic'] = 0.15 + 0.05 * progress  # 0.15→0.2
-            self.weights['orthogonal'] = 0.5 - 0.2 * progress  # 0.5→0.3（解耦任务完成，降低权重）
-            self.weights['gate_adaptive'] = 0.02 + 0.03 * progress  # 0.02→0.05
+            self.weights['cls'] = 0.08 + 0.10 * progress  # 0.08->0.18
+            self.weights['cloth_semantic'] = 0.10 + 0.05 * progress  # 0.10->0.15
+            self.weights['orthogonal'] = 0.2 - 0.05 * progress  # 0.2->0.15
+            self.weights['gate_adaptive'] = 0.05 + 0.05 * progress  # 0.05->0.10
+            self.weights['diversity'] = 0.05
             
-        # 阶段3 (41-60): 稳定期
-        elif epoch <= 60:
-            self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.3
-            self.weights['cloth_semantic'] = 0.2
-            self.weights['orthogonal'] = 0.2  # 进一步降低
-            self.weights['gate_adaptive'] = 0.05
-            
-        # 阶段4 (61+): 微调期
+        # 阶段3 (41+): 收敛期
         else:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.25  # 略微降低，避免过拟合
-            self.weights['cloth_semantic'] = 0.25
+            self.weights['cls'] = 0.20  # 适度降低
+            self.weights['cloth_semantic'] = 0.15
             self.weights['orthogonal'] = 0.15
-            self.weights['gate_adaptive'] = 0.08
+            self.weights['gate_adaptive'] = 0.10
+            self.weights['diversity'] = 0.05
     
-    def gate_adaptive_loss_v2(self, gate, id_embeds, cloth_embeds, pids):
+    def gate_adaptive_loss_v2(self, gate_stats, id_embeds, cloth_embeds, pids):
         """
-        === P2方案：重新设计的gate_adaptive损失 ===
+        === 软门控版本：处理gate_stats字典 ===
+        gate_stats是dict，包含gate_id和gate_cloth的统计信息
         目标：好的gate应该使同类样本的id特征更相似（类内紧凑）
         """
-        if gate is None or id_embeds is None or cloth_embeds is None:
+        if gate_stats is None or id_embeds is None or cloth_embeds is None:
             if id_embeds is not None:
                 return id_embeds.sum() * 0.0
             elif cloth_embeds is not None:
                 return cloth_embeds.sum() * 0.0
             else:
-                return torch.tensor(0.0, requires_grad=True)
+                return torch.tensor(0.0, device=self._get_device(), requires_grad=True)
         
         batch_size = id_embeds.size(0)
         
-        # 统一gate维度
-        if gate.dim() == 2:
-            gate_value = gate.mean(dim=1) if gate.size(1) > 1 else gate.squeeze(1)
-        elif gate.dim() == 1:
-            gate_value = gate
-        else:
-            gate_value = gate.expand(batch_size)
+        # 从gate_stats提取平均门控值（用于正则）
+        # 注意：gate_stats中的值是标量，我们需要从原始gate_id/gate_cloth计算
+        # 但这里我们只用统计信息做监控，loss还是基于id_embeds
         
         # === 核心：基于对比学习的gate优化 ===
         if batch_size > 1 and pids is not None:
@@ -129,22 +132,36 @@ class Loss(nn.Module):
             # 最大化类内相似度
             compact_loss = 1.0 - intra_class_sim
             
-            # gate平滑正则
-            gate_smooth = gate_value.var()
-            smooth_penalty = torch.clamp(gate_smooth - 0.02, min=0.0)
+            # gate平滑正则（基于统计信息）
+            # 鼓励gate_id保持合理范围（不要太接近0或1）
+            gate_id_mean = gate_stats.get('gate_id_mean', 0.5)
+            gate_regularization = 0.0
+            if gate_id_mean < 0.3 or gate_id_mean > 0.9:
+                # 如果gate过于极端，添加惩罚
+                gate_regularization = 0.1 * ((gate_id_mean - 0.6) ** 2)
             
-            total_loss = compact_loss + 0.1 * smooth_penalty
+            total_loss = compact_loss + gate_regularization
+            
+            # 调试信息
+            if self.logger and hasattr(self, '_log_counter_gate'):
+                self._log_counter_gate = getattr(self, '_log_counter_gate', 0) + 1
+                if self._log_counter_gate % 200 == 0:
+                    self.debug_logger.debug(
+                        f"Gate_adaptive: intra_sim={intra_class_sim:.4f}, "
+                        f"compact_loss={compact_loss:.6f}, gate_id_mean={gate_id_mean:.4f}, "
+                        f"total={total_loss:.6f}"
+                    )
         else:
-            # batch太小时，鼓励gate保持合理值
-            gate_mean = gate_value.mean()
-            total_loss = (gate_mean - 0.5).pow(2)
+            # batch太小时，基于gate统计信息的简单正则
+            gate_id_mean = gate_stats.get('gate_id_mean', 0.5)
+            total_loss = (gate_id_mean - 0.6).pow(2)  # 鼓励gate_id稍微偏向身份
         
         return torch.clamp(total_loss, min=0.0, max=10.0)
     
     def info_nce_loss(self, image_embeds, text_embeds):
         """InfoNCE对比学习损失"""
         if image_embeds is None or text_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+            return torch.tensor(0.0, device=self._get_device())
         
         bsz = image_embeds.size(0)
         image_embeds = F.normalize(image_embeds, dim=-1, eps=1e-8)
@@ -169,7 +186,7 @@ class Loss(nn.Module):
         3. 通过动态权重控制学习速度，而非温度缩放
         """
         if id_logits is None or pids is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device)
+            return torch.tensor(0.0, device=self._get_device())
         
         # 裁剪防止数值爆炸
         id_logits_clipped = torch.clamp(id_logits, min=-50, max=50)
@@ -191,7 +208,7 @@ class Loss(nn.Module):
         3. 实验显示cloth_semantic占总损失83-95%，说明基础损失就已经很高
         """
         if cloth_image_embeds is None or cloth_text_embeds is None:
-            return torch.tensor(0.0, device=self.ce_loss.weight.device if hasattr(self, 'ce_loss') else 'cuda')
+            return torch.tensor(0.0, device=self._get_device())
         
         bsz = cloth_image_embeds.size(0)
         
@@ -217,7 +234,7 @@ class Loss(nn.Module):
         移除复杂的跨样本约束，避免梯度混乱
         """
         if id_embeds is None or cloth_embeds is None:
-            return torch.tensor(0.0, device=id_embeds.device if id_embeds is not None else 'cuda')
+            return torch.tensor(0.0, device=self._get_device())
         
         batch_size = id_embeds.size(0)
         
@@ -230,23 +247,33 @@ class Loss(nn.Module):
         cosine_sim = torch.clamp(cosine_sim, min=-1.0, max=1.0)
         ortho_loss = cosine_sim.pow(2).mean()
         
+        # 调试信息：记录余弦相似度
+        if self.logger and hasattr(self, '_log_counter'):
+            self._log_counter = getattr(self, '_log_counter', 0) + 1
+            if self._log_counter % 200 == 0:  # 每200次记录一次
+                self.debug_logger.debug(
+                    f"Orthogonal loss: cosine_sim mean={cosine_sim.mean().item():.4f}, "
+                    f"std={cosine_sim.std().item():.4f}, ortho_loss={ortho_loss.item():.6f}"
+                )
+        
         return ortho_loss
     
     def forward(self, image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                 cloth_embeds, cloth_text_embeds, cloth_image_embeds, pids, 
                 is_matched=None, epoch=None, gate=None,
                 id_seq_features=None, cloth_seq_features=None, saliency_score=None,
-                id_cls_features=None):  # 新增：分类分支的中间特征
+                id_cls_features=None, diversity_loss=None):
         """
         前向传播：计算所有损失
         
-        === 重构后的调用流程 ===
-        1. 更新epoch（动态权重）
-        2. 计算各个损失（使用v2版本）
-        3. 加权求和
+        === 软门控版本更新 ===
+        1. gate现在是gate_stats (dict)
+        2. 新增diversity_loss参数（从模型传入）
         
         Args:
-            id_cls_features: 分类分支的中间特征 [B, 1024]，用于center loss等高级损失
+            gate: 现在是gate_stats字典，包含门控统计信息
+            diversity_loss: 门控多样性损失（从G-S3模块传入）
+            id_cls_features: 分类分支的中间特征 [B, 1024]
         """
         losses = {}
         
@@ -258,32 +285,38 @@ class Loss(nn.Module):
         # 1. InfoNCE损失
         losses['info_nce'] = self.info_nce_loss(image_embeds, id_text_embeds) \
             if image_embeds is not None and id_text_embeds is not None \
-            else torch.tensor(0.0, device=self.ce_loss.weight.device)
+            else torch.tensor(0.0, device=self._get_device())
         
-        # 2. 分类损失（P0：权重已提高）
+        # 2. 分类损失
         losses['cls'] = self.id_classification_loss(id_logits, pids) \
             if id_logits is not None and pids is not None \
-            else torch.tensor(0.0, device=self.ce_loss.weight.device)
+            else torch.tensor(0.0, device=self._get_device())
         
-        # 3. 服装语义损失（P0：修复去ID正则）
+        # 3. 服装语义损失
         losses['cloth_semantic'] = self.cloth_semantic_loss_v2(
             cloth_image_embeds, cloth_text_embeds, id_embeds
         )
         
-        # 4. 正交约束（P1：增强版）
+        # 4. 正交约束
         losses['orthogonal'] = self.orthogonal_loss_v2(id_embeds, cloth_embeds)
         
-        # 5. 门控自适应（P2：重新设计）
+        # 5. 门控自适应（现在接收gate_stats）
         losses['gate_adaptive'] = self.gate_adaptive_loss_v2(
             gate, id_embeds, cloth_embeds, pids
         )
+        
+        # 6. 门控多样性正则（软门控新增）
+        if diversity_loss is not None:
+            losses['diversity'] = diversity_loss
+        else:
+            losses['diversity'] = torch.tensor(0.0, device=self._get_device(), requires_grad=True)
         
         # === NaN/Inf检查 ===
         for key, value in losses.items():
             if isinstance(value, torch.Tensor):
                 if torch.isnan(value).any() or torch.isinf(value).any():
-                    import logging
-                    logging.warning(f"⚠️  WARNING: Loss '{key}' contains NaN/Inf! Resetting to 0.0.")
+                    if self.logger:
+                        self.debug_logger.warning(f"⚠️  WARNING: Loss '{key}' contains NaN/Inf! Resetting to 0.0.")
                     losses[key] = torch.tensor(0.0, device=value.device, requires_grad=True)
         
         # === 加权求和 ===

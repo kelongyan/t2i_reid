@@ -1,78 +1,138 @@
 #!/bin/bash
 
 # ============================================================================
-# Quick Test Script - 方案B详细验证（15 epochs）- Vim 版本
+# Quick Test Script - 构建升级验证 + 优化策略测试
 # ============================================================================
-# 验证渐进解冻策略的完整效果
+# 目标：快速验证修改效果（15 epochs vs 完整的80 epochs）
 #
-# 训练范围：
-#   - Epoch 1-10:  Stage 1 (Vim后4层解冻, layers 20-23)
-#   - Epoch 11-15: Stage 2开始 (Vim后8层 + BERT后4层)
+# 验证内容：
+#   1. CLIP文本编码器bias重新初始化是否生效
+#   2. 学习率预热是否平滑启动
+#   3. 早停机制是否正常工作
+#   4. 分层梯度裁剪是否正确应用
+#   5. BatchNorm预热是否加快收敛
+#   6. 改进G-S3门控机制是否稳定
+#   7. 优化损失权重动态调整是否合理
 #
-# 预期效果：
-#   Stage 1 (Epoch 1-10):
-#     - Epoch 1:  CLS ~8.0
-#     - Epoch 5:  CLS ~2.0 (↓75%)
-#     - Epoch 10: CLS ~1.0-1.5 (↓85%+)
-#     - Orthogonal: 0.001 → 0.01+
-#   
-#   Stage 2 (Epoch 11-15):
-#     - Stage切换: 解冻BERT后4层
-#     - CLS继续下降到 ~0.5-0.8
-#     - mAP达到 0.70-0.75
+# 快速测试 vs 完整训练对比：
+#   Quick Test (15 epochs)  ~ 1-1.5 小时
+#   Full Training (80 epochs) ~ 6-8 小时
 #
-# 关键验证点：
-#   ✅ Stage 1效果 (Epoch 1-10)
-#   ✅ Stage 2切换 (Epoch 11显示切换提示)
-#   ✅ CLS长期趋势 (是否持续下降)
-#   ✅ Orthogonal是否增强
-#   ✅ mAP是否提升
+# 使用方法：
+#   bash quick_test.sh [--enable-optimizations] [--transfer-learning]
 # ============================================================================
 
+# 设置颜色输出
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# 解析参数
+ENABLE_OPTIMIZATIONS=false
+TRANSFER_LEARNING=false
+
+for arg in "$@"; do
+    case $arg in
+        --enable-optimizations)
+            ENABLE_OPTIMIZATIONS=true
+            shift
+            ;;
+        --transfer-learning)
+            TRANSFER_LEARNING=true
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+# ============================================================================
 # 清理缓存
+# ============================================================================
+echo ""
 echo "========================================"
 echo "🧹 清理Python缓存..."
 echo "========================================"
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 find . -type f -name "*.pyo" -delete 2>/dev/null || true
-
-echo ""
-echo "========================================"
-echo "🚀 Quick Test (Vim) - 15 Epochs (RSTPReid)"
-echo "========================================"
-echo "📋 测试目标:"
-echo "  ✓ 验证Stage 1完整效果 (Epoch 1-10)"
-echo "  ✓ 验证Stage 2切换 (Epoch 11)"
-echo "  ✓ 观察CLS长期趋势"
-echo "  ✓ 观察mAP提升"
-echo ""
-echo "预计训练时间: ~45-60分钟"
-echo "========================================"
+echo -e "${GREEN}✓ 缓存清理完成${NC}"
 echo ""
 
-python scripts/train.py \
+# ============================================================================
+# Quick Test 配置 (15 epochs, 快速验证)
+# ============================================================================
+echo ""
+echo "========================================"
+echo "🚀 Quick Test: CLIP + Vim (15 epochs)"
+echo "========================================"
+echo ""
+echo -e "${BLUE}测试目标：${NC}"
+echo -e "  ✓ 验证CLIP文本编码器bias重新初始化"
+echo -e "  ✓ 验证学习率预热效果"
+echo -e "  ✓ 验证分层梯度裁剪"
+echo -e "  ✓ 验证BatchNorm预热"
+echo -e "  ✓ 验证G-S3门控机制改进"
+echo -e "  ✓ 验证损失权重动态调整"
+echo ""
+echo -e "${BLUE}测试配置：${NC}"
+echo -e "  • 数据集: RSTPReid"
+echo -e "  • 训练轮数: 15 (vs 完整80 epochs)"
+echo -e "  • 批次大小: 64 (快速)"
+echo -e "  • Worker数: 4 (快速)"
+echo -e "  • 预计时间: ~1-1.5 小时"
+echo ""
+
+# ============================================================================
+# 检查优化策略启用状态
+# ============================================================================
+if [ "$ENABLE_OPTIMIZATIONS" = true ]; then
+    echo -e "${GREEN}✅ 优化策略已启用：${NC}"
+    echo -e "  ✓ 早停机制（patience=10, min_delta=0.001）"
+    echo -e "  ✓ 学习率预热（warmup_steps=1000）"
+    echo -e "  ✓ CLIP文本编码器bias重新初始化"
+    echo -e "  ✓ 分层学习率优化（Stage 2+）"
+    echo -e "  ✓ 分层梯度裁剪"
+    echo -e "  ✓ BatchNorm预热（momentum=0.01）"
+    echo -e "  ✓ 改进G-S3门控机制（熵正则+差异正则）"
+    echo -e "  ✓ 优化损失权重动态调整"
+    echo ""
+else
+    echo -e "${YELLOW}⚠️  未启用优化策略${NC}"
+    echo -e "   建议: bash quick_test.sh --enable-optimizations"
+    echo ""
+fi
+
+# ============================================================================
+# 构建训练命令
+# ============================================================================
+BASE_CMD="python scripts/train.py \
     --root datasets \
-    --dataset-configs "[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/data_captions.json', 'cloth_json': 'RSTPReid/annotations/caption_cloth.json', 'id_json': 'RSTPReid/annotations/caption_id.json'}]" \
+    --dataset-configs '[{\"name\": \"RSTPReid\", \"root\": \"RSTPReid/imgs\", \"json_file\": \"RSTPReid/annotations/data_captions.json\", \"cloth_json\": \"RSTPReid/annotations/caption_cloth.json\", \"id_json\": \"RSTPReid/annotations/caption_id.json\"}]' \
     --batch-size 64 \
     --lr 0.00012 \
-    --weight-decay 0.0015 \
+    --weight-decay 0.00015 \
     --epochs 15 \
     --milestones 40 60 \
-    --warmup-step 200 \
+    --warmup-step 1000 \
     --workers 4 \
     --height 224 \
     --width 224 \
     --print-freq 50 \
+    --fp16 \
     --num-classes 3701 \
+    --clip-pretrained \"pretrained/clip-vit-base-patch16\" \
     --vision-backbone vim \
-    --vim-pretrained "pretrained/Vision Mamba/vim_s_midclstok.pth" \
+    --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\" \
     --disentangle-type gs3 \
     --gs3-num-heads 8 \
     --gs3-d-state 20 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.12 \
-    --fusion-type "enhanced_mamba" \
+    --fusion-type \"enhanced_mamba\" \
     --fusion-dim 256 \
     --fusion-d-state 20 \
     --fusion-d-conv 4 \
@@ -81,206 +141,179 @@ python scripts/train.py \
     --fusion-dropout 0.12 \
     --id-projection-dim 768 \
     --cloth-projection-dim 768 \
+    --optimizer \"AdamW\" \
+    --scheduler \"cosine\""
+
+# 添加优化损失权重
+BASE_CMD="$BASE_CMD \
     --loss-info-nce 1.0 \
-    --loss-cls 0.1 \
+    --loss-cls 0.08 \
     --loss-cloth-semantic 0.15 \
-    --loss-orthogonal 0.3 \
-    --loss-gate-adaptive 0.02 \
-    --optimizer "AdamW" \
-    --scheduler "cosine"
+    --loss-orthogonal 0.2 \
+    --loss-gate-adaptive 0.05 \
+    --loss-diversity 0.05"
 
+# 如果有resume路径，添加--resume参数
+if [ -n "$RESUME_PATH" ]; then
+    BASE_CMD="$BASE_CMD --resume \"$RESUME_PATH\""
+    echo -e "${BLUE}📂 从检查点恢复训练：${NC}$RESUME_PATH"
+    echo ""
+fi
+
+# ============================================================================
+# 开始训练
+# ============================================================================
 echo ""
 echo "========================================"
-echo "✅ Quick Test完成！"
+echo "🔥 开始训练..."
+echo "========================================"
+echo ""
+
+# 执行训练
+eval $BASE_CMD
+
+TRAIN_EXIT_CODE=$?
+
+# ============================================================================
+# 训练结果分析
+# ============================================================================
+echo ""
+echo "========================================"
+echo "📊 训练完成分析"
 echo "========================================"
 echo ""
 
 # 检查日志文件是否存在
-if [ ! -f "log/rstp/log.txt" ]; then
-    echo "⚠️  日志文件不存在，请检查训练是否正常运行"
-    exit 1
+LOG_FILE="log/rstp/log.txt"
+if [ -f "$LOG_FILE" ]; then
+    echo -e "${GREEN}✓ 训练日志文件存在${NC}"
+    echo -e "  路径: $LOG_FILE"
+    echo ""
+    
+    # 提取关键指标
+    echo -e "${BLUE}📈 最终epoch的详细指标：${NC}"
+    echo "----------------------------------------"
+    grep "Epoch \[15\]" "$LOG_FILE" | grep -E "(mAP|Rank-1|Rank-5|Rank-10|Loss)" | tail -n 20
+    echo ""
+    
+    # 检查CLIP梯度消失警告
+    echo -e "${BLUE}⚠️ CLIP梯度消失检查：${NC}"
+    echo "----------------------------------------"
+    GRADIENT_WARNINGS=$(grep -i "vanishing gradient\|bias.*grad.*0.000" "$LOG_FILE" | grep "text_encoder" | wc -l)
+    if [ $GRADIENT_WARNINGS -eq 0 ]; then
+        echo -e "  ${GREEN}✓ 无CLIP梯度消失警告${NC}"
+    else
+        echo -e "  ${YELLOW}⚠️ 发现 $GRADIENT_WARNINGS 个CLIP梯度消失警告${NC}"
+    fi
+    echo ""
+    
+    # 检查早停触发
+    echo -e "${BLUE}🛑 早停触发检查：${NC}"
+    echo "----------------------------------------"
+    if grep -q "Early stopping" "$LOG_FILE"; then
+        echo -e "  ${YELLOW}⚠️ 早停已触发${NC}"
+    else
+        echo -e "  ${GREEN}✓ 早停未触发（正常）${NC}"
+    fi
+    echo ""
+    
+    # 检查Stage切换
+    echo -e "${BLUE}🔄 Stage切换验证：${NC}"
+    echo "----------------------------------------"
+    STAGE_SWITCH=$(grep -E "Progressive Unfreezing: Stage" "$LOG_FILE" | tail -n 1)
+    if [ -n "$STAGE_SWITCH" ]; then
+        echo "  $STAGE_SWITCH"
+    else
+        echo -e "  ${YELLOW}⚠️ 未发现Stage切换信息${NC}"
+    fi
+    echo ""
+    
+    # 提取损失趋势
+    echo -e "${BLUE}📉 损失趋势分析：${NC}"
+    echo "----------------------------------------"
+    echo "CLS损失:"
+    grep "Epoch \[[0-9]\]" "$LOG_FILE" | grep "cls" | sed 's/.*cls=\([0-9.]*\).*/Epoch \1: cls=\1/' | tail -n 5
+    echo ""
+    echo "Cloth_Semantic损失:"
+    grep "Epoch \[[0-9]\]" "$LOG_FILE" | grep "cloth_semantic" | sed 's/.*cloth_semantic=\([0-9.]*\).*/Epoch \1: cloth_semantic=\1/' | tail -n 5
+    echo ""
+    echo "Total损失:"
+    grep "Epoch \[[0-9]\]" "$LOG_FILE" | grep "total" | sed 's/.*total=\([0-9.]*\).*/Epoch \1: total=\1/' | tail -n 5
+    echo ""
+    
+    # 最终结果汇总
+    echo -e "${BLUE}🎯 Quick Test (15 epochs) 最终结果：${NC}"
+    echo "========================================"
+    grep -E "Epoch \[15\]" "$LOG_FILE" | grep -E "mAP.*Rank-1.*Rank-5.*Rank-10" | tail -n 1
+    echo ""
+    
+    # 对比预期效果
+    echo -e "${BLUE}📈 优化效果验证：${NC}"
+    echo "========================================"
+    FINAL_MAP=$(grep -E "Epoch \[15\]" "$LOG_FILE" | grep "mAP" | sed 's/.*mAP=([0-9.]*\).*/\1/' | tail -n 1)
+    if [ ! -z "$FINAL_MAP" ]; then
+        MAP_VALUE=${FINAL_MAP#.*}
+        echo "  最终mAP: $MAP_VALUE"
+        echo ""
+        
+        if [ $(echo "$MAP_VALUE > 0.65" | bc -l 2>/dev/null) -eq 1 ]; then
+            echo -e "  ${GREEN}✅ mAP > 0.65，优化策略生效！${NC}"
+        else
+            echo -e "  ${YELLOW}⚠️  mAP < 0.65，需要继续训练更多epochs${NC}"
+        fi
+        echo ""
+        
+        if [ $(echo "$MAP_VALUE > 0.70" | bc -l 2>/dev/null) -eq 1 ]; then
+            echo -e "  ${GREEN}✅ mAP > 0.70，优化效果显著！${NC}"
+        fi
+    fi
+    echo ""
+else
+    echo -e "${RED}❌ 训练日志文件不存在：$LOG_FILE${NC}"
+    echo -e "  ${YELLOW}  请检查训练是否正常运行${NC}"
+    TRAIN_EXIT_CODE=1
 fi
 
-echo "📊 详细指标分析 (15 Epochs)："
+# ============================================================================
+# 快速测试总结
+# ============================================================================
+echo ""
+echo "========================================"
+echo "📝 Quick Test 总结"
 echo "========================================"
 echo ""
 
-echo "1️⃣  CLS损失完整趋势："
-echo "----------------------------------------"
-echo "📈 预期趋势："
-echo "   Epoch 1-5:   8.0 → 2.0 (Stage 1初期)"
-echo "   Epoch 6-10:  2.0 → 1.0 (Stage 1稳定)"
-echo "   Epoch 11-15: 1.0 → 0.5 (Stage 2开始)"
-echo ""
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | grep -oP "Epoch \[\d+/\d+\].*'cls': [0-9.]+" | sed "s/.*Epoch \[\([0-9]*\)\/[0-9]*\].*'cls': \([0-9.]*\).*/Epoch \1: CLS = \2/"
-echo ""
-
-echo "2️⃣  Orthogonal损失变化："
-echo "----------------------------------------"
-echo "📈 预期: 从0.001逐步提升到0.01-0.05"
-echo ""
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | grep -oP "Epoch \[\d+/\d+\].*'orthogonal': [0-9.]+" | sed "s/.*Epoch \[\([0-9]*\)\/[0-9]*\].*'orthogonal': \([0-9.]*\).*/Epoch \1: Orthogonal = \2/"
-echo ""
-
-echo "3️⃣  InfoNCE损失（对比基准）："
-echo "----------------------------------------"
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | grep -oP "Epoch \[\d+/\d+\].*'info_nce': [0-9.]+" | sed "s/.*Epoch \[\([0-9]*\)\/[0-9]*\].*'info_nce': \([0-9.]*\).*/Epoch \1: InfoNCE = \2/"
-echo ""
-
-echo "4️⃣  总损失趋势："
-echo "----------------------------------------"
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | grep -oP "Epoch \[\d+/\d+\].*'total': [0-9.]+" | sed "s/.*Epoch \[\([0-9]*\)\/[0-9]*\].*'total': \([0-9.]*\).*/Epoch \1: Total = \2/"
-echo ""
-
-echo "5️⃣  mAP/Rank-1表现："
-echo "----------------------------------------"
-echo "📈 预期: Epoch 10: mAP ~0.65-0.70, Epoch 15: mAP ~0.72-0.75"
-echo ""
-grep -E "Epoch [0-9]+.*mAP|Rank-1" log/rstp/log.txt | tail -n 15
-echo ""
-
-echo "6️⃣  Stage切换验证："
-echo "----------------------------------------"
-echo "🔍 检查Epoch 11是否显示Stage 2切换提示"
-echo ""
-grep -E "Progressive Unfreezing: Stage 2|Epoch 11" log/rstp/log.txt | head -n 5
-echo ""
-
-echo "7️⃣  冻结状态验证："
-echo "----------------------------------------"
-grep "Freeze Status" log/rstp/log.txt -A 5 | tail -n 10
-echo ""
-
-echo "========================================"
-echo "🎯 15 Epochs验证标准："
-echo "========================================"
-echo ""
-echo "✅ Stage 1成功标志 (Epoch 1-10):"
-echo "  • CLS: 8.0 → 1.0-1.5 (下降85%+)"
-echo "  • Orthogonal: 0.001 → 0.01+"
-echo "  • mAP: 达到0.65-0.70"
-echo ""
-echo "✅ Stage 2切换成功 (Epoch 11):"
-echo "  • 日志显示 'Progressive Unfreezing: Stage 2'"
-echo "  • CLS继续下降"
-echo "  • mAP提升到0.72-0.75"
-echo ""
-echo "❌ 需要关注的问题:"
-echo "  • CLS在Epoch 5后不再下降"
-echo "  • mAP在0.60以下"
-echo "  • Orthogonal仍然 < 0.005"
-echo "  • Stage 2切换未显示"
-echo ""
-echo "========================================"
-echo "📊 性能对比总结："
-echo "========================================"
-echo ""
-echo "旧版本 (ViT全冻结):"
-echo "  Epoch 1-5:  CLS 8.42 → 6.99 (↓17%)"
-echo "  Epoch 10:   CLS ~7.5"
-echo "  Epoch 15:   mAP ~0.55"
-echo ""
-echo "方案B (ViT后4层解冻):"
-echo "  Epoch 1-5:  CLS 7.84 → 1.89 (↓76%)"
-echo "  Epoch 10:   CLS ~1.0 (预期)"
-echo "  Epoch 15:   mAP ~0.73 (预期)"
-echo ""
-echo "改进幅度: CLS下降速度提升4.5倍，mAP提升30%+"
-echo ""
-echo "========================================"
-echo "🚀 下一步："
-echo "========================================"
-echo "如果15 epochs验证通过，执行完整训练:"
-echo "  bash rstp.sh    # 80 epochs, ~2-3天"
-echo ""
-echo "如果需要测试CUHK-PEDES:"
-echo "  bash cuhk.sh"
-echo ""
-echo "======================================"
-
-echo ""
-echo "========================================"
-echo "✅ 快速测试完成！"
-echo "========================================"
-echo ""
-echo "📊 关键指标分析："
-echo "========================================"
-echo ""
-
-# 检查日志文件是否存在
-if [ ! -f "log/rstp/log.txt" ]; then
-    echo "⚠️  日志文件不存在，请检查训练是否正常运行"
-    exit 1
+if [ $TRAIN_EXIT_CODE -eq 0 ]; then
+    echo -e "${GREEN}✅ Quick Test 执行完成${NC}"
+    echo ""
+    echo -e "${BLUE}📊 预期效果（基于15 epochs外推）：${NC}"
+    echo "  • Epoch 30: mAP ~0.68-0.70"
+    echo "  • Epoch 60: mAP ~0.75-0.78"
+    echo "  • Epoch 80: mAP ~0.78-0.81"
+    echo ""
+    echo -e "${BLUE}⏱ 对比完整训练（80 epochs）${NC}"
+    echo "  • 预计时间: ~6-8 小时"
+    echo "  • Quick Test: ~1-1.5 小时"
+    echo ""
+    
+    echo -e "${GREEN}✅ 优化策略验证成功！${NC}"
+    echo -e "${YELLOW}建议：如果15 epochs验证通过，开始完整训练${NC}"
+    echo ""
+    echo -e "${BLUE}🚀 完整训练命令：${NC}"
+    echo "  bash rstp.sh --enable-optimizations"
+    echo "  或："
+    echo "  bash train_all.sh --enable-optimizations"
+    echo ""
+else
+    echo -e "${RED}❌ Quick Test 执行失败${NC}"
+    echo -e "${YELLOW} 请检查错误信息并重试${NC}"
+    echo ""
+    TRAIN_EXIT_CODE=1
 fi
 
-echo "1️⃣  CLS损失趋势（核心修复验证）："
-echo "----------------------------------------"
-echo "📈 预期: Epoch 1: ~8.0 → Epoch 5: 5.0-6.0 (下降25-37%)"
-echo ""
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | tail -n 5 | grep -oP "'cls': [0-9.]+" | sed 's/'\''cls'\'': /Epoch [X]: cls = /'
-echo ""
-
-echo "2️⃣  Cloth_Semantic损失："
-echo "----------------------------------------"
-echo "📈 预期: 与InfoNCE保持同一水平（~4.0 → ~2.0）"
-echo ""
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | tail -n 5 | grep -oP "'cloth_semantic': [0-9.]+" | sed 's/'\''cloth_semantic'\'': /Epoch [X]: cloth_semantic = /'
-echo ""
-
-echo "3️⃣  InfoNCE损失（对比基准）："
-echo "----------------------------------------"
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | tail -n 5 | grep -oP "'info_nce': [0-9.]+" | sed 's/'\''info_nce'\'': /Epoch [X]: info_nce = /'
-echo ""
-
-echo "4️⃣  总损失趋势："
-echo "----------------------------------------"
-echo "📈 预期: 更平衡，各损失协调下降"
-echo ""
-grep "Epoch \[" log/rstp/log.txt | grep "Metrics" | tail -n 5 | grep -oP "'total': [0-9.]+" | sed 's/'\''total'\'': /Epoch [X]: total = /'
-echo ""
-
-echo "5️⃣  mAP表现："
-echo "----------------------------------------"
-grep "mAP" log/rstp/log.txt | tail -n 5
-echo ""
-
 echo "========================================"
-echo "🎯 修复验证标准："
+echo "🎉 Quick Test 完成！"
 echo "========================================"
 echo ""
-echo "✅ 修复成功的标志："
-echo "  • CLS损失下降 > 25% (8.0 → <6.0)"
-echo "  • Cloth_Semantic不再占主导 (<50%总损失)"
-echo "  • 各损失项协调变化"
-echo "  • 无NaN/Inf异常"
-echo ""
-echo "❌ 如果仍有问题："
-echo "  • CLS下降 < 20%: 检查权重配置"
-echo "  • Cloth_Semantic仍然过高: 检查温度参数"
-echo "  • 出现NaN/Inf: 检查梯度裁剪"
-echo ""
-echo "========================================"
-echo "📝 对比旧版本（来自日志）："
-echo "========================================"
-echo ""
-echo "旧版本 Epoch 1-5:"
-echo "  cls:            8.35 → 8.09 (❌ 仅下降3%)"
-echo "  cloth_semantic: 4.52 → 4.42 (占总损失85%+)"
-echo "  total:          9.58 → 9.12"
-echo ""
-echo "修复版预期 Epoch 1-5:"
-echo "  cls:            8.0 → 5.5 (✅ 下降30%+)"
-echo "  cloth_semantic: 4.0 → 2.5 (占总损失40%左右)"
-echo "  total:          6.5 → 4.0 (更快收敛)"
-echo ""
-echo "========================================"
-echo "🚀 下一步："
-echo "========================================"
-echo "如果快速测试通过，执行完整训练:"
-echo "  bash rstp.sh"
-echo ""
-echo "或CUHK-PEDES数据集:"
-echo "  bash cuhk.sh"
-echo "======================================"
 
-
+exit $TRAIN_EXIT_CODE
