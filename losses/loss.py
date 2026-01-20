@@ -152,14 +152,14 @@ class Loss(nn.Module):
         # 核心原则：info_nce主导 + 对称重构保证信息完整性
         self.weights = weights if weights is not None else {
             'info_nce': 1.0,              # 对比学习 - 主导
-            'cls': 0.1,                   # 分类损失
-            'cloth_semantic': 1.0,        # 衣服语义（改名为attr_semantic更合适）
-            'orthogonal': 0.3,            # 正交约束（提高权重，使用增强版）
+            'cls': 0.05,                  # 分类损失（降低）
+            'cloth_semantic': 1.0,        # 衣服语义
+            'orthogonal': 0.15,           # 正交约束（大幅降低，防止过度解耦）
             'id_triplet': 0.5,            # ID一致性
             'anti_collapse': 1.0,         # 防坍缩
             'gate_adaptive': 0.02,        # 门控自适应
-            'reconstruction': 0.5,        # 对称重构损失（新增，重要！）
-            'semantic_alignment': 0.3,    # CLIP语义对齐（新增）
+            'reconstruction': 0.5,        # 对称重构损失
+            'semantic_alignment': 0.1,    # CLIP语义对齐（大幅降低）
         }
         
         # 动态权重调整参数
@@ -204,29 +204,29 @@ class Loss(nn.Module):
         # 目标：让双分支都能提取有效特征
         if epoch <= 5:
             self.weights['info_nce'] = 1.2
-            self.weights['cls'] = 0.05
-            self.weights['orthogonal'] = 0.3      # 较强的正交约束
-            self.weights['reconstruction'] = 0.8  # 强调重构，防止信息丢失
-            self.weights['semantic_alignment'] = 0.1  # 初期弱化语义引导
+            self.weights['cls'] = 0.02
+            self.weights['orthogonal'] = 0.2         # 降低正交约束（从0.5→0.2）
+            self.weights['reconstruction'] = 0.8
+            self.weights['semantic_alignment'] = 0.05 # 进一步降低
             self.weights['anti_collapse'] = 2.0
             
         # Stage 2 (Epoch 6-30): 语义对齐期
         elif epoch <= 30:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.1
+            self.weights['cls'] = 0.05
             self.weights['cloth_semantic'] = 1.5
-            self.weights['orthogonal'] = 0.4      # 提高正交约束
+            self.weights['orthogonal'] = 0.15        # 降低（从0.4→0.15）
             self.weights['reconstruction'] = 0.5
-            self.weights['semantic_alignment'] = 0.3  # 增强语义引导
+            self.weights['semantic_alignment'] = 0.1 # 降低
             
         # Stage 3 (Epoch 31+): 精细微调期
         else:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.2
+            self.weights['cls'] = 0.1
             self.weights['cloth_semantic'] = 1.0
-            self.weights['orthogonal'] = 0.3      # 维持正交约束
+            self.weights['orthogonal'] = 0.1         # 保持低权重
             self.weights['reconstruction'] = 0.4
-            self.weights['semantic_alignment'] = 0.4  # 维持语义引导
+            self.weights['semantic_alignment'] = 0.15
     
     def gate_adaptive_loss_v2(self, gate_stats, id_embeds, cloth_embeds, pids):
         """

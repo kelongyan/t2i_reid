@@ -37,23 +37,16 @@ class SemanticGuidedDecoupling(nn.Module):
         # === 固定的Prompt模板 ===
         # ID Prompts: 描述人的身份、体态、结构
         self.id_prompts = [
-            "a photo of a person",
-            "a pedestrian walking",
-            "human body structure",
-            "a person standing",
-            "somebody's figure"
+            "a person",
+            "pedestrian",
+            "human figure",
         ]
         
         # Attribute Prompts: 描述外观属性（颜色、配饰、衣物）
         self.attr_prompts = [
-            "red clothing",
-            "blue jeans",
-            "wearing a backpack",
-            "black shoes",
-            "white t-shirt",
-            "long hair",
-            "wearing a hat",
-            "carrying a bag"
+            "clothing",
+            "outfit",
+            "appearance",
         ]
         
         # 预计算并缓存CLIP Embeddings（避免重复编码）

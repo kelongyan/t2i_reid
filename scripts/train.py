@@ -161,8 +161,18 @@ class Runner:
         
         self.args.original_logs_dir = args.logs_dir
 
+        # === 统一数据集名称映射 ===
         if hasattr(args, 'dataset_configs') and args.dataset_configs:
-            dataset_name = args.dataset_configs[0]['name'] if args.dataset_configs else 'unknown'
+            dataset_full_name = args.dataset_configs[0]['name'].lower() if args.dataset_configs else 'unknown'
+            # 映射到短名称
+            if 'cuhk' in dataset_full_name:
+                dataset_name = 'cuhk_pedes'
+            elif 'rstp' in dataset_full_name:
+                dataset_name = 'rstp'
+            elif 'icfg' in dataset_full_name:
+                dataset_name = 'icfg'
+            else:
+                dataset_name = dataset_full_name
         else:
             dataset_name = 'unknown'
         
@@ -481,31 +491,17 @@ class Runner:
         for handler in logging.root.handlers[:]:
             logging.root.removeHandler(handler)
 
-        # 创建数据集特定的日志目录
-        if hasattr(args, 'dataset_configs') and args.dataset_configs:
-            dataset_full_name = args.dataset_configs[0]['name'].lower()
-            if 'cuhk' in dataset_full_name:
-                dataset_dir_name = 'cuhk_pedes'
-            elif 'rstp' in dataset_full_name:
-                dataset_dir_name = 'rstp'
-            elif 'icfg' in dataset_full_name:
-                dataset_dir_name = 'icfg'
-            else:
-                dataset_dir_name = dataset_full_name
-        else:
-            dataset_dir_name = 'unknown'
-
+        # 获取数据集日志目录（TrainingMonitor已经创建）
         script_dir = Path(__file__).parent
         project_root = script_dir.parent
-        log_base_dir = project_root / 'log'
-        dataset_log_dir = log_base_dir / dataset_dir_name
-        dataset_log_dir.mkdir(parents=True, exist_ok=True)
+        dataset_log_dir = self.monitor.dataset_log_dir
 
         # 1. 详细日志记录器 (仅限文件)
         detailed_logger = logging.getLogger('detailed')
         detailed_logger.setLevel(logging.DEBUG)
-        detailed_logger.propagate = False # 防止向上级传播到 Root
-        for handler in detailed_logger.handlers[:]: detailed_logger.removeHandler(handler)
+        detailed_logger.propagate = False
+        for handler in detailed_logger.handlers[:]: 
+            detailed_logger.removeHandler(handler)
         
         file_handler = logging.FileHandler(dataset_log_dir / 'log.txt', mode='a', encoding='utf-8')
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))

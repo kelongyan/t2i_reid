@@ -22,12 +22,12 @@ class Evaluator:
         # Define default loss weights (与loss.py对称解耦配置保持一致)
         default_loss_weights = {
             'info_nce': 1.0, 
-            'cls': 0.1, 
+            'cls': 0.05,
             'cloth_semantic': 1.0, 
-            'orthogonal': 0.3,           # 使用增强版
+            'orthogonal': 0.15,
             'gate_adaptive': 0.02,
-            'reconstruction': 0.5,       # 对称重构
-            'semantic_alignment': 0.3,   # CLIP语义对齐
+            'reconstruction': 0.5,
+            'semantic_alignment': 0.1,
         }
         # Get loss weights from config file, merge with defaults
         loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)

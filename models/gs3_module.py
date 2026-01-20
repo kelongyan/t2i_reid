@@ -371,9 +371,9 @@ class SymmetricGS3Module(nn.Module):
         gate_id = self.gate_id(concat_feat)      # [B, dim]
         gate_attr = self.gate_attr(concat_feat)  # [B, dim]
         
-        # 防止门控塌缩：限制范围在 [0.1, 0.9]
-        gate_id = torch.clamp(gate_id, min=0.1, max=0.9)
-        gate_attr = torch.clamp(gate_attr, min=0.1, max=0.9)
+        # 防止门控塌缩：限制范围在 [0.2, 0.8]（扩大下界）
+        gate_id = torch.clamp(gate_id, min=0.2, max=0.8)
+        gate_attr = torch.clamp(gate_attr, min=0.2, max=0.8)
         
         # === 关键改进：对称应用门控 ===
         # 两个分支都应用门控，避免一个分支"摸鱼"

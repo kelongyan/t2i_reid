@@ -22,8 +22,16 @@ class TrainingMonitor:
     def __init__(self, dataset_name: str, log_dir: str = "log"):
         self.dataset_name = dataset_name
         self.log_dir = Path(log_dir)
+        
+        # === 新的目录结构 ===
+        # log/dataset_name/ (日志文件)
+        # log/dataset_name/model/ (模型文件)
         self.dataset_log_dir = self.log_dir / dataset_name
+        self.model_dir = self.dataset_log_dir / "model"
+        
+        # 创建目录
         self.dataset_log_dir.mkdir(parents=True, exist_ok=True)
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         
         # 文件路径
         self.log_file = self.dataset_log_dir / "log.txt"
@@ -48,18 +56,20 @@ class TrainingMonitor:
         if logger.hasHandlers():
             logger.handlers.clear()
         
-        formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+        # File Handler: 完整格式（带时间戳和级别）
+        file_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         
         # File Handler
         fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
-        fh.setFormatter(formatter)
+        fh.setFormatter(file_formatter)
         fh.setLevel(level)
         logger.addHandler(fh)
         
-        # Optional Console Handler
+        # Optional Console Handler: 简洁格式（仅消息内容）
         if console:
+            console_formatter = logging.Formatter('%(message)s')  # 只显示消息内容
             ch = logging.StreamHandler()
-            ch.setFormatter(formatter)
+            ch.setFormatter(console_formatter)
             ch.setLevel(level)
             logger.addHandler(ch)
 

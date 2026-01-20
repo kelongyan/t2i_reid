@@ -31,7 +31,7 @@ class EarlyStopping:
             if self.counter >= self.patience:
                 self.early_stop = True
                 if self.logger:
-                    self.logger.warning("Early stopping triggered!")
+                    self.logger.logger.warning("Early stopping triggered!")
         else:
             self.best_score = mAP
             self.counter = 0
@@ -48,12 +48,12 @@ class Trainer:
         # === 对称解耦权重配置 ===
         default_loss_weights = {
             'info_nce': 1.0, 
-            'cls': 0.1,
+            'cls': 0.05,
             'cloth_semantic': 1.0, 
-            'orthogonal': 0.3,           # 提高正交约束权重（增强版）
+            'orthogonal': 0.15,          # 大幅降低
             'gate_adaptive': 0.02,
-            'reconstruction': 0.5,       # 新增：对称重构损失
-            'semantic_alignment': 0.3,   # 新增：CLIP语义对齐
+            'reconstruction': 0.5,
+            'semantic_alignment': 0.1,   # 大幅降低
         }
         
         # 从配置文件获取损失权重，合并默认值
