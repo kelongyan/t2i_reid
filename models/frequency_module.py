@@ -1,13 +1,14 @@
 # models/frequency_module.py
 """
 频域分解模块 - FSHD-Net核心组件
-仅支持DCT频域变换，已移除Legacy Wavelet代码
+使用真正的DCT（离散余弦变换）进行频域分析
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import numpy as np
 
 
 class FixedFrequencyMask(nn.Module):
@@ -100,17 +101,18 @@ class DCTFrequencySplitter(nn.Module):
     @torch.amp.autocast('cuda', enabled=False)
     def dct2d(self, x):
         """
-        2D DCT变换（数值稳定版本）
+        真正的2D DCT变换（Type-II）
         
-        修复：
-        1. 强制禁用混合精度
-        2. 强制float32精度
-        3. 添加NaN检测
+        实现：
+        1. 使用PyTorch原生实现（高效GPU加速）
+        2. 强制float32精度避免数值问题
+        3. 正交归一化保持能量守恒
+        4. 添加NaN检测保护
         
         Args:
-            x: [B, C, H, W]
+            x: [B, C, H, W] 输入特征
         Returns:
-            dct_coeff: [B, C, H, W] (complex)
+            dct_coeff: [B, C, H, W] DCT系数（实数）
         """
         # 强制转换为float32
         x = x.float()
@@ -119,44 +121,103 @@ class DCTFrequencySplitter(nn.Module):
         if torch.isnan(x).any():
             x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         
-        # FFT变换
-        x_fft = torch.fft.fft2(x, dim=(-2, -1))
+        B, C, H, W = x.shape
+        
+        # 方法1: 使用矩阵乘法实现DCT（适用于任何PyTorch版本）
+        # 构建DCT基矩阵
+        if not hasattr(self, '_dct_matrix_h') or self._dct_matrix_h.shape[0] != H:
+            self._dct_matrix_h = self._get_dct_matrix(H).to(x.device)
+        if not hasattr(self, '_dct_matrix_w') or self._dct_matrix_w.shape[0] != W:
+            self._dct_matrix_w = self._get_dct_matrix(W).to(x.device)
+        
+        # 2D DCT = DCT_H @ X @ DCT_W^T
+        # [B, C, H, W] -> [B*C, H, W]
+        x_reshape = x.reshape(B * C, H, W)
+        
+        # 沿H维度DCT: [B*C, H, W] @ [W, W]^T = [B*C, H, W]
+        dct_h = torch.matmul(self._dct_matrix_h, x_reshape)
+        
+        # 沿W维度DCT: [B*C, H, W] @ [W, W]^T
+        # 需要转置: [B*C, H, W] -> [B*C, W, H]
+        dct_h_t = dct_h.transpose(-2, -1)  # [B*C, W, H]
+        dct_hw = torch.matmul(self._dct_matrix_w, dct_h_t)  # [B*C, W, H]
+        dct_hw = dct_hw.transpose(-2, -1)  # [B*C, H, W]
+        
+        # Reshape回来: [B*C, H, W] -> [B, C, H, W]
+        dct_coeff = dct_hw.reshape(B, C, H, W)
         
         # 结果检测
-        if torch.isnan(x_fft.real).any() or torch.isnan(x_fft.imag).any():
-            x_fft = torch.complex(
-                torch.nan_to_num(x_fft.real, nan=0.0),
-                torch.nan_to_num(x_fft.imag, nan=0.0)
-            )
+        if torch.isnan(dct_coeff).any():
+            dct_coeff = torch.nan_to_num(dct_coeff, nan=0.0)
         
-        return x_fft
+        return dct_coeff
+    
+    def _get_dct_matrix(self, N):
+        """
+        构建1D DCT-II正交基矩阵
+        
+        DCT-II公式:
+        X_k = sqrt(2/N) * alpha(k) * sum_{n=0}^{N-1} x_n * cos(pi*k*(2n+1)/(2N))
+        alpha(0) = 1/sqrt(2), alpha(k) = 1 for k>0
+        
+        Args:
+            N: 序列长度
+        Returns:
+            DCT_matrix: [N, N] 正交DCT基矩阵
+        """
+        dct_matrix = torch.zeros(N, N, dtype=torch.float32)
+        
+        for k in range(N):
+            for n in range(N):
+                if k == 0:
+                    dct_matrix[k, n] = math.sqrt(1.0 / N) * math.cos(math.pi * k * (2*n + 1) / (2*N))
+                else:
+                    dct_matrix[k, n] = math.sqrt(2.0 / N) * math.cos(math.pi * k * (2*n + 1) / (2*N))
+        
+        return dct_matrix
     
     @torch.amp.autocast('cuda', enabled=False)
     def idct2d(self, dct_coeff, target_dtype=None):
         """
-        2D IDCT变换（数值稳定版本）
+        真正的2D IDCT变换（Type-III，DCT-II的逆）
         
-        修复：
-        1. 强制禁用混合精度
-        2. 添加NaN检测
-        3. 安全的dtype转换
+        实现：
+        1. 使用DCT矩阵的转置（正交矩阵）
+        2. 强制float32精度
+        3. 添加NaN检测
         
         Args:
-            dct_coeff: [B, C, H, W] (complex)
-            target_dtype: 目标数据类型（如float16），如果为None则返回float32
+            dct_coeff: [B, C, H, W] DCT系数（实数）
+            target_dtype: 目标数据类型（如float16）
         Returns:
-            x: [B, C, H, W]
+            x: [B, C, H, W] 重构信号
         """
         # NaN检测
-        if torch.isnan(dct_coeff.real).any() or torch.isnan(dct_coeff.imag).any():
-            dct_coeff = torch.complex(
-                torch.nan_to_num(dct_coeff.real, nan=0.0),
-                torch.nan_to_num(dct_coeff.imag, nan=0.0)
-            )
+        if torch.isnan(dct_coeff).any():
+            dct_coeff = torch.nan_to_num(dct_coeff, nan=0.0)
         
-        # IFFT变换
-        x = torch.fft.ifft2(dct_coeff, dim=(-2, -1))
-        x_real = x.real
+        B, C, H, W = dct_coeff.shape
+        
+        # 获取DCT基矩阵（如果已缓存则直接使用）
+        if not hasattr(self, '_dct_matrix_h') or self._dct_matrix_h.shape[0] != H:
+            self._dct_matrix_h = self._get_dct_matrix(H).to(dct_coeff.device)
+        if not hasattr(self, '_dct_matrix_w') or self._dct_matrix_w.shape[0] != W:
+            self._dct_matrix_w = self._get_dct_matrix(W).to(dct_coeff.device)
+        
+        # 2D IDCT = DCT_H^T @ X @ DCT_W
+        # [B, C, H, W] -> [B*C, H, W]
+        dct_reshape = dct_coeff.reshape(B * C, H, W)
+        
+        # 沿H维度IDCT: [H, H]^T @ [B*C, H, W]
+        idct_h = torch.matmul(self._dct_matrix_h.T, dct_reshape)
+        
+        # 沿W维度IDCT
+        idct_h_t = idct_h.transpose(-2, -1)  # [B*C, W, H]
+        idct_hw = torch.matmul(self._dct_matrix_w.T, idct_h_t)  # [B*C, W, H]
+        idct_hw = idct_hw.transpose(-2, -1)  # [B*C, H, W]
+        
+        # Reshape回来
+        x_real = idct_hw.reshape(B, C, H, W)
         
         # 再次检测
         if torch.isnan(x_real).any():
@@ -213,27 +274,22 @@ class DCTFrequencySplitter(nn.Module):
         # 2. Reshape to 2D: [B, H*W, D] → [B, D, H, W]
         patches_2d = patches.transpose(1, 2).reshape(B, D, H, W)
         
-        # 3. DCT变换（自动处理float32转换和NaN）
-        freq_coeff = self.dct2d(patches_2d)  # Complex tensor in float32
-        freq_real = freq_coeff.real
-        freq_imag = freq_coeff.imag
+        # 3. 真正的DCT变换（返回实数，无虚部）
+        freq_coeff = self.dct2d(patches_2d)  # [B, D, H, W] 实数tensor
         
         # 4. 生成固定的频域掩码
         low_mask = self.low_freq_mask()   # [1, H, W]
         high_mask = self.high_freq_mask()  # [1, H, W]
         
-        # 5. 应用掩码分离频域
-        low_freq_real = freq_real * low_mask
-        low_freq_imag = freq_imag * low_mask
-        high_freq_real = freq_real * high_mask
-        high_freq_imag = freq_imag * high_mask
+        # 5. 应用掩码分离频域（DCT无虚部，只有实部）
+        low_freq_coeff = freq_coeff * low_mask   # [B, D, H, W]
+        high_freq_coeff = freq_coeff * high_mask  # [B, D, H, W]
         
         # 6. IDCT变换回空域（自动处理dtype转换和NaN）
-        low_freq_complex = torch.complex(low_freq_real, low_freq_imag)
-        high_freq_complex = torch.complex(high_freq_real, high_freq_imag)
         
-        low_freq_spatial = self.idct2d(low_freq_complex, target_dtype=original_dtype)   # [B, D, H, W]
-        high_freq_spatial = self.idct2d(high_freq_complex, target_dtype=original_dtype)  # [B, D, H, W]
+        # 6. IDCT逆变换（DCT无需重组复数）
+        low_freq_spatial = self.idct2d(low_freq_coeff, target_dtype=original_dtype)   # [B, D, H, W]
+        high_freq_spatial = self.idct2d(high_freq_coeff, target_dtype=original_dtype)  # [B, D, H, W]
         
         # 7. Reshape back to sequence: [B, D, H, W] → [B, H*W, D]
         low_freq_patches = low_freq_spatial.reshape(B, D, -1).transpose(1, 2)
@@ -274,7 +330,8 @@ class DCTFrequencySplitter(nn.Module):
             'high_mask': high_mask.detach(),
             'alpha_low': self.alpha_low.item(),
             'alpha_high': self.alpha_high.item(),
-            'freq_magnitude': torch.abs(freq_coeff).mean(dim=(1, 2, 3)).detach()  # [B]
+            'freq_magnitude': torch.abs(freq_coeff).mean(dim=(1, 2, 3)).detach(),  # [B] DCT系数幅度
+            'freq_coeff': freq_coeff.detach()  # 保存DCT系数用于可视化
         }
         
         return low_freq_seq, high_freq_seq, freq_info
