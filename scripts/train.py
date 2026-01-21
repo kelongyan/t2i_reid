@@ -71,10 +71,12 @@ def configuration():
     parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
     
-    # G-S3 module parameters
+    # G-S3/FSHD module parameters
+    # [Modify] Fixed to 'fshd' as default, removed 'gs3' option
     parser.add_argument('--disentangle-type', type=str, default='fshd', 
-                       choices=['fshd', 'gs3', 'simple'],
-                       help='Type of disentangle module: fshd (FSHD-Net), gs3 (G-S3 Module) or simple (DisentangleModule)')
+                       choices=['fshd', 'simple'],
+                       help='Type of disentangle module: fshd (FSHD-Net) or simple (DisentangleModule)')
+    
     parser.add_argument('--gs3-num-heads', type=int, default=8, 
                        help='Number of attention heads in G-S3 OPA')
     parser.add_argument('--gs3-d-state', type=int, default=16, 
@@ -85,8 +87,7 @@ def configuration():
                        help='Dropout rate for G-S3 module')
     
     # [New] FSHD specific parameters
-    parser.add_argument('--gs3-freq-type', type=str, default='dct', choices=['dct', 'wavelet'],
-                       help='Frequency decomposition type for FSHD')
+    # [Modify] Removed freq-type choice (fixed to dct)
     parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true',
                        help='Whether to use multi-scale CNN in FSHD (true/false)')
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
@@ -582,7 +583,6 @@ class Runner:
                 'd_state': args.gs3_d_state,
                 'd_conv': args.gs3_d_conv,
                 'dropout': args.gs3_dropout,
-                'freq_type': args.gs3_freq_type,
                 'use_multi_scale_cnn': args.gs3_use_multi_scale_cnn,
                 'img_size': tuple(args.gs3_img_size)
             },

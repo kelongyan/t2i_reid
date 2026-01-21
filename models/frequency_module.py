@@ -1,7 +1,7 @@
 # models/frequency_module.py
 """
 频域分解模块 - FSHD-Net核心组件
-支持DCT和Wavelet两种频域变换，可学习的频域掩码
+仅支持DCT频域变换，已移除Legacy Wavelet代码
 """
 
 import torch
@@ -158,7 +158,9 @@ class DCTFrequencySplitter(nn.Module):
         
         # 验证尺寸
         if patches.size(1) != H * W:
-            raise ValueError(f"Expected {H*W} patches, got {patches.size(1)}")
+            # 尝试自适应调整（如果是 ViT/Vim 且 H*W 不匹配，可能是输入尺寸变了）
+            # 这里简单做个容错，或者报错
+            raise ValueError(f"Expected {H*W} patches, got {patches.size(1)}. Check img_size config.")
         
         # 2. Reshape to 2D: [B, H*W, D] → [B, D, H, W]
         patches_2d = patches.transpose(1, 2).reshape(B, D, H, W)
@@ -242,124 +244,9 @@ class DCTFrequencySplitter(nn.Module):
         return low_freq_seq, high_freq_seq, freq_info
 
 
-class WaveletFrequencySplitter(nn.Module):
-    """
-    基于小波变换的轻量级频域分解
-    计算效率高，边界效应小
-    """
-    def __init__(self, dim=768):
-        super().__init__()
-        self.dim = dim
-        
-        # 可学习的小波滤波器（Depthwise Conv1d）
-        self.low_pass_filter = nn.Conv1d(
-            dim, dim, kernel_size=5, padding=2, groups=dim, bias=False
-        )
-        self.high_pass_filter = nn.Conv1d(
-            dim, dim, kernel_size=5, padding=2, groups=dim, bias=False
-        )
-        
-        # 初始化为Haar小波
-        self._init_wavelet_filters()
-        
-        # 自适应融合权重
-        self.alpha_low = nn.Parameter(torch.tensor(0.2))
-        self.alpha_high = nn.Parameter(torch.tensor(0.2))
-    
-    def _init_wavelet_filters(self):
-        """初始化小波滤波器权重"""
-        # Low-pass: 平滑滤波器 [1, 2, 4, 2, 1] / 10
-        low_kernel = torch.tensor([1, 2, 4, 2, 1], dtype=torch.float32) / 10.0
-        # High-pass: 边缘检测 [-1, -2, 0, 2, 1] / 6
-        high_kernel = torch.tensor([-1, -2, 0, 2, 1], dtype=torch.float32) / 6.0
-        
-        for i in range(self.dim):
-            self.low_pass_filter.weight.data[i, 0, :] = low_kernel
-            self.high_pass_filter.weight.data[i, 0, :] = high_kernel
-    
-    def forward(self, x, cls_token_idx=None):
-        """
-        小波分解
-        Args:
-            x: [B, N, D]
-            cls_token_idx: CLS token位置
-        Returns:
-            low_freq_seq, high_freq_seq, freq_info
-        """
-        B, N, D = x.shape
-        
-        # 提取CLS token
-        if cls_token_idx is not None:
-            cls_token = x[:, cls_token_idx:cls_token_idx+1, :]
-            if cls_token_idx == 0:
-                patches = x[:, 1:, :]
-            elif cls_token_idx == N - 1:
-                patches = x[:, :-1, :]
-            else:
-                patches = torch.cat([x[:, :cls_token_idx, :], 
-                                    x[:, cls_token_idx+1:, :]], dim=1)
-        else:
-            cls_token = None
-            patches = x
-        
-        # Transpose for Conv1d: [B, N, D] → [B, D, N]
-        patches_transposed = patches.transpose(1, 2)
-        
-        # 应用小波滤波
-        low_freq = self.low_pass_filter(patches_transposed)
-        high_freq = self.high_pass_filter(patches_transposed)
-        
-        # Transpose back: [B, D, N] → [B, N, D]
-        low_freq_patches = low_freq.transpose(1, 2)
-        high_freq_patches = high_freq.transpose(1, 2)
-        
-        # 加权
-        alpha_low = torch.sigmoid(self.alpha_low)
-        alpha_high = torch.sigmoid(self.alpha_high)
-        
-        low_freq_patches = low_freq_patches * alpha_low
-        high_freq_patches = high_freq_patches * alpha_high
-        
-        # 重新插入CLS token
-        if cls_token is not None:
-            if cls_token_idx == 0:
-                low_freq_seq = torch.cat([cls_token, low_freq_patches], dim=1)
-                high_freq_seq = torch.cat([cls_token, high_freq_patches], dim=1)
-            elif cls_token_idx == N - 1:
-                low_freq_seq = torch.cat([low_freq_patches, cls_token], dim=1)
-                high_freq_seq = torch.cat([high_freq_patches, cls_token], dim=1)
-            else:
-                low_freq_seq = torch.cat([
-                    low_freq_patches[:, :cls_token_idx, :],
-                    cls_token,
-                    low_freq_patches[:, cls_token_idx:, :]
-                ], dim=1)
-                high_freq_seq = torch.cat([
-                    high_freq_patches[:, :cls_token_idx, :],
-                    cls_token,
-                    high_freq_patches[:, cls_token_idx:, :]
-                ], dim=1)
-        else:
-            low_freq_seq = low_freq_patches
-            high_freq_seq = high_freq_patches
-        
-        freq_info = {
-            'low_freq': low_freq_seq.detach(),
-            'high_freq': high_freq_seq.detach(),
-            'alpha_low': alpha_low.item(),
-            'alpha_high': alpha_high.item()
-        }
-        
-        return low_freq_seq, high_freq_seq, freq_info
-
-
 def get_frequency_splitter(freq_type='dct', **kwargs):
     """
     工厂函数：根据类型创建频域分解器
+    (Legacy: freq_type parameter is kept for compatibility but ignored)
     """
-    if freq_type == 'dct':
-        return DCTFrequencySplitter(**kwargs)
-    elif freq_type == 'wavelet':
-        return WaveletFrequencySplitter(**kwargs)
-    else:
-        raise ValueError(f"Unknown frequency type: {freq_type}")
+    return DCTFrequencySplitter(**kwargs)

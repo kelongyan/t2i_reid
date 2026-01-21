@@ -16,14 +16,14 @@ class FSHDModule(nn.Module):
     Frequency-Spatial Hybrid Decoupling Module
     
     完整流程：
-    1. 频域分解：DCT/Wavelet → 低频/高频特征
+    1. 频域分解：DCT → 低频/高频特征
     2. 频域引导注意力：低频→ID分支，高频→Attr分支
     3. 异构双流建模：Mamba(ID) + Multi-scale CNN(Attr)
     4. 对称门控：独立门控机制
     """
     
     def __init__(self, dim=768, num_heads=8, d_state=16, d_conv=4, dropout=0.1,
-                 freq_type='dct', img_size=(14, 14), use_multi_scale_cnn=True, logger=None):
+                 img_size=(14, 14), use_multi_scale_cnn=True, logger=None):
         """
         Args:
             dim: 特征维度
@@ -31,23 +31,20 @@ class FSHDModule(nn.Module):
             d_state: Mamba状态维度
             d_conv: Mamba卷积核大小
             dropout: Dropout比率
-            freq_type: 频域分解类型 ('dct' or 'wavelet')
             img_size: 图像patch grid尺寸
             use_multi_scale_cnn: 是否使用多尺度CNN
             logger: 日志记录器
         """
         super().__init__()
         self.logger = logger
-        self.freq_type = freq_type
         
-        # === 阶段1：频域分解 ===
+        # === 阶段1：频域分解 (固定为DCT) ===
         self.freq_splitter = get_frequency_splitter(
-            freq_type=freq_type,
             dim=dim,
             img_size=img_size
         )
         if logger:
-            logger.debug_logger.info(f"✅ FSHD: Using {freq_type.upper()} frequency splitter")
+            logger.debug_logger.info(f"✅ FSHD: Using DCT frequency splitter")
         
         # === 阶段2：频域引导注意力 ===
         self.freq_guided_attn = FrequencyGuidedAttention(
@@ -95,7 +92,7 @@ class FSHDModule(nn.Module):
         if logger:
             logger.debug_logger.info("=" * 60)
             logger.debug_logger.info("FSHD-Net Architecture Summary:")
-            logger.debug_logger.info(f"  1. Frequency Decomposition: {freq_type.upper()}")
+            logger.debug_logger.info(f"  1. Frequency Decomposition: DCT")
             logger.debug_logger.info(f"  2. Attention: Frequency-Guided + Soft Orthogonal")
             logger.debug_logger.info(f"  3. Dual Stream: Mamba(ID) + {'Multi-CNN' if use_multi_scale_cnn else 'Light-Mamba'}(Attr)")
             logger.debug_logger.info(f"  4. Gating: Symmetric Independent Gates")
@@ -180,7 +177,7 @@ class FSHDModule(nn.Module):
             'gate_attr_mean': gate_attr.mean().item(),
             'gate_attr_std': gate_attr.std().item(),
             'diversity': torch.abs(gate_id - gate_attr).mean().item(),
-            'freq_type': self.freq_type,
+            'freq_type': 'dct',  # Fixed to DCT
             'low_freq_energy': freq_info.get('freq_magnitude', torch.tensor(0.0)).mean().item() if 'freq_magnitude' in freq_info else 0.0
         }
         
@@ -199,8 +196,3 @@ class FSHDModule(nn.Module):
             base_outputs = base_outputs + (freq_info,)
         
         return base_outputs
-
-
-# 兼容性别名
-GS3Module = FSHDModule
-SymmetricGS3Module = FSHDModule
