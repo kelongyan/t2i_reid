@@ -73,36 +73,49 @@ class Evaluator:
         self.model.eval()
         loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
 
-        for i, inputs in enumerate(data_loader):
-            image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
-            image = image.to(self.device)
-            pid = pid.to(self.device)
-            cam_id = cam_id.to(self.device) if cam_id is not None else None
-            is_matched = is_matched.to(self.device)
+        # === 限制验证batch数量，防止OOM ===
+        max_val_batches = 50  # 只评估前50个batch
+        
+        with torch.no_grad():
+            for i, inputs in enumerate(data_loader):
+                if i >= max_val_batches:
+                    break
+                    
+                image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
+                image = image.to(self.device)
+                pid = pid.to(self.device)
+                cam_id = cam_id.to(self.device) if cam_id is not None else None
+                is_matched = is_matched.to(self.device)
 
-            with torch.amp.autocast('cuda', enabled=self.args.fp16):
-                outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
+                with torch.amp.autocast('cuda', enabled=self.args.fp16):
+                    outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
 
-                # === 对称解耦：模型返回12个输出 ===
-                if len(outputs) != 12:
-                    raise ValueError(f"Expected 12 model outputs during validation, got {len(outputs)}")
+                    # === 对称解耦：模型返回12个输出 ===
+                    if len(outputs) != 12:
+                        raise ValueError(f"Expected 12 model outputs during validation, got {len(outputs)}")
 
-                image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-                cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
-                id_cls_features, original_feat = outputs
+                    image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
+                    cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
+                    id_cls_features, original_feat = outputs
 
-                loss_dict = self.combined_loss(
-                    image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
-                    id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
-                    cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                    pids=pid, is_matched=is_matched, epoch=None, gate=gate_stats,
-                    id_cls_features=id_cls_features, original_feat=original_feat
-                )
+                    loss_dict = self.combined_loss(
+                        image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
+                        id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
+                        cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
+                        pids=pid, is_matched=is_matched, epoch=None, gate=gate_stats,
+                        id_cls_features=id_cls_features, original_feat=original_feat
+                    )
 
-            # Update loss records
-            for key, val in loss_dict.items():
-                if key in loss_meters:
-                    loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
+                # Update loss records
+                for key, val in loss_dict.items():
+                    if key in loss_meters:
+                        loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
+                
+                # === 释放显存 ===
+                del image, outputs, image_feats, id_text_feats, fused_feats, id_logits
+                del id_embeds, cloth_embeds, cloth_text_embeds, cloth_image_embeds
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
         # Return average losses
         avg_losses = {k: v.avg for k, v in loss_meters.items()}
@@ -175,6 +188,12 @@ class Evaluator:
                     labels[img_path] = pid
                 
                 processed_count += batch_size
+                
+                # === 定期清理显存 ===
+                if i % 50 == 0:
+                    del outputs, fused_feats
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
             
             # 验证处理的数据数量
             if processed_count != len(full_data):

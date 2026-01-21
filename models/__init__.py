@@ -5,13 +5,20 @@ from .gs3_module import (
     SymmetricBranchAttention,      # 对称双分支注意力
     DualMambaStream,               # 双Mamba流
 )
+from .fshd_module import FSHDModule  # 新增：频域-空域联合解耦模块
+from .frequency_module import DCTFrequencySplitter, WaveletFrequencySplitter  # 频域分解
+from .hybrid_stream import HybridDualStream, MultiScaleCNN, FrequencyGuidedAttention  # 异构双流
 from .semantic_guidance import SemanticGuidedDecoupling  # CLIP语义引导
 
 __factory = {
     'Model': Model,
+    'FSHDModule': FSHDModule,
     'GS3Module': GS3Module,
     'SymmetricGS3Module': SymmetricGS3Module,
     'SemanticGuidedDecoupling': SemanticGuidedDecoupling,
+    'DCTFrequencySplitter': DCTFrequencySplitter,
+    'WaveletFrequencySplitter': WaveletFrequencySplitter,
+    'HybridDualStream': HybridDualStream,
 }
 
 

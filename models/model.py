@@ -8,7 +8,8 @@ from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
 from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
-from .gs3_module import GS3Module  # 兼容性别名，实际使用SymmetricGS3Module
+from .gs3_module import GS3Module as GS3BaselineModule  # 保留Baseline对比
+from .fshd_module import FSHDModule  # 新的FSHD模块（频域-空域联合解耦）
 from .semantic_guidance import SemanticGuidedDecoupling  # 新增CLIP语义引导
 # from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
 from .vim import VisionMamba
@@ -295,11 +296,30 @@ class Model(nn.Module):
             if self.logger:
                 self.debug_logger.info("Using ViT-Base backbone")
 
-        # 初始化 G-S3 特征分离模块（对称解耦版本）
-        disentangle_type = net_config.get('disentangle_type', 'gs3')
-        if disentangle_type == 'gs3':
-            gs3_config = net_config.get('gs3', {})
-            self.disentangle = GS3Module(
+        # === 初始化特征分离模块：支持FSHD和Baseline两种模式 ===
+        disentangle_type = net_config.get('disentangle_type', 'fshd')  # 默认使用FSHD
+        gs3_config = net_config.get('gs3', {})
+        
+        if disentangle_type == 'fshd':
+            # 激进方案：FSHD模块（频域-空域联合解耦）
+            self.disentangle = FSHDModule(
+                dim=self.text_width,
+                num_heads=gs3_config.get('num_heads', 8),
+                d_state=gs3_config.get('d_state', 16),
+                d_conv=gs3_config.get('d_conv', 4),
+                dropout=gs3_config.get('dropout', 0.1),
+                freq_type=gs3_config.get('freq_type', 'dct'),  # 'dct' or 'wavelet'
+                img_size=gs3_config.get('img_size', (14, 14)),  # patch grid size
+                use_multi_scale_cnn=gs3_config.get('use_multi_scale_cnn', True),
+                logger=self.logger
+            )
+            if self.logger:
+                self.debug_logger.info("🔥 Using FSHD Module (Frequency-Spatial Hybrid Decoupling)")
+                self.debug_logger.info(f"   - Frequency Type: {gs3_config.get('freq_type', 'dct').upper()}")
+                self.debug_logger.info(f"   - Multi-scale CNN: {gs3_config.get('use_multi_scale_cnn', True)}")
+        elif disentangle_type == 'gs3':
+            # Baseline方案：原G-S3模块（用于对比实验）
+            self.disentangle = GS3BaselineModule(
                 dim=self.text_width,
                 num_heads=gs3_config.get('num_heads', 8),
                 d_state=gs3_config.get('d_state', 16),
@@ -308,8 +328,9 @@ class Model(nn.Module):
                 logger=self.logger
             )
             if self.logger:
-                self.debug_logger.info("Using Symmetric G-S3 (对称解耦) disentangle module")
+                self.debug_logger.info("Using Baseline G-S3 Module (for comparison)")
         else:
+            # 简化版（消融实验用）
             self.disentangle = DisentangleModule(dim=self.text_width)
             if self.logger:
                 self.debug_logger.info("Using simplified disentangle module")
@@ -453,8 +474,8 @@ class Model(nn.Module):
         if instruction is None:
             return None
         device = next(self.parameters()).device
-        if isinstance(instruction, list):
-            texts = instruction
+        if isinstance(instruction, (list, tuple)):
+            texts = list(instruction)
         else:
             texts = [instruction]
 

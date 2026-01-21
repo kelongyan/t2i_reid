@@ -43,6 +43,12 @@ class TrainingMonitor:
         self.logger.setLevel(logging.INFO)
         self.logger.propagate = False
         self._setup_handler(self.logger, self.log_file, level=logging.INFO, console=True)
+
+        # [New] 设置仅文件 Logger (用于后台记录 batch 信息)
+        self.file_logger = logging.getLogger(f"train.{dataset_name}.file_only")
+        self.file_logger.setLevel(logging.INFO)
+        self.file_logger.propagate = False
+        self._setup_handler(self.file_logger, self.log_file, level=logging.INFO, console=False)
         
         # 2. 设置调试 Logger (File Only)
         self.debug_logger = logging.getLogger(f"train.{dataset_name}.debug")
@@ -76,52 +82,93 @@ class TrainingMonitor:
     # --- 1. 特征统计 (透明化数据流) ---
     
     def log_feature_statistics(self, features: torch.Tensor, name: str):
-        """记录特征统计信息 (Compact format)"""
-        if features is None: return
+        """记录特征统计信息到debug.txt (仅文件，不显示终端)"""
+        if features is None: 
+            self.debug_logger.debug(f"[{name}] Feature is None, skipped")
+            return
+        
         t = features.detach().cpu().float()
         
+        # 计算详细统计信息
         stats_str = (
-            f"[{name}] shape={list(t.shape)} | μ={t.mean():.4f} σ={t.std():.4f} | "
-            f"min={t.min():.4f} max={t.max():.4f}"
+            f"[{name}] shape={list(t.shape)} | "
+            f"μ={t.mean().item():.6f} σ={t.std().item():.6f} | "
+            f"min={t.min().item():.6f} max={t.max().item():.6f} | "
+            f"norm={t.norm().item():.6f}"
         )
         
-        if torch.isnan(t).any() or torch.isinf(t).any():
-            self.debug_logger.warning(f"⚠️  NAN/INF DETECTED: {stats_str}")
+        # 检测异常值
+        if torch.isnan(t).any():
+            nan_count = torch.isnan(t).sum().item()
+            self.debug_logger.warning(f"⚠️  NAN DETECTED in {name}: {nan_count} values | {stats_str}")
+        elif torch.isinf(t).any():
+            inf_count = torch.isinf(t).sum().item()
+            self.debug_logger.warning(f"⚠️  INF DETECTED in {name}: {inf_count} values | {stats_str}")
         else:
             self.debug_logger.debug(stats_str)
 
     # --- 2. 梯度健康度 (透明化训练稳定性) ---
 
     def log_gradients(self, model, step_name: str):
-        """记录梯度摘要和异常"""
+        """记录梯度摘要和异常到debug.txt (仅文件)"""
         grads = []
         names = []
+        nan_params = []
+        zero_grad_params = []
+        
         for n, p in model.named_parameters():
             if p.grad is not None:
-                g_norm = p.grad.norm().item()
+                g = p.grad
+                if torch.isnan(g).any():
+                    nan_params.append(n)
+                g_norm = g.norm().item()
                 grads.append(g_norm)
                 names.append(n)
+                if g_norm < 1e-7:
+                    zero_grad_params.append(n)
         
-        if not grads: return
+        if not grads: 
+            self.debug_logger.debug(f"[{step_name}] No gradients found")
+            return
+        
         grads = np.array(grads)
         
-        # 摘要记录
+        # 详细摘要记录
         self.debug_logger.debug(
-            f"Grad Summary [{step_name}]: Count={len(grads)} | Mean={grads.mean():.6f} | "
-            f"Max={grads.max():.4f} | Min={grads.min():.8f}"
+            f"Grad Summary [{step_name}]: Count={len(grads)} | "
+            f"Mean={grads.mean():.8f} Std={grads.std():.8f} | "
+            f"Max={grads.max():.6f} Min={grads.min():.10f} | "
+            f"Median={np.median(grads):.8f}"
         )
         
-        # 异常检测
+        # NaN检测
+        if nan_params:
+            self.debug_logger.error(f"❌ NaN Gradients in {len(nan_params)} params: {nan_params[:5]}")
+        
+        # 异常检测 - 梯度爆炸
         exploding = [(n, g) for n, g in zip(names, grads) if g > 5.0]
         if exploding:
-            self.debug_logger.warning(f"⚠️  EXPLODING Gradients detected in {len(exploding)} layers!")
-            for n, g in sorted(exploding, key=lambda x: x[1], reverse=True)[:3]:
-                self.debug_logger.warning(f"   - {n}: {g:.4f}")
+            self.debug_logger.warning(
+                f"⚠️  EXPLODING Gradients detected in {len(exploding)}/{len(grads)} layers!"
+            )
+            for n, g in sorted(exploding, key=lambda x: x[1], reverse=True)[:5]:
+                self.debug_logger.warning(f"   - {n}: norm={g:.6f}")
+        
+        # 异常检测 - 梯度消失
+        if zero_grad_params:
+            self.debug_logger.warning(
+                f"⚠️  VANISHING Gradients in {len(zero_grad_params)} params (norm<1e-7)"
+            )
+            if len(zero_grad_params) <= 10:
+                for n in zero_grad_params:
+                    self.debug_logger.warning(f"   - {n}")
 
-        # Top 活跃层 (确认哪些层在学)
-        top_idx = grads.argsort()[::-1][:3]
-        top_str = " | ".join([f"{names[i]}={grads[i]:.4f}" for i in top_idx])
-        self.debug_logger.debug(f"🔥 Top Active Layers: {top_str}")
+        # Top 活跃层
+        if len(grads) >= 5:
+            top_idx = grads.argsort()[::-1][:5]
+            self.debug_logger.debug("🔥 Top 5 Active Layers:")
+            for i in top_idx:
+                self.debug_logger.debug(f"   - {names[i]}: norm={grads[i]:.6f}")
 
     def log_gradient_flow(self, model):
         """保持接口兼容，逻辑已并入 log_gradients"""
@@ -130,29 +177,47 @@ class TrainingMonitor:
     # --- 3. 损失与批次 (透明化进度) ---
 
     def log_batch_info(self, epoch: int, batch_idx: int, total_batches: int,
-                       loss_meters: Dict[str, float], lr: float):
-        """记录每一批次的简要状态"""
+                       loss_meters: Dict[str, float], lr: float, print_to_console=True):
+        """记录每一批次的状态到log.txt (显示终端) 和 debug.txt (仅文件，详细版)"""
+        # 简要版本
         loss_str = ', '.join([f"{k}: {v:.4f}" for k, v in loss_meters.items() if 'total' not in k])
-        self.debug_logger.info(
-            f"Epoch {epoch} [{batch_idx}/{total_batches}] | LR: {lr:.2e} | "
-            f"Total: {loss_meters.get('total', 0):.4f} | {loss_str}"
+        msg = (
+            f"E{epoch} [{batch_idx}/{total_batches}] LR:{lr:.2e} | "
+            f"Total:{loss_meters.get('total', 0):.4f} | {loss_str}"
         )
+        
+        if print_to_console:
+            self.logger.info(msg)
+        else:
+            self.file_logger.info(msg)
+        
+        # 详细版本 - 仅写入debug.txt
+        self.debug_logger.debug(
+            f"Batch Detail - Epoch:{epoch} Batch:{batch_idx}/{total_batches} | LR:{lr:.2e}"
+        )
+        for k, v in loss_meters.items():
+            self.debug_logger.debug(f"  └─ {k}: {v:.6f}")
 
     def log_loss_breakdown(self, loss_dict: Dict[str, torch.Tensor], epoch: int, batch_idx: int):
-        """记录损失占比"""
+        """记录损失占比到debug.txt (仅文件)"""
         total = loss_dict['total'].item() if isinstance(loss_dict['total'], torch.Tensor) else loss_dict['total']
-        if total == 0: return
+        if total == 0: 
+            self.debug_logger.debug(f"Loss Breakdown E{epoch}B{batch_idx}: Total=0, skipped")
+            return
         
         parts = []
         for k, v in loss_dict.items():
             if k == 'total': continue
             val = v.item() if isinstance(v, torch.Tensor) else v
-            parts.append((val / total * 100, k, val))
+            ratio = (val / total * 100) if total > 0 else 0
+            parts.append((ratio, k, val))
         
         parts.sort(key=lambda x: -x[0])
-        msg = f"Loss Breakdown E{epoch}B{batch_idx}: Total={total:.4f} | "
-        msg += " | ".join([f"{k}:{v:.3f}({p:.1f}%)" for p, k, v in parts[:5]])
-        self.debug_logger.debug(msg)
+        
+        # 详细记录每个损失项
+        self.debug_logger.debug(f"Loss Breakdown - Epoch:{epoch} Batch:{batch_idx} Total={total:.6f}")
+        for ratio, k, val in parts:
+            self.debug_logger.debug(f"  └─ {k}: {val:.6f} ({ratio:.2f}%)")
 
     def log_epoch_info(self, epoch: int, total_epochs: int, metrics: Dict[str, float]):
         """保存指标到历史记录"""
@@ -168,19 +233,40 @@ class TrainingMonitor:
     # --- 4. 模块特定状态 (透明化模型内部) ---
 
     def log_gs3_module_info(self, id_feat, cloth_feat, gate_stats=None):
-        """监控 G-S3 解耦质量"""
-        self.debug_logger.debug("--- G-S3 Internal State ---")
-        self.log_feature_statistics(id_feat, "GS3_ID_Final")
-        self.log_feature_statistics(cloth_feat, "GS3_Cloth_Final")
+        """监控 G-S3/FSHD 解耦质量到debug.txt (仅文件)"""
+        self.debug_logger.debug("=== Disentangle Module Internal State ===")
+        self.log_feature_statistics(id_feat, "ID_Feature")
+        self.log_feature_statistics(cloth_feat, "Cloth_Feature")
         
         # 检查正交性
         if id_feat is not None and cloth_feat is not None:
-            cos_sim = F.cosine_similarity(id_feat, cloth_feat, dim=-1).abs().mean().item()
-            self.debug_logger.debug(f"[Decouple] Absolute Cosine Similarity: {cos_sim:.6f} (target: 0.0)")
+            id_norm = F.normalize(id_feat, dim=-1, eps=1e-8)
+            cloth_norm = F.normalize(cloth_feat, dim=-1, eps=1e-8)
             
+            cos_sim = (id_norm * cloth_norm).sum(dim=-1)
+            abs_cos_sim = cos_sim.abs()
+            
+            self.debug_logger.debug(
+                f"[Orthogonality] Cosine Similarity: "
+                f"mean={cos_sim.mean().item():.6f} std={cos_sim.std().item():.6f} | "
+                f"abs_mean={abs_cos_sim.mean().item():.6f} (target: 0.0)"
+            )
+            
+            # 检查是否有严重的非正交情况
+            high_sim_count = (abs_cos_sim > 0.5).sum().item()
+            if high_sim_count > 0:
+                self.debug_logger.warning(
+                    f"⚠️  {high_sim_count}/{id_feat.size(0)} samples have high correlation (>0.5)"
+                )
+            
+        # 记录门控统计
         if isinstance(gate_stats, dict):
-            g_str = " | ".join([f"{k}={v:.4f}" for k, v in gate_stats.items()])
-            self.debug_logger.debug(f"[Gate] {g_str}")
+            self.debug_logger.debug("[Gate Statistics]")
+            for k, v in gate_stats.items():
+                if isinstance(v, (int, float)):
+                    self.debug_logger.debug(f"  └─ {k}: {v:.6f}")
+                else:
+                    self.debug_logger.debug(f"  └─ {k}: {v}")
 
     def log_gate_weights(self, weights: torch.Tensor, name: str):
         """记录门控权重分布"""
@@ -196,10 +282,17 @@ class TrainingMonitor:
     # --- 5. 系统与辅助 ---
 
     def log_memory_usage(self):
+        """记录GPU内存使用情况到debug.txt (仅文件)"""
         if torch.cuda.is_available():
             alloc = torch.cuda.memory_allocated() / 1024**2
+            reserved = torch.cuda.memory_reserved() / 1024**2
             max_alloc = torch.cuda.max_memory_allocated() / 1024**2
-            self.debug_logger.debug(f"GPU Memory: {alloc:.0f}MB / Max: {max_alloc:.0f}MB")
+            free = reserved - alloc
+            
+            self.debug_logger.debug(
+                f"[GPU Memory] Allocated:{alloc:.1f}MB | Reserved:{reserved:.1f}MB | "
+                f"Free:{free:.1f}MB | Peak:{max_alloc:.1f}MB"
+            )
 
     def log_optimizer_state(self, optimizer, epoch):
         lrs = [pg['lr'] for pg in optimizer.param_groups]

@@ -72,9 +72,9 @@ def configuration():
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
     
     # G-S3 module parameters
-    parser.add_argument('--disentangle-type', type=str, default='gs3', 
-                       choices=['gs3', 'simple'],
-                       help='Type of disentangle module: gs3 (G-S3 Module) or simple (DisentangleModule)')
+    parser.add_argument('--disentangle-type', type=str, default='fshd', 
+                       choices=['fshd', 'gs3', 'simple'],
+                       help='Type of disentangle module: fshd (FSHD-Net), gs3 (G-S3 Module) or simple (DisentangleModule)')
     parser.add_argument('--gs3-num-heads', type=int, default=8, 
                        help='Number of attention heads in G-S3 OPA')
     parser.add_argument('--gs3-d-state', type=int, default=16, 
@@ -83,6 +83,14 @@ def configuration():
                        help='Convolution kernel size for G-S3 Mamba filter')
     parser.add_argument('--gs3-dropout', type=float, default=0.1, 
                        help='Dropout rate for G-S3 module')
+    
+    # [New] FSHD specific parameters
+    parser.add_argument('--gs3-freq-type', type=str, default='dct', choices=['dct', 'wavelet'],
+                       help='Frequency decomposition type for FSHD')
+    parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true',
+                       help='Whether to use multi-scale CNN in FSHD (true/false)')
+    parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
+                       help='Image patch grid size (h, w) for FSHD frequency splitting')
 
     # Loss weights
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
@@ -94,6 +102,16 @@ def configuration():
     parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
     parser.add_argument('--loss-anti-collapse', type=float, default=1.0, help='Anti-collapse loss weight')
     parser.add_argument('--loss-reconstruction', type=float, default=0.1, help='Reconstruction loss weight')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.1, help='Orthogonal loss weight')
+    parser.add_argument('--loss-semantic-alignment', type=float, default=0.1, help='Semantic alignment loss weight')
+    parser.add_argument('--loss-freq-consistency', type=float, default=0.5, help='Frequency consistency loss weight')
+    parser.add_argument('--loss-freq-separation', type=float, default=0.2, help='Frequency separation loss weight')
+
+    # [New] Visualization parameters
+    parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
+    parser.add_argument('--visualization-save-dir', type=str, default='visualizations', help='Directory to save visualizations')
+    parser.add_argument('--visualization-frequency', type=int, default=5, help='Frequency (epochs) to save visualizations')
+    parser.add_argument('--visualization-batch-interval', type=int, default=200, help='Batch interval to save visualizations')
 
     # Optimizer and scheduler
     parser.add_argument('--optimizer', type=str, default='Adam', help='Optimizer type')
@@ -106,6 +124,9 @@ def configuration():
     # 初始化 disentangle 字典
     args.disentangle = {}
 
+    # 处理布尔值字符串
+    args.gs3_use_multi_scale_cnn = args.gs3_use_multi_scale_cnn.lower() == 'true'
+
     # 处理损失权重
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
@@ -117,8 +138,20 @@ def configuration():
             'gate_adaptive': args.loss_gate_adaptive,
             'id_triplet': args.loss_id_triplet,
             'anti_collapse': args.loss_anti_collapse,
-            'reconstruction': args.loss_reconstruction
+            'reconstruction': args.loss_reconstruction,
+            'orthogonal': args.loss_orthogonal,
+            'semantic_alignment': args.loss_semantic_alignment,
+            'freq_consistency': args.loss_freq_consistency,
+            'freq_separation': args.loss_freq_separation
         }
+    
+    # 初始化可视化配置
+    args.visualization = {
+        'enabled': args.visualization_enabled,
+        'save_dir': args.visualization_save_dir,
+        'frequency': args.visualization_frequency,
+        'batch_interval': args.visualization_batch_interval
+    }
 
     # 处理数据集配置
     if args.dataset_configs:
@@ -548,7 +581,10 @@ class Runner:
                 'num_heads': args.gs3_num_heads,
                 'd_state': args.gs3_d_state,
                 'd_conv': args.gs3_d_conv,
-                'dropout': args.gs3_dropout
+                'dropout': args.gs3_dropout,
+                'freq_type': args.gs3_freq_type,
+                'use_multi_scale_cnn': args.gs3_use_multi_scale_cnn,
+                'img_size': tuple(args.gs3_img_size)
             },
             'fusion': {
                 'type': args.fusion_type,

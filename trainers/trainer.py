@@ -7,6 +7,7 @@ from losses.loss import Loss
 from evaluators.evaluator import Evaluator
 from utils.serialization import save_checkpoint
 from utils.meters import AverageMeter
+from utils.visualization import FSHDVisualizer  # 新增：可视化工具
 
 class EarlyStopping:
     """早停机制，防止过拟合"""
@@ -45,15 +46,17 @@ class Trainer:
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === 对称解耦权重配置 ===
+        # === FSHD权重配置（激进版）===
         default_loss_weights = {
             'info_nce': 1.0, 
             'cls': 0.05,
             'cloth_semantic': 1.0, 
-            'orthogonal': 0.15,          # 大幅降低
+            'orthogonal': 0.1,            # 大幅降低
             'gate_adaptive': 0.02,
             'reconstruction': 0.5,
-            'semantic_alignment': 0.1,   # 大幅降低
+            'semantic_alignment': 0.1,     # 大幅降低
+            'freq_consistency': 0.5,      # 【新增】频域一致性
+            'freq_separation': 0.2,       # 【新增】频域分离
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -70,6 +73,18 @@ class Trainer:
             self.combined_loss.set_semantic_guidance(model.semantic_guidance)
             if self.monitor:
                 self.monitor.debug_logger.info("✅ Semantic guidance module connected to Loss system")
+        
+        # === 新增：初始化可视化器 ===
+        visualize_config = getattr(args, 'visualization', {})
+        if visualize_config.get('enabled', True):
+            vis_save_dir = visualize_config.get('save_dir', 'visualizations')
+            self.visualizer = FSHDVisualizer(save_dir=vis_save_dir, logger=monitor)
+            self.visualize_freq = visualize_config.get('frequency', 5)  # 每N个epoch可视化一次
+            self.visualize_batch_interval = visualize_config.get('batch_interval', 200)
+            if self.monitor:
+                self.monitor.debug_logger.info(f"✅ Visualizer enabled (freq={self.visualize_freq}, batch_interval={self.visualize_batch_interval})")
+        else:
+            self.visualizer = None
         
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
         if args.fp16 and self.device.type != 'cuda':
@@ -168,7 +183,7 @@ class Trainer:
             self.monitor.logger.info(f"BatchNorm warmup enabled with momentum={momentum}")
 
     def run(self, inputs, epoch, batch_idx, total_batches):
-        # 执行单次训练步骤，计算所有损失（对称解耦版本）
+        # 执行单次训练步骤，计算所有损失（FSHD版本）
         image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
         image = image.to(self.device)
         pid = pid.to(self.device)
@@ -183,10 +198,16 @@ class Trainer:
                 raise ValueError("id_captions must be a list of strings")
 
         with torch.amp.autocast('cuda', enabled=self.args.fp16):
-            # 训练时不需要注意力图，return_attention=False（默认值）
-            outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
+            # === FSHD模块支持返回频域信息 ===
+            # 如果使用FSHD模块，需要获取频域信息
+            return_freq_info = (self.visualizer is not None and 
+                               batch_idx % self.visualize_batch_interval == 0)
+            
+            # 训练时可以选择性返回注意力图和频域信息
+            outputs = self.model(image=image, cloth_instruction=cloth_captions, 
+                               id_instruction=id_captions)
 
-            # === 对称解耦更新：模型返回12个输出（新增original_feat）===
+            # === FSHD模块返回12个输出（保持兼容）===
             if len(outputs) != 12:
                 raise ValueError(f"Expected 12 model outputs during training, got {len(outputs)}")
 
@@ -194,15 +215,52 @@ class Trainer:
             cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
             id_cls_features, original_feat = outputs
             
-            # 损失计算（新增original_feat参数）
+            # === 获取频域信息（如果使用FSHD模块）===
+            freq_info = None
+            if hasattr(self.model, 'disentangle') and hasattr(self.model.disentangle, 'forward'):
+                # 检查是否是FSHD模块（通过检查是否有freq_splitter属性）
+                if hasattr(self.model.disentangle, 'freq_splitter') and return_freq_info:
+                    # 重新调用disentangle获取频域信息（仅用于可视化，不参与梯度）
+                    with torch.no_grad():
+                        # 从模型中提取image_embeds_raw
+                        if self.model.vision_backbone_type == 'vim':
+                            image_embeds_raw = self.model.visual_encoder(image)
+                        else:
+                            image_outputs = self.model.visual_encoder(image)
+                            image_embeds_raw = image_outputs.last_hidden_state
+                        image_embeds_raw = self.model.visual_proj(image_embeds_raw)
+                        
+                        # 调用disentangle获取freq_info
+                        _, _, _, _, freq_info = self.model.disentangle(
+                            image_embeds_raw, return_freq_info=True
+                        )
+            
+            # === 损失计算（新增freq_info参数）===
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
                 pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                id_cls_features=id_cls_features, original_feat=original_feat
+                id_cls_features=id_cls_features, original_feat=original_feat,
+                freq_info=freq_info  # 【新增】传递频域信息
             )
 
+        # === 可视化回调 ===
+        if self.visualizer is not None and batch_idx % self.visualize_batch_interval == 0:
+            # 频域掩码可视化
+            if freq_info is not None:
+                self.visualizer.plot_frequency_masks(freq_info, epoch, batch_idx)
+                
+                # 频域能量谱
+                if 'freq_magnitude' in freq_info:
+                    self.visualizer.plot_frequency_energy_spectrum(freq_info, epoch, batch_idx)
+            
+            # 门控统计
+            if gate_stats is not None and isinstance(gate_stats, dict):
+                # 从gate_stats中提取实际的gate tensor（如果存在）
+                # 注意：当前gate_stats只包含统计值，如果需要可视化需要修改模型返回gate tensor
+                pass
+        
         # 记录模型内部状态信息
         if self.monitor and batch_idx % 200 == 0:  # 每200个批次记录一次详细信息
             self.monitor.log_feature_statistics(image_feats, "image_features")
@@ -220,6 +278,14 @@ class Trainer:
                     f"Attr[{gate_stats.get('gate_attr_mean', 0):.4f}], "
                     f"Diversity[{gate_stats.get('diversity', 0):.4f}]"
                 )
+                
+                # 【新增】频域信息记录
+                if 'freq_type' in gate_stats:
+                    self.monitor.debug_logger.debug(
+                        f"Frequency: type={gate_stats.get('freq_type')}, "
+                        f"energy={gate_stats.get('low_freq_energy', 0):.4f}"
+                    )
+            
             if gate_weights is not None:
                 self.monitor.log_gate_weights(gate_weights, "fusion_gate")
 
@@ -451,11 +517,11 @@ class Trainer:
                     self.monitor.log_loss_breakdown(loss_dict, epoch, i)
 
                 # 记录批次信息
-                if self.monitor and i % 50 == 0:  # 每50个批次记录一次
+                if self.monitor and i % 200 == 0:  # 每200个批次记录一次
                     current_lr = optimizer.param_groups[0]['lr']
                     self.monitor.log_batch_info(epoch, i, total_batches,
                                               {k: v.avg for k, v in loss_meters.items()},
-                                              current_lr)
+                                              current_lr, print_to_console=False)
                 
                 global_step += 1
 
@@ -470,6 +536,10 @@ class Trainer:
                 epoch_metrics = {k: v.avg for k, v in loss_meters.items()}
                 self.monitor.log_epoch_info(epoch, self.args.epochs, epoch_metrics)
 
+            # === 清理显存，准备评估 ===
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             # 每个epoch结束后进行评估
             if query_loader and gallery_loader:
                 # 评估模型
