@@ -82,12 +82,15 @@ class FrequencySeparationLoss(nn.Module):
 
 class SymmetricReconstructionLoss(nn.Module):
     """
-    对称重构损失 (Symmetric Reconstruction Loss)
+    对称重构损失 (Symmetric Reconstruction Loss) - 增强版
     
     核心思想：F_input ≈ F_id + F_attr
     确保解耦后的两个特征能够重建原始输入，防止信息丢失
     
-    改进：相比TextGuidedDecouplingLoss，直接约束视觉特征的重构
+    优化：
+    1. 保留MSE和Cosine损失（基础）
+    2. 【新增】特征多样性损失 - 确保id和attr覆盖不同语义空间
+    3. 【新增】能量守恒约束 - 确保信息量守恒
     """
     def __init__(self):
         super().__init__()
@@ -107,6 +110,7 @@ class SymmetricReconstructionLoss(nn.Module):
         # 简单加法重建
         reconstructed = id_feat + attr_feat  # [B, dim]
         
+        # === 基础重构损失 ===
         # 方案1：MSE Loss（L2距离）
         mse_loss = self.mse_loss(reconstructed, original_feat)
         
@@ -119,8 +123,24 @@ class SymmetricReconstructionLoss(nn.Module):
             target
         )
         
-        # 组合两种损失
-        return mse_loss + 0.5 * cos_loss
+        # === 【新增】特征多样性损失 ===
+        # 确保id和attr特征覆盖不同的语义空间，避免重叠
+        id_norm = F.normalize(id_feat, dim=-1, eps=1e-8)
+        attr_norm = F.normalize(attr_feat, dim=-1, eps=1e-8)
+        # 计算id和attr的余弦相似度，应该接近0（正交）
+        diversity_loss = torch.abs((id_norm * attr_norm).sum(dim=-1)).mean()
+        
+        # === 【新增】能量守恒约束 ===
+        # 重构特征的能量（L2范数）应接近原始特征
+        recon_energy = torch.norm(reconstructed, p=2, dim=-1)  # [B]
+        orig_energy = torch.norm(original_feat, p=2, dim=-1)   # [B]
+        energy_loss = F.mse_loss(recon_energy, orig_energy)
+        
+        # 组合所有损失
+        # 基础重构(mse+cos) + 多样性 + 能量守恒
+        total_loss = mse_loss + 0.5 * cos_loss + 0.5 * diversity_loss + 0.3 * energy_loss
+        
+        return total_loss
 
 
 class EnhancedOrthogonalLoss(nn.Module):
@@ -194,20 +214,20 @@ class Loss(nn.Module):
         self.frequency_consistency = FrequencyConsistencyLoss()
         self.frequency_separation = FrequencySeparationLoss()
         
-        # === FSHD权重配置（优化版）===
-        # 移除冗余损失，保留核心损失
+        # === FSHD权重配置（优化版 - 平衡权重）===
+        # 阶段1：禁用频域损失和语义对齐损失，提升辅助损失权重
         self.weights = weights if weights is not None else {
-            'info_nce': 1.0,              # 对比学习 - 主导
-            'cls': 0.05,                  # 分类损失
-            'cloth_semantic': 1.0,        # 衣服语义
-            'orthogonal': 0.1,            # 正交约束（降低，防止过度解耦）
-            'id_triplet': 0.5,            # ID一致性
-            'anti_collapse': 1.0,         # 防坍缩
-            'gate_adaptive': 0.02,        # 门控自适应（降低）
-            'reconstruction': 0.5,        # 对称重构
-            'semantic_alignment': 0.1,    # CLIP语义对齐（可选）
-            'freq_consistency': 0.5,      # 【FSHD】频域一致性
-            'freq_separation': 0.2,       # 【FSHD】频域分离
+            'info_nce': 1.2,              # 对比学习 - 主导
+            'cls': 0.05,                  # 分类损失（提升2.5倍）
+            'cloth_semantic': 1.0,        # 衣服语义（降低，避免过度主导）
+            'orthogonal': 0.12,           # 正交约束（提升50%）
+            'id_triplet': 0.8,            # ID一致性（提升60%）
+            'anti_collapse': 2.0,         # 防坍缩（大幅提升，修复后激活）
+            'gate_adaptive': 0.05,        # 门控自适应（提升5倍）
+            'reconstruction': 1.5,        # 对称重构（大幅提升，增强版）
+            'semantic_alignment': 0.0,    # 【阶段1：完全禁用】
+            'freq_consistency': 0.0,      # 【阶段1：完全禁用】
+            'freq_separation': 0.0,       # 【阶段1：完全禁用】
         }
         
         # 动态权重调整参数
@@ -243,58 +263,89 @@ class Loss(nn.Module):
     
     def update_epoch(self, epoch):
         """
-        === 动态权重调整（3-Stage策略）===
-        优化：简化逻辑，减少不必要的调整
+        === 动态权重调整（优化版 - 3-Stage策略）===
+        
+        阶段1 (Epoch 1-20): 优化基础训练
+            - 完全禁用频域损失和语义对齐
+            - 提升辅助损失权重，增强监督信号
+        
+        阶段2 (Epoch 21-50): 渐进激活期
+            - 逐步引入频域监督
+            - 启用轻量语义对齐
+        
+        阶段3 (Epoch 51+): 全面优化期
+            - 完整频域损失
+            - 完整语义对齐
         """
         self.current_epoch = epoch
         
         if not self.enable_dynamic_weights:
             return
         
-        # Stage 1 (Epoch 0-10): 激活期 - 让双分支都能提取有效特征
-        if epoch <= 10:
+        # === 阶段1 (Epoch 1-20): 优化基础训练 ===
+        if epoch <= 20:
             self.weights['info_nce'] = 1.2
-            self.weights['cls'] = 0.02
-            self.weights['orthogonal'] = 0.15         # 适中的正交约束
-            self.weights['reconstruction'] = 0.8      # 强化重构
-            self.weights['semantic_alignment'] = 0.05
-            self.weights['anti_collapse'] = 1.5
-            self.weights['freq_consistency'] = 0.3    # 逐步引入频域监督
+            self.weights['cls'] = 0.05              # 提升（0.02→0.05）
+            self.weights['cloth_semantic'] = 1.0
+            self.weights['orthogonal'] = 0.12       # 提升（0.08→0.12）
+            self.weights['reconstruction'] = 1.5    # 大幅提升（0.8→1.5）
+            self.weights['anti_collapse'] = 2.0     # 大幅提升（1.5→2.0）
+            self.weights['id_triplet'] = 0.8        # 提升（0.5→0.8）
+            self.weights['gate_adaptive'] = 0.05    # 大幅提升（0.01→0.05）
+            # 【关键】完全禁用
+            self.weights['semantic_alignment'] = 0.0
+            self.weights['freq_consistency'] = 0.0
+            self.weights['freq_separation'] = 0.0
+            
+        # === 阶段2 (Epoch 21-50): 渐进激活 ===
+        elif epoch <= 50:
+            self.weights['info_nce'] = 1.0
+            self.weights['cls'] = 0.08              # 持续提升
+            self.weights['cloth_semantic'] = 1.0
+            self.weights['orthogonal'] = 0.12
+            self.weights['reconstruction'] = 1.2
+            self.weights['anti_collapse'] = 1.8
+            self.weights['id_triplet'] = 0.8
+            self.weights['gate_adaptive'] = 0.05
+            # 【渐进激活】
+            self.weights['semantic_alignment'] = 0.05   # 轻量启用
+            self.weights['freq_consistency'] = 0.3      # 轻量启用
             self.weights['freq_separation'] = 0.1
             
-        # Stage 2 (Epoch 11-40): 语义对齐期 - 优化特征质量
-        elif epoch <= 40:
-            self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.05
-            self.weights['cloth_semantic'] = 1.2      # 增强cloth语义
-            self.weights['orthogonal'] = 0.1          # 降低正交约束
-            self.weights['reconstruction'] = 0.5
-            self.weights['semantic_alignment'] = 0.1
-            self.weights['freq_consistency'] = 0.5    # 完整频域监督
-            self.weights['freq_separation'] = 0.2
-            
-        # Stage 3 (Epoch 41+): 精细微调期 - 稳定收敛
+        # === 阶段3 (Epoch 51+): 全面优化 ===
         else:
             self.weights['info_nce'] = 1.0
-            self.weights['cls'] = 0.1                 # 轻微增加分类权重
+            self.weights['cls'] = 0.1               # 进一步提升
             self.weights['cloth_semantic'] = 1.0
-            self.weights['orthogonal'] = 0.08         # 进一步降低
-            self.weights['reconstruction'] = 0.4
-            self.weights['semantic_alignment'] = 0.12
+            self.weights['orthogonal'] = 0.12
+            self.weights['reconstruction'] = 1.0
+            self.weights['anti_collapse'] = 1.5
+            self.weights['id_triplet'] = 0.8
+            self.weights['gate_adaptive'] = 0.05
+            # 【完整激活】
+            self.weights['semantic_alignment'] = 0.08
             self.weights['freq_consistency'] = 0.5
             self.weights['freq_separation'] = 0.2
             
         # 记录权重变化
-        if self.logger and epoch in [0, 11, 41]:
+        if self.logger and epoch in [1, 21, 51]:
             self.debug_logger.info(f"📊 Loss weights updated at epoch {epoch}:")
             for k, v in self.weights.items():
-                self.debug_logger.info(f"   - {k}: {v:.4f}")
+                if v > 0:  # 只显示激活的损失
+                    self.debug_logger.info(f"   - {k}: {v:.4f}")
     
     def gate_adaptive_loss_v2(self, gate_stats, id_embeds, cloth_embeds, pids):
         """
-        === 门控自适应损失（简化版）===
-        目标：使同类样本的ID特征更相似（类内紧凑）
-        优化：简化计算，减少冗余逻辑
+        === 门控自适应损失（增强版 - 添加类间分离）===
+        
+        优化：
+        1. 保留类内紧凑（原有功能）
+        2. 【新增】类间分离损失（解决类内相似度饱和问题）
+        3. 平衡类内聚合与类间区分
+        
+        目标：
+        - compact_loss: 使同类样本的ID特征更相似
+        - separation_loss: 使异类样本的ID特征更不同
         """
         if gate_stats is None or id_embeds is None:
             return torch.tensor(0.0, device=self._get_device(), requires_grad=True)
@@ -317,9 +368,20 @@ class Loss(nn.Module):
         id_norm = F.normalize(id_embeds, dim=-1, eps=1e-8)
         id_sim = torch.matmul(id_norm, id_norm.t())
         
-        # 类内紧凑度
+        # === 类内紧凑度（原有逻辑）===
         intra_class_sim = (id_sim * mask).sum() / (mask.sum() + 1e-8)
         compact_loss = 1.0 - intra_class_sim
+        
+        # === 【新增】类间分离损失 ===
+        # 异类样本mask（排除同类和对角线）
+        neg_mask = 1.0 - mask - torch.eye(batch_size, device=mask.device)
+        
+        separation_loss = 0.0
+        if neg_mask.sum() > 1e-6:
+            # 计算异类样本间的平均相似度
+            inter_class_sim = (id_sim * neg_mask).sum() / (neg_mask.sum() + 1e-8)
+            # 惩罚异类样本相似度过高
+            separation_loss = torch.clamp(inter_class_sim, min=0.0)
         
         # 门控正则（防止极端值）
         gate_id_mean = gate_stats.get('gate_id_mean', 0.5)
@@ -327,7 +389,8 @@ class Loss(nn.Module):
         if gate_id_mean < 0.25 or gate_id_mean > 0.85:
             gate_regularization = 0.05 * ((gate_id_mean - 0.55) ** 2)
         
-        total_loss = compact_loss + gate_regularization
+        # 组合损失：类内紧凑 + 类间分离 + 门控正则
+        total_loss = compact_loss + 0.5 * separation_loss + gate_regularization
         
         # 定期记录调试信息
         if self.logger:
@@ -335,7 +398,9 @@ class Loss(nn.Module):
             if self._log_counter_gate % 500 == 0:
                 self.debug_logger.debug(
                     f"[Gate Adaptive] intra_sim={intra_class_sim:.4f} | "
-                    f"loss={compact_loss:.6f} | gate_mean={gate_id_mean:.4f}"
+                    f"inter_sim={inter_class_sim if isinstance(separation_loss, torch.Tensor) else 0:.4f} | "
+                    f"compact_loss={compact_loss:.6f} | sep_loss={separation_loss if isinstance(separation_loss, torch.Tensor) else 0:.6f} | "
+                    f"gate_mean={gate_id_mean:.4f}"
                 )
         
         return torch.clamp(total_loss, min=0.0, max=5.0)
@@ -468,16 +533,41 @@ class Loss(nn.Module):
         loss = F.relu(dist_ap - dist_an + margin).mean()
         return loss
 
-    def anti_collapse_loss(self, cloth_embeds, margin=1.0):
-        """[基础保障] 防坍缩正则：确保衣服特征存在，打破零和博弈"""
+    def anti_collapse_loss(self, cloth_embeds, target_norm=8.0, margin_ratio=0.8):
+        """
+        [优化版] 防坍缩正则：确保衣服特征存在，打破零和博弈
+        
+        修复：
+        1. 使用自适应margin（原固定margin=1.0远小于实际norm=8.0）
+        2. 添加方差正则，防止维度坍缩
+        
+        Args:
+            cloth_embeds: 衣服特征 [B, D]
+            target_norm: 目标范数（默认8.0，与实际特征norm匹配）
+            margin_ratio: margin比例（0.8表示容忍20%的范数下降）
+        """
         if cloth_embeds is None:
             return torch.tensor(0.0, device=self._get_device())
         
+        # 自适应margin：期望norm的80%
+        adaptive_margin = target_norm * margin_ratio  # 8.0 * 0.8 = 6.4
+        
         # 计算 L2 范数
-        norms = torch.norm(cloth_embeds, p=2, dim=-1)
+        norms = torch.norm(cloth_embeds, p=2, dim=-1)  # [B]
         # 惩罚模长过小的向量
-        loss = F.relu(margin - norms).mean()
-        return loss
+        norm_loss = F.relu(adaptive_margin - norms).mean()
+        
+        # 【新增】方差正则：防止特征坍缩到少数维度
+        # 计算每个维度的标准差
+        feature_std = cloth_embeds.std(dim=0)  # [D]
+        # 惩罚标准差过小的维度（说明该维度信息量低）
+        std_threshold = 0.01  # 最小标准差阈值
+        collapse_loss = F.relu(std_threshold - feature_std).mean()
+        
+        # 组合两种损失
+        total_loss = norm_loss + 0.5 * collapse_loss
+        
+        return total_loss
 
     def forward(self, image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                 cloth_embeds, cloth_text_embeds, cloth_image_embeds, pids, 
@@ -519,14 +609,14 @@ class Loss(nn.Module):
         # 5. ID 一致性 Triplet
         losses['id_triplet'] = self.triplet_loss(id_embeds, pids)
         
-        # 6. 防坍缩正则
+        # 6. 防坍缩正则（优化版 - 使用自适应margin）
         if id_embeds is not None:
-            id_collapse_loss = self.anti_collapse_loss(id_embeds, margin=1.0)
+            id_collapse_loss = self.anti_collapse_loss(id_embeds)
         else:
             id_collapse_loss = torch.tensor(0.0, device=self._get_device())
         
         if cloth_embeds is not None:
-            cloth_collapse_loss = self.anti_collapse_loss(cloth_embeds, margin=1.0)
+            cloth_collapse_loss = self.anti_collapse_loss(cloth_embeds)
         else:
             cloth_collapse_loss = torch.tensor(0.0, device=self._get_device())
         

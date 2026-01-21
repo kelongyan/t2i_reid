@@ -139,20 +139,24 @@ class VimMamba(nn.Module):
         dt, B_fwd, C_fwd = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt) # [B, L, d_inner]
         
-        # Ensure dt type matches input u (x_fwd) for selective_scan_fn
-        # And DO NOT apply softplus here because delta_softplus=True is passed to selective_scan_fn
-        if dt.dtype != x_fwd.dtype:
-            dt = dt.to(x_fwd.dtype)
+        # [Fix] Force ALL inputs to float32 for selective_scan_fn numerical stability & type matching
+        x_fwd = x_fwd.float()
+        dt = dt.float()
+        A = A.float()
+        B_fwd = B_fwd.transpose(1, 2).float() # [B, N, L]
+        C_fwd = C_fwd.transpose(1, 2).float() # [B, N, L]
+        D_fwd = self.D.float()
+        delta_bias_fwd = self.dt_proj.bias.float()
         
         # selective_scan_fn requires [B, D, L] for u and delta
         y_fwd = selective_scan_fn(
             x_fwd.transpose(1, 2), # [B, D, L]
             dt.transpose(1, 2),    # [B, D, L]
             A,
-            B_fwd.transpose(1, 2), # [B, N, L]
-            C_fwd.transpose(1, 2), # [B, N, L]
-            self.D.float(),
-            z=None, delta_bias=self.dt_proj.bias.float(), delta_softplus=True, return_last_state=False
+            B_fwd, 
+            C_fwd, 
+            D_fwd,
+            z=None, delta_bias=delta_bias_fwd, delta_softplus=True, return_last_state=False
         )
         
         # 3. Backward Path
@@ -168,18 +172,23 @@ class VimMamba(nn.Module):
         dt_b, B_bwd, C_bwd = torch.split(x_dbl_b, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt_b = self.dt_proj_b(dt_b)
         
-        # Ensure dt type matches input u
-        if dt_b.dtype != x_bwd.dtype:
-            dt_b = dt_b.to(x_bwd.dtype)
+        # [Fix] Force ALL inputs to float32 for backward branch
+        x_bwd = x_bwd.float()
+        dt_b = dt_b.float()
+        A_b = A_b.float()
+        B_bwd = B_bwd.transpose(1, 2).float()
+        C_bwd = C_bwd.transpose(1, 2).float()
+        D_bwd = self.D_b.float()
+        delta_bias_bwd = self.dt_proj_b.bias.float()
         
         y_bwd = selective_scan_fn(
             x_bwd.transpose(1, 2), # [B, D, L]
             dt_b.transpose(1, 2),  # [B, D, L]
             A_b,
-            B_bwd.transpose(1, 2), # [B, N, L]
-            C_bwd.transpose(1, 2), # [B, N, L]
-            self.D_b.float(),
-            z=None, delta_bias=self.dt_proj_b.bias.float(), delta_softplus=True, return_last_state=False
+            B_bwd,
+            C_bwd,
+            D_bwd,
+            z=None, delta_bias=delta_bias_bwd, delta_softplus=True, return_last_state=False
         )
         
         # Flip backward output back

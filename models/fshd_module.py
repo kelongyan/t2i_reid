@@ -196,3 +196,8 @@ class FSHDModule(nn.Module):
             base_outputs = base_outputs + (freq_info,)
         
         return base_outputs
+
+
+# 兼容性别名
+GS3Module = FSHDModule
+SymmetricGS3Module = FSHDModule

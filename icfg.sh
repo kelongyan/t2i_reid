@@ -12,49 +12,43 @@
 # 预期性能：
 #   - FSHD-Full: mAP 75-78%
 #   - FSHD-Lite: mAP 74-77%
-#   - Baseline G-S3: mAP 73-76%
 # ============================================================================
 
 # 默认参数配置（FSHD-Full完整版）
 DISENTANGLE_TYPE="fshd"
-FREQ_TYPE="dct"
 USE_MULTI_SCALE_CNN=true
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
 
-echo "🔥 默认配置: FSHD-Full (disentangle=fshd, freq=dct, multi_scale_cnn=true, visualization=true)"
-echo "   可通过参数覆盖，例如: bash icfg.sh --disentangle-type=gs3 --no-viz"
+echo "🔥 默认配置: FSHD-Full (disentangle=fshd, multi_scale_cnn=true, visualization=true)"
+echo "   可通过参数覆盖，例如: bash icfg.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
-        --disentangle-type=*)
+        --disentangle-type=*) 
             DISENTANGLE_TYPE="${arg#*=}"
             shift
-            ;;
-        --freq-type=*)
-            FREQ_TYPE="${arg#*=}"
-            shift
-            ;;
+            ;; 
         --use-cnn)
             USE_MULTI_SCALE_CNN=true
             shift
-            ;;
+            ;; 
         --no-cnn)
             USE_MULTI_SCALE_CNN=false
             shift
-            ;;
+            ;; 
         --no-viz)
             ENABLE_VISUALIZATION=false
             shift
-            ;;
-        --resume=*)
+            ;; 
+        --resume=*) 
             RESUME_PATH="${arg#*=}"
             shift
-            ;;
+            ;; 
         *)
             shift
-            ;;
+            ;; 
     esac
 done
 
@@ -62,12 +56,15 @@ done
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
+# JSON Config String (Single quoted for safety)
+DATASET_CONFIG="[{'name': 'ICFG-PEDES', 'root': 'ICFG-PEDES', 'json_file': 'ICFG-PEDES/annotations/ICFG-PEDES.json', 'cloth_json': 'ICFG-PEDES/annotations/caption_cloth.json', 'id_json': 'ICFG-PEDES/annotations/caption_id.json'}]"
+
 # 构建基础命令
-BASE_CMD="python scripts/train.py \
+CMD="python scripts/train.py \
     --root datasets \
-    --dataset-configs '[{\"name\": \"ICFG-PEDES\", \"root\": \"ICFG-PEDES\", \"json_file\": \"ICFG-PEDES/annotations/ICFG-PEDES.json\", \"cloth_json\": \"ICFG-PEDES/annotations/caption_cloth.json\", \"id_json\": \"ICFG-PEDES/annotations/caption_id.json\"}]' \
+    --dataset-configs \"${DATASET_CONFIG}\" \
     --batch-size 112 \
-    --lr 0.00018 \
+    --lr 0.00003 \
     --weight-decay 0.00025 \
     --epochs 80 \
     --milestones 40 60 \
@@ -83,23 +80,20 @@ BASE_CMD="python scripts/train.py \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
 # 添加解耦模块配置
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --disentangle-type $DISENTANGLE_TYPE"
 
 if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    BASE_CMD="$BASE_CMD \
-    --gs3-freq-type $FREQ_TYPE \
+    CMD="$CMD \
     --gs3-use-multi-scale-cnn $USE_MULTI_SCALE_CNN \
     --gs3-img-size 14 14"
-    echo "🔥 使用FSHD模块: freq_type=$FREQ_TYPE, multi_scale_cnn=$USE_MULTI_SCALE_CNN"
-elif [ "$DISENTANGLE_TYPE" = "gs3" ]; then
-    echo "📊 使用Baseline G-S3模块"
+    echo "🔥 使用FSHD模块: multi_scale_cnn=$USE_MULTI_SCALE_CNN (Frequency: DCT fixed)"
 else
     echo "🔧 使用简化解耦模块"
 fi
 
 # ICFG使用更多的heads（数据集更大）
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --gs3-num-heads 12 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
@@ -116,96 +110,45 @@ BASE_CMD="$BASE_CMD \
     --optimizer \"AdamW\" \
     --scheduler \"cosine\""
 
-# 损失权重
-BASE_CMD="$BASE_CMD \
-    --loss-info-nce 1.0 \
+# 损失权重（优化版）
+CMD="$CMD \
+    --loss-info-nce 1.2 \
     --loss-cls 0.05 \
     --loss-cloth-semantic 1.0 \
-    --loss-orthogonal 0.1 \
-    --loss-gate-adaptive 0.02 \
-    --loss-id-triplet 0.5 \
-    --loss-anti-collapse 1.0 \
-    --loss-reconstruction 0.5"
+    --loss-orthogonal 0.12 \
+    --loss-gate-adaptive 0.05 \
+    --loss-id-triplet 0.8 \
+    --loss-anti-collapse 2.0 \
+    --loss-reconstruction 1.5 \
+    --loss-semantic-alignment 0.0 \
+    --loss-freq-consistency 0.0 \
+    --loss-freq-separation 0.0"
 
-if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    BASE_CMD="$BASE_CMD \
-    --loss-freq-consistency 0.5 \
-    --loss-freq-separation 0.2"
-fi
+echo "🚀 优化模式: 修复anti_collapse/gate_adaptive/reconstruction，提升辅助损失权重"
 
 if [ "$ENABLE_VISUALIZATION" = true ]; then
-    BASE_CMD="$BASE_CMD \
+    CMD="$CMD \
     --visualization-enabled \
-    --visualization-save-dir \"visualizations/icfg_${DISENTANGLE_TYPE}_${FREQ_TYPE}\" \
+    --visualization-save-dir \"visualizations/icfg_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
 fi
 
 if [ -n "$RESUME_PATH" ]; then
-    BASE_CMD="$BASE_CMD --resume \"$RESUME_PATH\""
+    CMD="$CMD --resume \"$RESUME_PATH\""
 fi
 
 echo ""
 echo "🚀 开始训练 ICFG-PEDES 数据集 (${DISENTANGLE_TYPE}模式)"
+echo "Executing command..."
 echo ""
 
-eval $BASE_CMD
+eval $CMD
 
 exit_code=$?
 if [ $exit_code -eq 0 ]; then
     echo "✅ ICFG-PEDES 训练完成！"
 else
-    echo "❌ ICFG-PEDES 训练失败，退出码：$exit_code"
-fi
-
-exit $exit_code
-    --disentangle-type gs3 \
-    --gs3-num-heads 12 \
-    --gs3-d-state 24 \
-    --gs3-d-conv 4 \
-    --gs3-dropout 0.18 \
-    --fusion-type \"enhanced_mamba\" \
-    --fusion-dim 256 \
-    --fusion-d-state 24 \
-    --fusion-d-conv 4 \
-    --fusion-num-layers 3 \
-    --fusion-output-dim 256 \
-    --fusion-dropout 0.18 \
-    --id-projection-dim 768 \
-    --cloth-projection-dim 768 \
-    --optimizer \"AdamW\" \
-    --scheduler \"cosine\""
-
-# 添加损失权重
-BASE_CMD="$BASE_CMD \
-    --loss-info-nce 1.0 \
-    --loss-cls 0.5 \
-    --loss-cloth-semantic 2.0 \
-    --loss-gate-adaptive 0.05 \
-    --loss-id-triplet 1.0 \
-    --loss-anti-collapse 1.5 \
-    --loss-reconstruction 0.1"
-
-# 如果有resume路径，添加--resume参数
-if [ -n "$RESUME_PATH" ]; then
-    BASE_CMD="$BASE_CMD --resume \"$RESUME_PATH\""
-    echo "📂 从检查点恢复训练：$RESUME_PATH"
-    echo ""
-fi
-
-echo "🚀 开始训练 ICFG-PEDES 数据集..."
-echo ""
-
-# 执行训练
-eval $BASE_CMD
-
-exit_code=$?
-
-if [ $exit_code -eq 0 ]; then
-    echo ""
-    echo "✅ ICFG-PEDES 训练完成！"
-else
-    echo ""
     echo "❌ ICFG-PEDES 训练失败，退出码：$exit_code"
 fi
 

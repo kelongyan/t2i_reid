@@ -46,17 +46,19 @@ class Trainer:
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === FSHD权重配置（激进版）===
+        # === FSHD权重配置（优化版 - 平衡权重）===
         default_loss_weights = {
-            'info_nce': 1.0, 
-            'cls': 0.05,
-            'cloth_semantic': 1.0, 
-            'orthogonal': 0.1,            # 大幅降低
-            'gate_adaptive': 0.02,
-            'reconstruction': 0.5,
-            'semantic_alignment': 0.1,     # 大幅降低
-            'freq_consistency': 0.5,      # 【新增】频域一致性
-            'freq_separation': 0.2,       # 【新增】频域分离
+            'info_nce': 1.2,               # 对比学习
+            'cls': 0.05,                   # 分类损失（提升）
+            'cloth_semantic': 1.0,         # 衣服语义
+            'orthogonal': 0.12,            # 正交约束（提升）
+            'gate_adaptive': 0.05,         # 门控自适应（大幅提升）
+            'reconstruction': 1.5,         # 对称重构（大幅提升）
+            'id_triplet': 0.8,             # ID一致性（提升）
+            'anti_collapse': 2.0,          # 防坍缩（大幅提升）
+            'semantic_alignment': 0.0,     # 【阶段1：完全禁用】
+            'freq_consistency': 0.0,       # 【阶段1：完全禁用】
+            'freq_separation': 0.0,        # 【阶段1：完全禁用】
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -343,81 +345,123 @@ class Trainer:
         for epoch in range(1, self.args.epochs + 1):
             # 【方案B：渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
             stage_changed = False
+            
+            # Epoch 1: Initial Warmup Trigger
+            if epoch == 1:
+                stage_changed = True
+                if self.monitor: self.monitor.logger.info("🚀 Training Start: Stage 1 Warmup")
+
             if self.runner:
-                if epoch == 11:  # Stage 2: Vim后8层 + CLIP后1层
+                # === 修复：推迟渐进式解冻，增加NaN检测 ===
+                
+                if epoch == 20:  # Stage 2: 推迟到Epoch 20（原Epoch 11）
                     print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 2")
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 2 (Delayed)")
                     if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 11-30: Unfreezing Vim last 8 layers (layer 16-23)")
+                    if self.monitor: self.monitor.logger.info("Epoch 20-40: Unfreezing Vim last 8 layers (layer 16-23)")
                     if self.monitor: self.monitor.logger.info("             + CLIP last 1 layer (layer 11)")
-                    if self.monitor: self.monitor.logger.info("Goal: Initial adaptation of CLIP semantic space")
+                    if self.monitor: self.monitor.logger.info("Goal: Stabilized adaptation with NaN protection")
                     print("="*70 + "\n")
-                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=11)
-                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
                     
-                    # 【新增】重新初始化CLIP bias防止梯度消失
-                    self.reinit_clip_bias_layers(self.model, self.monitor)
+                    # 【新增】NaN检测：检查模型参数是否健康
+                    nan_detected = False
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and torch.isnan(param).any():
+                            if self.monitor:
+                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
+                            nan_detected = True
+                            break
                     
-                    # 【新增】使用分层学习率优化器
-                    optimizer = self.build_optimizer_with_lr_groups(self.model, stage=2)
-                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                        optimizer, 
-                        num_training_steps=(self.args.epochs - 10) * total_batches,
-                        num_warmup_steps=warmup_steps
-                    )
-                    
-                    # 【新增】启用BatchNorm预热
-                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                    
-                    stage_changed = True
-                    global_step = 0  # 重置全局步数
-                elif epoch == 31:  # Stage 3: Vim后12层 + CLIP后6层
+                    if nan_detected:
+                        if self.monitor:
+                            self.monitor.logger.warning("⚠️  Skipping progressive unfreezing due to NaN detection. Model will continue with current freeze state.")
+                    else:
+                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=11)
+                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
+                        
+                        # 重新初始化CLIP bias防止梯度消失
+                        self.reinit_clip_bias_layers(self.model, self.monitor)
+                        
+                        # 使用分层学习率优化器（降低学习率）
+                        optimizer = self.build_optimizer_with_lr_groups(self.model, stage=2)
+                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                            optimizer, 
+                            num_training_steps=(self.args.epochs - 19) * total_batches,
+                            num_warmup_steps=warmup_steps
+                        )
+                        
+                        # 启用BatchNorm预热
+                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                        
+                        stage_changed = True
+                        global_step = 0
+                        
+                elif epoch == 41:  # Stage 3: 推迟到Epoch 41（原Epoch 31）
                     print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 3")
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 3 (Delayed)")
                     if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 31-60: Unfreezing Vim last 12 layers")
+                    if self.monitor: self.monitor.logger.info("Epoch 41-65: Unfreezing Vim last 12 layers")
                     if self.monitor: self.monitor.logger.info("             + CLIP last 6 layers (layer 6-11)")
-                    if self.monitor: self.monitor.logger.info("Goal: Deep interaction tuning")
+                    if self.monitor: self.monitor.logger.info("Goal: Deep interaction tuning with stability")
                     print("="*70 + "\n")
-                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=6)
-                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=6)
                     
-                    # 【新增】使用分层学习率优化器
-                    optimizer = self.build_optimizer_with_lr_groups(self.model, stage=3)
-                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                        optimizer,
-                        num_training_steps=(self.args.epochs - 30) * total_batches,
-                        num_warmup_steps=warmup_steps
-                    )
+                    # NaN检测
+                    nan_detected = False
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and torch.isnan(param).any():
+                            if self.monitor:
+                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
+                            nan_detected = True
+                            break
                     
-                    # 【新增】启用BatchNorm预热
-                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                    
-                    stage_changed = True
-                    global_step = 0  # 重置全局步数
-                elif epoch == 61:  # Stage 4: 全部解冻
+                    if not nan_detected:
+                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=6)
+                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=6)
+                        
+                        optimizer = self.build_optimizer_with_lr_groups(self.model, stage=3)
+                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                            optimizer,
+                            num_training_steps=(self.args.epochs - 40) * total_batches,
+                            num_warmup_steps=warmup_steps
+                        )
+                        
+                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                        
+                        stage_changed = True
+                        global_step = 0
+                        
+                elif epoch == 66:  # Stage 4: 推迟到Epoch 66（原Epoch 61）
                     print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 4")
+                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 4 (Delayed)")
                     if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 61-80: Unfreezing all CLIP and Vim layers")
+                    if self.monitor: self.monitor.logger.info("Epoch 66-80: Unfreezing all CLIP and Vim layers")
                     if self.monitor: self.monitor.logger.info("Goal: End-to-end fine-tuning")
                     print("="*70 + "\n")
-                    self.runner.freeze_text_layers(self.model, unfreeze_from_layer=0)
-                    self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
                     
-                    # 【新增】使用默认优化器（所有层相同学习率）
-                    optimizer = self._build_default_optimizer(self.model)
-                    lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                        optimizer,
-                        num_training_steps=(self.args.epochs - 60) * total_batches,
-                        num_warmup_steps=warmup_steps
-                    )
+                    # NaN检测
+                    nan_detected = False
+                    for name, param in self.model.named_parameters():
+                        if param.requires_grad and torch.isnan(param).any():
+                            if self.monitor:
+                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
+                            nan_detected = True
+                            break
                     
-                    # 【新增】启用BatchNorm预热
-                    self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                    
-                    stage_changed = True
-                    global_step = 0  # 重置全局步数
+                    if not nan_detected:
+                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=0)
+                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
+                        
+                        optimizer = self._build_default_optimizer(self.model)
+                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
+                            optimizer,
+                            num_training_steps=(self.args.epochs - 65) * total_batches,
+                            num_warmup_steps=warmup_steps
+                        )
+                        
+                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
+                        
+                        stage_changed = True
+                        global_step = 0
             
             if stage_changed and self.monitor:
                 self.monitor.logger.info(f"Stage changed at epoch {epoch}")
@@ -463,6 +507,13 @@ class Trainer:
                 optimizer.zero_grad()
                 loss_dict = self.run(inputs, epoch, i, total_batches)
                 loss = loss_dict['total']
+                
+                # 【新增】NaN损失检测 - 提前终止batch
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                    if self.monitor:
+                        self.monitor.logger.error(f"❌ NaN/Inf total loss detected at epoch {epoch} batch {i}! Skipping this batch.")
+                        self.monitor.debug_logger.error(f"Loss dict: {loss_dict}")
+                    continue  # 跳过这个batch
 
                 if self.scaler:
                     self.scaler.scale(loss).backward()
@@ -473,6 +524,20 @@ class Trainer:
                     if has_grads:
                         # 【修改】使用分层梯度裁剪
                         self.scaler.unscale_(optimizer)
+                        
+                        # 【新增】NaN梯度检测
+                        nan_grad_params = []
+                        for name, param in self.model.named_parameters():
+                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                                nan_grad_params.append(name)
+                                # 将NaN梯度置零，防止传播
+                                param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
+                        
+                        if nan_grad_params and self.monitor:
+                            if i % 100 == 0:  # 每100个batch报告一次
+                                self.monitor.logger.warning(f"⚠️  NaN gradients detected and reset to 0 in {len(nan_grad_params)} params at epoch {epoch} batch {i}")
+                                self.monitor.debug_logger.warning(f"NaN grad params: {nan_grad_params[:10]}")  # 只显示前10个
+                        
                         self.clip_grad_norm_by_layer(self.model, max_norm=5.0)
 
                         # 记录梯度信息（每100个batch）

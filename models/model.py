@@ -432,8 +432,12 @@ class Model(nn.Module):
         
         # 获取图像特征
         if self.vision_backbone_type == 'vim':
-            # Vim 返回 [batch_size, seq_len, 384]
-            image_embeds_raw = self.visual_encoder(image)
+            # Vim Numerical Stability Fix: Force float32
+            with torch.cuda.amp.autocast(enabled=False):
+                image_embeds_raw = self.visual_encoder(image.float())
+                # Vim returns [batch_size, seq_len, 384]
+            # Cast back to match mixed precision context if needed, or keep float32
+            image_embeds_raw = image_embeds_raw.to(image.dtype)
         else:
             # ViT 返回 BaseModelOutput，取 last_hidden_state [batch_size, seq_len, 768]
             image_outputs = self.visual_encoder(image)
@@ -559,7 +563,9 @@ class Model(nn.Module):
             
             # === 获取图像原始特征 ===
             if self.vision_backbone_type == 'vim':
-                image_embeds_raw = self.visual_encoder(image) # [B, 197, 384]
+                # Vim Numerical Stability Fix: Force float32
+                with torch.cuda.amp.autocast(enabled=False):
+                    image_embeds_raw = self.visual_encoder(image.float())
             else:
                 image_outputs = self.visual_encoder(image)
                 image_embeds_raw = image_outputs.last_hidden_state  # [B, 197, 768]

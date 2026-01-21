@@ -114,7 +114,12 @@ class SemanticGuidedDecoupling(nn.Module):
     
     def compute_semantic_alignment_loss(self, id_feat, attr_feat):
         """
-        计算语义对齐损失
+        计算语义对齐损失（简化版本）
+        
+        修复：
+        1. 使用L2距离替代负对数，避免梯度爆炸
+        2. 添加NaN检测
+        3. 降低损失敏感度
         
         目标：
         - ID特征应该与ID Prompts更相似
@@ -135,6 +140,10 @@ class SemanticGuidedDecoupling(nn.Module):
         id_feat_norm = F.normalize(id_feat, dim=-1, eps=1e-8)      # [B, dim]
         attr_feat_norm = F.normalize(attr_feat, dim=-1, eps=1e-8)  # [B, dim]
         
+        # NaN检测
+        if torch.isnan(id_feat_norm).any() or torch.isnan(attr_feat_norm).any():
+            return torch.tensor(0.0, device=id_feat.device, requires_grad=True)
+        
         # === ID特征与ID Prompts的对齐 ===
         # 计算余弦相似度矩阵 [B, num_id_prompts]
         id_sim = torch.matmul(id_feat_norm, self.id_prompt_embeds.t())
@@ -145,10 +154,14 @@ class SemanticGuidedDecoupling(nn.Module):
         attr_sim = torch.matmul(attr_feat_norm, self.attr_prompt_embeds.t())
         attr_max_sim, _ = torch.max(attr_sim, dim=1)  # [B]
         
-        # === 损失：最大化与对应Prompts的相似度 ===
-        # 使用负对数，相似度越高损失越小
-        loss_id = -torch.log(torch.clamp(id_max_sim, min=0.01, max=0.99)).mean()
-        loss_attr = -torch.log(torch.clamp(attr_max_sim, min=0.01, max=0.99)).mean()
+        # === 损失：使用L2距离替代负对数 ===
+        # 相似度越高（接近1）损失越小
+        loss_id = (1.0 - id_max_sim).mean()
+        loss_attr = (1.0 - attr_max_sim).mean()
+        
+        # NaN检测
+        if torch.isnan(loss_id).any() or torch.isnan(loss_attr).any():
+            return torch.tensor(0.0, device=id_feat.device, requires_grad=True)
         
         # 总损失
         total_loss = loss_id + loss_attr

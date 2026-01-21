@@ -30,7 +30,7 @@ def configuration():
     parser.add_argument('-j', '--workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--height', type=int, default=224, help='Image height')
     parser.add_argument('--width', type=int, default=224, help='Image width')
-    parser.add_argument('--lr', type=float, default=0.0001, help='Learning rate')
+    parser.add_argument('--lr', type=float, default=0.00003, help='Learning rate (reduced for stability)')
     parser.add_argument('--weight-decay', type=float, default=0.001, help='Weight decay')
     parser.add_argument('--warmup-step', type=int, default=500, help='Warmup steps')
     parser.add_argument('--milestones', nargs='+', type=int, default=[40, 60], help='Milestones for LR scheduler')
@@ -93,20 +93,20 @@ def configuration():
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
-    # Loss weights
-    parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.5, help='Classification loss weight')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=2.0, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-gate-adaptive', type=float, default=0.05, help='Gate adaptive loss weight')
+    # Loss weights (优化版默认值)
+    parser.add_argument('--loss-info-nce', type=float, default=1.2, help='InfoNCE loss weight (optimized)')
+    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight (increased)')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=1.0, help='Cloth semantic loss weight')
+    parser.add_argument('--loss-gate-adaptive', type=float, default=0.05, help='Gate adaptive loss weight (increased)')
     
-    # [New] Relax & Constrain Losses
-    parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
-    parser.add_argument('--loss-anti-collapse', type=float, default=1.0, help='Anti-collapse loss weight')
-    parser.add_argument('--loss-reconstruction', type=float, default=0.1, help='Reconstruction loss weight')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.1, help='Orthogonal loss weight')
-    parser.add_argument('--loss-semantic-alignment', type=float, default=0.1, help='Semantic alignment loss weight')
-    parser.add_argument('--loss-freq-consistency', type=float, default=0.5, help='Frequency consistency loss weight')
-    parser.add_argument('--loss-freq-separation', type=float, default=0.2, help='Frequency separation loss weight')
+    # [New] Relax & Constrain Losses (优化版权重)
+    parser.add_argument('--loss-id-triplet', type=float, default=0.8, help='ID Triplet loss weight (increased)')
+    parser.add_argument('--loss-anti-collapse', type=float, default=2.0, help='Anti-collapse loss weight (greatly increased)')
+    parser.add_argument('--loss-reconstruction', type=float, default=1.5, help='Reconstruction loss weight (greatly increased)')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.12, help='Orthogonal loss weight (increased)')
+    parser.add_argument('--loss-semantic-alignment', type=float, default=0.0, help='Semantic alignment loss weight (disabled in stage 1)')
+    parser.add_argument('--loss-freq-consistency', type=float, default=0.0, help='Frequency consistency loss weight (disabled in stage 1)')
+    parser.add_argument('--loss-freq-separation', type=float, default=0.0, help='Frequency separation loss weight (disabled in stage 1)')
 
     # [New] Visualization parameters
     parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
@@ -607,6 +607,11 @@ class Runner:
         console_logger.info("=" * 60)
         console_logger.info("🚀 Training Start: CLIP + Vim Architecture")
         console_logger.info("   Stage 1: Freeze CLIP / Unfreeze Vim Last 4")
+        console_logger.info("   ⚠️  Emergency Fix Mode:")
+        console_logger.info("      - Frequency losses DISABLED (Stage 1)")
+        console_logger.info("      - Semantic alignment DISABLED (Stage 1)")
+        console_logger.info("      - Progressive unfreezing DELAYED (Epoch 20+)")
+        console_logger.info("      - Learning rate REDUCED (3e-5)")
         console_logger.info("=" * 60)
         
         # Initial Freeze State

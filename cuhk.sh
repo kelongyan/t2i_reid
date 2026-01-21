@@ -5,8 +5,8 @@
 # ============================================================================
 # 支持FSHD模块配置
 # 核心特性：
-#   ✅ 支持FSHD/G-S3/Simple三种解耦模式
-#   ✅ 频域分解配置（DCT/Wavelet）
+#   ✅ 支持FSHD/Simple两种解耦模式
+#   ✅ 频域分解固化为DCT
 #   ✅ 异构双流配置（Multi-scale CNN开关）
 #   ✅ 可视化配置
 #   ✅ 渐进解冻策略
@@ -14,49 +14,43 @@
 # 预期性能：
 #   - FSHD-Full: mAP 68-70%
 #   - FSHD-Lite: mAP 67-69%
-#   - Baseline G-S3: mAP 66-68%
 # ============================================================================
 
 # 默认参数配置（FSHD-Full完整版）
-DISENTANGLE_TYPE="fshd"  # fshd | gs3 | simple
-FREQ_TYPE="dct"          # dct | wavelet
+DISENTANGLE_TYPE="fshd"  # fshd | simple
 USE_MULTI_SCALE_CNN=true # true | false
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
 
-echo "🔥 默认配置: FSHD-Full (disentangle=fshd, freq=dct, multi_scale_cnn=true, visualization=true)"
-echo "   可通过参数覆盖，例如: bash cuhk.sh --disentangle-type=gs3 --no-viz"
+echo "🔥 默认配置: FSHD-Full (disentangle=fshd, multi_scale_cnn=true, visualization=true)"
+echo "   可通过参数覆盖，例如: bash cuhk.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
-        --disentangle-type=*)
+        --disentangle-type=*) 
             DISENTANGLE_TYPE="${arg#*=}"
             shift
-            ;;
-        --freq-type=*)
-            FREQ_TYPE="${arg#*=}"
-            shift
-            ;;
+            ;; 
         --use-cnn)
             USE_MULTI_SCALE_CNN=true
             shift
-            ;;
+            ;; 
         --no-cnn)
             USE_MULTI_SCALE_CNN=false
             shift
-            ;;
+            ;; 
         --no-viz)
             ENABLE_VISUALIZATION=false
             shift
-            ;;
-        --resume=*)
+            ;; 
+        --resume=*) 
             RESUME_PATH="${arg#*=}"
             shift
-            ;;
+            ;; 
         *)
             shift
-            ;;
+            ;; 
     esac
 done
 
@@ -64,12 +58,15 @@ done
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
+# JSON Config String (Single quoted for safety)
+DATASET_CONFIG="[{'name': 'CUHK-PEDES', 'root': 'CUHK-PEDES/imgs', 'json_file': 'CUHK-PEDES/annotations/caption_all.json', 'cloth_json': 'CUHK-PEDES/annotations/caption_cloth.json', 'id_json': 'CUHK-PEDES/annotations/caption_id.json'}]"
+
 # 构建基础命令
-BASE_CMD="python scripts/train.py \
+CMD="python scripts/train.py \
     --root datasets \
-    --dataset-configs '[{\"name\": \"CUHK-PEDES\", \"root\": \"CUHK-PEDES/imgs\", \"json_file\": \"CUHK-PEDES/annotations/caption_all.json\", \"cloth_json\": \"CUHK-PEDES/annotations/caption_cloth.json\", \"id_json\": \"CUHK-PEDES/annotations/caption_id.json\"}]' \
+    --dataset-configs \"${DATASET_CONFIG}\" \
     --batch-size 96 \
-    --lr 0.00015 \
+    --lr 0.00003 \
     --weight-decay 0.0002 \
     --epochs 80 \
     --milestones 40 60 \
@@ -85,31 +82,28 @@ BASE_CMD="python scripts/train.py \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
 # 添加解耦模块配置
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --disentangle-type $DISENTANGLE_TYPE"
 
 # FSHD特定配置
 if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    BASE_CMD="$BASE_CMD \
-    --gs3-freq-type $FREQ_TYPE \
+    CMD="$CMD \
     --gs3-use-multi-scale-cnn $USE_MULTI_SCALE_CNN \
     --gs3-img-size 14 14"
-    echo "🔥 使用FSHD模块: freq_type=$FREQ_TYPE, multi_scale_cnn=$USE_MULTI_SCALE_CNN"
-elif [ "$DISENTANGLE_TYPE" = "gs3" ]; then
-    echo "📊 使用Baseline G-S3模块"
+    echo "🔥 使用FSHD模块: multi_scale_cnn=$USE_MULTI_SCALE_CNN (Frequency: DCT fixed)"
 else
     echo "🔧 使用简化解耦模块"
 fi
 
 # G-S3/FSHD通用配置
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --gs3-num-heads 8 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15"
 
 # Fusion配置
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --fusion-type \"enhanced_mamba\" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
@@ -119,55 +113,60 @@ BASE_CMD="$BASE_CMD \
     --fusion-dropout 0.15"
 
 # 投影维度
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --id-projection-dim 768 \
     --cloth-projection-dim 768"
 
 # 优化器
-BASE_CMD="$BASE_CMD \
+CMD="$CMD \
     --optimizer \"AdamW\" \
     --scheduler \"cosine\""
 
-# 损失权重（FSHD优化版）
-BASE_CMD="$BASE_CMD \
-    --loss-info-nce 1.0 \
+# 损失权重（优化版 - 平衡权重，提升辅助损失）
+CMD="$CMD \
+    --loss-info-nce 1.2 \
     --loss-cls 0.05 \
     --loss-cloth-semantic 1.0 \
-    --loss-orthogonal 0.1 \
-    --loss-gate-adaptive 0.02 \
-    --loss-id-triplet 0.5 \
-    --loss-anti-collapse 1.0 \
-    --loss-reconstruction 0.5"
+    --loss-orthogonal 0.12 \
+    --loss-gate-adaptive 0.05 \
+    --loss-id-triplet 0.8 \
+    --loss-anti-collapse 2.0 \
+    --loss-reconstruction 1.5 \
+    --loss-semantic-alignment 0.0 \
+    --loss-freq-consistency 0.0 \
+    --loss-freq-separation 0.0"
 
-# FSHD频域损失
-if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    BASE_CMD="$BASE_CMD \
-    --loss-freq-consistency 0.5 \
-    --loss-freq-separation 0.2"
-fi
+echo "🚀 优化模式："
+echo "   - 学习率: 3e-5"
+echo "   - anti_collapse: 修复自适应margin，权重2.0"
+echo "   - gate_adaptive: 添加类间分离，权重0.05"
+echo "   - reconstruction: 增强版（多样性+能量守恒），权重1.5"
+echo "   - cls/orthogonal/id_triplet: 权重提升"
+echo "   - 频域/语义损失: 阶段1禁用，Epoch 21+激活"
 
 # 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then
-    BASE_CMD="$BASE_CMD \
+    CMD="$CMD \
     --visualization-enabled \
-    --visualization-save-dir \"visualizations/${DISENTANGLE_TYPE}_${FREQ_TYPE}\" \
+    --visualization-save-dir \"visualizations/cuhk_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
-    echo "📊 可视化已启用，保存到: visualizations/${DISENTANGLE_TYPE}_${FREQ_TYPE}"
+    echo "📊 可视化已启用，保存到: visualizations/cuhk_${DISENTANGLE_TYPE}"
 fi
 
 # Resume
 if [ -n "$RESUME_PATH" ]; then
-    BASE_CMD="$BASE_CMD --resume \"$RESUME_PATH\""
+    CMD="$CMD --resume \"$RESUME_PATH\""
     echo "📂 从检查点恢复训练：$RESUME_PATH"
 fi
 
 echo ""
 echo "🚀 开始训练 CUHK-PEDES 数据集 (${DISENTANGLE_TYPE}模式)"
+echo "Executing command..."
 echo ""
 
 # 执行训练
-eval $BASE_CMD
+eval $CMD
 
 exit_code=$?
 
