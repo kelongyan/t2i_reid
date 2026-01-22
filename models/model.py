@@ -7,13 +7,7 @@ import torch.nn.functional as F
 from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
 from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
-from .fusion import get_fusion_module
-# === 新增: Fusion V2 ===
-try:
-    from .fusion_v2 import FusionV2
-except ImportError:
-    FusionV2 = None
-    
+from .fusion import get_fusion_module, SamgRcsmFusion
 from .fshd_module import FSHDModule  # 新的FSHD模块（频域-空域联合解耦）
 from .semantic_guidance import SemanticGuidedDecoupling  # 新增CLIP语义引导
 # from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
@@ -417,22 +411,7 @@ class Model(nn.Module):
             ])
 
         # 初始化融合模块
-        if fusion_config and fusion_config.get('type') == 'samg_rcsm':
-            if FusionV2 is not None:
-                self.fusion = FusionV2(
-                    dim=self.text_width, 
-                    output_dim=256,
-                    d_state=fusion_config.get('d_state', 16),
-                    d_conv=fusion_config.get('d_conv', 4),
-                    dropout=fusion_config.get('dropout', 0.1)
-                )
-                if self.logger:
-                    self.debug_logger.info("🔥 Initialized Fusion V2 (SAMG + RCSM)")
-            else:
-                raise ImportError("FusionV2 (Mamba) selected but not available.")
-        else:
-            self.fusion = get_fusion_module(fusion_config) if fusion_config else None
-        
+        self.fusion = get_fusion_module(fusion_config) if fusion_config else None
         self.feat_dim = fusion_config.get("output_dim", 256) if fusion_config else 256
 
         # 初始化可学习的缩放参数
@@ -781,7 +760,7 @@ class Model(nn.Module):
         
         # === 融合模块调用 (支持 Fusion V2) ===
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
-            if isinstance(self.fusion, FusionV2):
+            if isinstance(self.fusion, SamgRcsmFusion):
                 # Fusion V2 需要: img_id, img_attr, txt_id, txt_attr, energy_ratio
                 # 图像特征: id_embeds, cloth_embeds (来自 disentangle)
                 # 文本特征: feat_id_raw, feat_attr_raw (来自 Pyramid)
