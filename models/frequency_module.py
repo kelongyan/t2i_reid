@@ -277,6 +277,11 @@ class DCTFrequencySplitter(nn.Module):
         # 3. 真正的DCT变换（返回实数，无虚部）
         freq_coeff = self.dct2d(patches_2d)  # [B, D, H, W] 实数tensor
         
+        # === 新增：计算频域能量分布 (OFC-Gate 输入) ===
+        # 使用Log-Scale能量聚合，平衡低频和高频的贡献
+        # V_energy = AvgPool(log(1 + |C_dct|))
+        v_energy = torch.mean(torch.log1p(torch.abs(freq_coeff)), dim=(2, 3)) # [B, D]
+        
         # 4. 生成固定的频域掩码
         low_mask = self.low_freq_mask()   # [1, H, W]
         high_mask = self.high_freq_mask()  # [1, H, W]
@@ -331,7 +336,8 @@ class DCTFrequencySplitter(nn.Module):
             'alpha_low': self.alpha_low.item(),
             'alpha_high': self.alpha_high.item(),
             'freq_magnitude': torch.abs(freq_coeff).mean(dim=(1, 2, 3)).detach(),  # [B] DCT系数幅度
-            'freq_coeff': freq_coeff.detach()  # 保存DCT系数用于可视化
+            'freq_coeff': freq_coeff.detach(),  # 保存DCT系数用于可视化
+            'v_energy': v_energy  # [B, D] 频域通道能量 (OFC-Gate使用, 梯度需要保留)
         }
         
         return low_freq_seq, high_freq_seq, freq_info

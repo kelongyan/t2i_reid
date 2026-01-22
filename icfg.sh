@@ -125,6 +125,9 @@ CMD="$CMD \
     --loss-freq-separation 0.0"
 
 echo "🔥 架构升级: SAMG + R-CSM (Pyramid Text Encoder)"
+echo "   - gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
+echo "   - gate_clamp: [0.05, 0.95] (放宽范围)"
+echo "   - prompts: 7+23个细粒度描述"
 
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \

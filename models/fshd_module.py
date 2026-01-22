@@ -11,6 +11,101 @@ from .frequency_module import get_frequency_splitter
 from .hybrid_stream import HybridDualStream, FrequencyGuidedAttention
 
 
+class OFC_Gate(nn.Module):
+    """
+    OFC-Gate: Orthogonal Frequency-Channel Gating
+    图像端门控机制改进方案
+    
+    1. 物理通道筛选 (Push): 利用DCT频域能量鉴别通道物理特性
+    2. 正交解耦抑制 (Pull): 强制ID与属性特征正交，抑制纠缠
+    """
+    def __init__(self, dim, dropout=0.1):
+        super().__init__()
+        
+        # === A. 频域物理通道注意力 (Physics Branch) ===
+        # Input: v_energy [B, D] -> m_freq [B, D]
+        # 瓶颈结构 MLP (r=16)
+        self.phy_mlp = nn.Sequential(
+            nn.Linear(dim, dim // 16),
+            nn.ReLU(),
+            nn.Linear(dim // 16, dim),
+            nn.Sigmoid()
+        )
+        
+        # 针对ID和Attr的不同频率偏好投影
+        self.phy_proj_id = nn.Linear(dim, dim)
+        self.phy_proj_attr = nn.Linear(dim, dim)
+        
+        # === B. 语义自适应门控 (Semantic Branch) ===
+        # 轻量化自适应门控
+        self.sem_gate_id = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid()
+        )
+        
+        self.sem_gate_attr = nn.Sequential(
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(dim // 4, dim),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, id_feat, attr_feat, v_energy):
+        """
+        Args:
+            id_feat: [B, D] ID特征
+            attr_feat: [B, D] 属性特征
+            v_energy: [B, D] 频域通道能量 (来自DCT)
+        """
+        # === 1. 物理通道感知 (Physics-Aware) ===
+        # 生成基础频率掩码
+        m_freq = self.phy_mlp(v_energy) # [B, D]
+        
+        # 映射到各自的分支 (ID通常偏好低频，Attr偏好高频，让模型自己学)
+        a_id_phy = torch.sigmoid(self.phy_proj_id(m_freq))
+        a_attr_phy = torch.sigmoid(self.phy_proj_attr(m_freq))
+        
+        # === 2. 动态正交抑制 (Dynamic Orthogonal Suppression) ===
+        # 计算余弦相似度
+        # 关键策略：对ID特征阻断梯度，防止ID被"带偏"，只允许调整Attr以远离ID
+        id_norm = F.normalize(id_feat.detach(), dim=-1, eps=1e-8)
+        attr_norm = F.normalize(attr_feat, dim=-1, eps=1e-8)
+        
+        # Sim: [B, 1]
+        sim = (id_norm * attr_norm).sum(dim=-1, keepdim=True)
+        
+        # 正交抑制因子 W = 1 - S^2
+        # 当Sim -> 0 (正交)时，W -> 1 (保留)
+        # 当Sim -> 1 (纠缠)时，W -> 0 (抑制)
+        # 添加微小epsilon防止完全关死
+        w_ortho = 1.0 - sim.pow(2) + 1e-6 
+        
+        # === 3. 语义自适应 (Semantic Self-Gating) ===
+        a_id_sem = self.sem_gate_id(id_feat)
+        a_attr_sem = self.sem_gate_attr(attr_feat)
+        
+        # === 4. 最终融合 ===
+        # ID门控: 语义 * 物理
+        g_id = a_id_sem * a_id_phy
+        
+        # Attr门控: 语义 * 物理 * 正交抑制
+        g_attr = a_attr_sem * a_attr_phy * w_ortho
+        
+        # 约束范围 (保持数值稳定性)
+        g_id = torch.clamp(g_id, min=0.05, max=0.95)
+        g_attr = torch.clamp(g_attr, min=0.05, max=0.95)
+        
+        # 特征加权
+        id_out = id_feat * g_id
+        attr_out = attr_feat * g_attr
+        
+        return id_out, attr_out, g_id, g_attr
+
+
 class FSHDModule(nn.Module):
     """
     Frequency-Spatial Hybrid Decoupling Module
@@ -19,7 +114,7 @@ class FSHDModule(nn.Module):
     1. 频域分解：DCT → 低频/高频特征
     2. 频域引导注意力：低频→ID分支，高频→Attr分支
     3. 异构双流建模：Mamba(ID) + Multi-scale CNN(Attr)
-    4. 对称门控：独立门控机制
+    4. 对称门控：OFC-Gate (物理感知 + 正交抑制)
     """
     
     def __init__(self, dim=768, num_heads=8, d_state=16, d_conv=4, dropout=0.1,
@@ -68,22 +163,8 @@ class FSHDModule(nn.Module):
             stream_type = "Multi-scale CNN" if use_multi_scale_cnn else "Lightweight Mamba"
             logger.debug_logger.info(f"✅ FSHD: Hybrid stream with {stream_type}")
         
-        # === 阶段4：对称门控 ===
-        self.gate_id = nn.Sequential(
-            nn.Linear(dim * 2, dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim // 4, dim),
-            nn.Sigmoid()
-        )
-        
-        self.gate_attr = nn.Sequential(
-            nn.Linear(dim * 2, dim // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(dim // 4, dim),
-            nn.Sigmoid()
-        )
+        # === 阶段4：对称门控 (升级为 OFC-Gate) ===
+        self.ofc_gate = OFC_Gate(dim, dropout)
         
         # 全局池化
         self.pool_id = nn.AdaptiveAvgPool1d(1)
@@ -95,7 +176,7 @@ class FSHDModule(nn.Module):
             logger.debug_logger.info(f"  1. Frequency Decomposition: DCT")
             logger.debug_logger.info(f"  2. Attention: Frequency-Guided + Soft Orthogonal")
             logger.debug_logger.info(f"  3. Dual Stream: Mamba(ID) + {'Multi-CNN' if use_multi_scale_cnn else 'Light-Mamba'}(Attr)")
-            logger.debug_logger.info(f"  4. Gating: Symmetric Independent Gates")
+            logger.debug_logger.info(f"  4. Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)")
             logger.debug_logger.info("=" * 60)
     
     def forward(self, x, return_attention=False, return_freq_info=False):
@@ -156,25 +237,15 @@ class FSHDModule(nn.Module):
         id_feat = self.pool_id(id_seq_filtered.transpose(1, 2)).squeeze(-1)      # [B, D]
         attr_feat = self.pool_attr(attr_seq_filtered.transpose(1, 2)).squeeze(-1) # [B, D]
         
-        # === 阶段5：对称门控（🔥 修复版：放宽约束）===
-        concat_feat = torch.cat([id_feat, attr_feat], dim=-1)  # [B, D*2]
+        # === 阶段5：OFC-Gate 门控 (升级) ===
+        # 获取频域通道能量 (确保存在)
+        v_energy = freq_info.get('v_energy', torch.zeros_like(id_feat))
         
-        gate_id = self.gate_id(concat_feat)      # [B, D]
-        gate_attr = self.gate_attr(concat_feat)  # [B, D]
-        
-        # 🔥 放宽门控约束：[0.2, 0.8] → [0.1, 0.95]
-        # 使用更宽松的clamp，允许门控有更大的表达空间
-        gate_id = torch.clamp(gate_id, min=0.1, max=0.95)
-        gate_attr = torch.clamp(gate_attr, min=0.1, max=0.95)
-        
-        # 应用门控
-        id_feat_gated = gate_id * id_feat
-        attr_feat_gated = gate_attr * attr_feat
+        # 应用 OFC-Gate
+        id_feat_gated, attr_feat_gated, gate_id, gate_attr = self.ofc_gate(id_feat, attr_feat, v_energy)
         
         # === 门控统计信息 ===
-        # 计算频域能量比率 (r_E) 用于 SAMG
-        # 使用 Parseval 定理：时域能量等于频域能量
-        # r_E = Energy_High / Energy_Total
+        # 计算频域能量比率 (r_E) 用于 SAMG (保留)
         energy_high = high_freq_seq.norm(p=2, dim=-1).mean(dim=1) # [B]
         energy_total = x.norm(p=2, dim=-1).mean(dim=1) + 1e-8      # [B]
         r_E = energy_high / energy_total                           # [B]

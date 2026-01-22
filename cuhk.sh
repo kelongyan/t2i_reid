@@ -138,7 +138,8 @@ echo "   - anti_collapse: EMA追踪 (修复loss=0 BUG), 权重1.5"
 echo "   - cls权重: 0.15 (降低60%, 避免过拟合)"
 echo "   - cloth_semantic: 0.2 (降低60% + 延迟激活)"
 echo "   - orthogonal: 0.3 (提升100%, 强化解耦)"
-echo "   - gate_clamp: [0.1, 0.95] (放宽85%)"
+echo "   - gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
+echo "   - gate_clamp: [0.05, 0.95] (放宽范围)"
 echo "   - prompts: 7+23个细粒度描述"
 
 # 可视化配置
