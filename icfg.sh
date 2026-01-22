@@ -112,17 +112,13 @@ CMD="$CMD \
 
 # 损失权重（优化版）
 CMD="$CMD \
+    --optimizer "AdamW" \
+    --scheduler "cosine" \
     --loss-info-nce 1.0 \
-    --loss-cls 0.15 \
-    --loss-cloth-semantic 0.2 \
-    --loss-orthogonal 0.3 \
-    --loss-id-triplet 0.8 \
-    --loss-anti-collapse 1.5 \
-    --loss-reconstruction 0.2 \
-    --loss-gate-adaptive 0.0 \
-    --loss-semantic-alignment 0.0 \
-    --loss-freq-consistency 0.0 \
-    --loss-freq-separation 0.0"
+    --loss-cls 0.05 \
+    --loss-cloth-semantic 0.5 \
+    --loss-orthogonal 0.05 \
+    --loss-id-triplet 1.0"
 
 echo "🔥 System Configuration (v3.0):"
 echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"

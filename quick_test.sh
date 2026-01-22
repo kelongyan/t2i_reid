@@ -84,7 +84,7 @@ echo -e "  ✅ anti_collapse: 修复自适应margin (权重2.0)"
 echo -e "  ✅ Architecture: Pyramid Text + OFC-Gate + SAMG-RCSM"
 echo -e "  ✅ Gating: Physics-Aware (DCT) + Ortho-Suppression"
 echo -e "  ✅ Fusion: Residual Cross-Scan Mamba (Dim=768)"
-echo -e "  ✅ Loss: Anti-Collapse(1.5) + Ortho(0.3) + Reconstruction(0.2)"
+echo -e "  ✅ Loss: Anti-Collapse(1.0) + Ortho(0.05) + Cloth-Sem(0.5)"
 echo ""
 
 # 3. 检查预训练模型
@@ -160,16 +160,10 @@ CMD="$CMD \
 # 损失权重（优化版）
 CMD="$CMD \
     --loss-info-nce 1.0 \
-    --loss-cls 0.15 \
-    --loss-cloth-semantic 0.2 \
-    --loss-orthogonal 0.3 \
-    --loss-gate-adaptive 0.0 \
-    --loss-id-triplet 0.8 \
-    --loss-anti-collapse 1.5 \
-    --loss-reconstruction 0.2 \
-    --loss-semantic-alignment 0.0 \
-    --loss-freq-consistency 0.0 \
-    --loss-freq-separation 0.0"
+    --loss-cls 0.05 \
+    --loss-cloth-semantic 0.5 \
+    --loss-orthogonal 0.05 \
+    --loss-id-triplet 1.0"
 
 # 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then

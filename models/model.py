@@ -544,7 +544,7 @@ class Model(nn.Module):
         # bias=False 是 ReID 常见 Trick，让模型关注向量角度而非模长
         self.id_classifier = nn.Linear(self.text_width, num_classes, bias=False)
         # 初始化分类器权重
-        nn.init.normal_(self.id_classifier.weight, std=0.001)
+        nn.init.normal_(self.id_classifier.weight, std=0.02)
         
         # === 分支2：专用于检索的id特征处理（保持原有设计）===
         # 共享MLP：用于降维
@@ -652,7 +652,7 @@ class Model(nn.Module):
         image_embeds_raw = self.visual_proj(image_embeds_raw)
         
         # 后续处理保持不变 (解耦 -> 检索MLP -> 归一化)
-        id_embeds, _, _ = self.disentangle(image_embeds_raw)  # [batch_size, hidden_size]
+        id_embeds, _, _, _ = self.disentangle(image_embeds_raw)  # [batch_size, hidden_size]
         image_embeds = self.shared_mlp(id_embeds)
         image_embeds = self.image_mlp(image_embeds)
         image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)

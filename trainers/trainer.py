@@ -49,16 +49,11 @@ class Trainer:
         # === 🔥 紧急修复版权重配置（与loss.py保持一致）===
         default_loss_weights = {
             'info_nce': 1.0,               # 对比学习 - 主任务
-            'cls': 0.15,                   # 🔥 大幅降低（避免过拟合）
-            'cloth_semantic': 0.2,         # 🔥 大幅降低（减少冲突）
-            'orthogonal': 0.3,             # 🔥 提升（强化解耦）
-            'id_triplet': 0.8,             # ID一致性
-            'anti_collapse': 1.5,          # 🔥 提升（修复后激活）
-            'reconstruction': 0.2,         # 🔥 降低
-            'gate_adaptive': 0.0,          # 已删除
-            'semantic_alignment': 0.0,     # 已删除
-            'freq_consistency': 0.0,       # 已删除
-            'freq_separation': 0.0,        # 已删除
+            'cls': 0.05,                   # 🔥 大幅降低 (0.15 -> 0.05) + Logit缩放
+            'cloth_semantic': 0.5,         # 🔥 激活 (0.2 -> 0.5) 
+            'orthogonal': 0.05,            # 🔥 降级 (0.3 -> 0.05)
+            'id_triplet': 1.0,             # ID一致性 (0.8 -> 1.0)
+            'anti_collapse': 1.0,          # 基础正则
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -301,7 +296,7 @@ class Trainer:
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
         # [Modify] Removed deprecated losses (gate_adaptive, etc) from display
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'reconstruction', 'orthogonal', 'total']
+        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'orthogonal', 'total']
         
         avg_losses = []
         for key in display_order:

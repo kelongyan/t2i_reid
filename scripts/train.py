@@ -89,14 +89,12 @@ def configuration():
 
     # Loss weights (Active Losses Only)
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.15, help='Classification loss weight')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=0.2, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-id-triplet', type=float, default=0.8, help='ID Triplet loss weight')
-    parser.add_argument('--loss-anti-collapse', type=float, default=1.5, help='Anti-collapse loss weight')
-    parser.add_argument('--loss-reconstruction', type=float, default=0.2, help='Reconstruction loss weight')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight')
+    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
+    parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.05, help='Orthogonal loss weight')
     
-    # [Deprecated Losses are removed from CLI and set to 0.0 internally]
+    # [Deprecated Losses are removed from CLI]
 
     # [New] Visualization parameters
     parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
@@ -122,20 +120,13 @@ def configuration():
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
     else:
-        # 仅保留活跃的损失，废弃的损失固定为 0.0
+        # 仅保留活跃的损失，废弃的损失已移除
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
             'cls': args.loss_cls,
             'cloth_semantic': args.loss_cloth_semantic,
             'id_triplet': args.loss_id_triplet,
-            'anti_collapse': args.loss_anti_collapse,
-            'reconstruction': args.loss_reconstruction,
-            'orthogonal': args.loss_orthogonal,
-            # Deprecated / Disabled
-            'gate_adaptive': 0.0,
-            'semantic_alignment': 0.0,
-            'freq_consistency': 0.0,
-            'freq_separation': 0.0
+            'orthogonal': args.loss_orthogonal
         }
     
     # 初始化可视化配置
