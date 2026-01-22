@@ -297,7 +297,7 @@ class PyramidTextEncoder(nn.Module):
 class DisentangleModule(nn.Module):
     """
     特征分离模块的基类（保留用于向后兼容）
-    实际使用中建议直接使用 GS3Module
+    实际使用中建议直接使用 GS3Module/FSHDModule
     """
     def __init__(self, dim):
         """
@@ -326,32 +326,20 @@ class DisentangleModule(nn.Module):
             return_attention (bool): 是否返回注意力权重（用于可视化）。
 
         Returns:
-            tuple: 如果 return_attention=False，返回 (id_feat, cloth_feat, gate)
-                  如果 return_attention=True，返回 (id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map)
+            tuple: (id_feat, cloth_feat, gate_stats, original_feat)
+                   如果有 return_attention，追加 None
         """
         batch_size, seq_len, dim = x.size()
 
+        # 原始特征用于重构损失 (Global Pooling)
+        original_feat = x.mean(dim=1) # [batch_size, dim]
+
         # 简化的身份特征处理：线性变换 + 全局平均池化
         id_feat = self.id_linear(x)  # [batch_size, seq_len, dim]
-        
-        # 计算身份分支的注意力权重（基于特征幅值）
-        id_attn_map = None
-        if return_attention:
-            # 使用 L2 范数作为注意力权重的近似
-            id_attn_map = torch.norm(id_feat, p=2, dim=-1)  # [batch_size, seq_len]
-            id_attn_map = torch.softmax(id_attn_map, dim=-1)  # 归一化
-        
         id_feat = id_feat.mean(dim=1)  # [batch_size, dim]
 
         # 简化的服装特征处理：线性变换 + 全局平均池化  
         cloth_feat = self.cloth_linear(x)  # [batch_size, seq_len, dim]
-        
-        # 计算服装分支的注意力权重（基于特征幅值）
-        cloth_attn_map = None
-        if return_attention:
-            cloth_attn_map = torch.norm(cloth_feat, p=2, dim=-1)  # [batch_size, seq_len]
-            cloth_attn_map = torch.softmax(cloth_attn_map, dim=-1)  # 归一化
-        
         cloth_feat = cloth_feat.mean(dim=1)  # [batch_size, dim]
 
         # 保持门控机制以维持原有接口
@@ -359,10 +347,22 @@ class DisentangleModule(nn.Module):
         id_feat = gate * id_feat
         cloth_feat = (1 - gate) * cloth_feat
         
+        # 构造兼容的 gate_stats
+        gate_stats = {
+            'gate_id_mean': gate.mean().item(),
+            'gate_attr_mean': (1-gate).mean().item(),
+            'diversity': 0.0,
+            # 提供默认的 energy_ratio 以防 Fusion 模块需要
+            'energy_ratio': torch.ones(batch_size, device=x.device) * 0.5 
+        }
+        
+        # 统一返回接口 (4个基础返回值)
+        base_outputs = (id_feat, cloth_feat, gate_stats, original_feat)
+        
         if return_attention:
-            return id_feat, cloth_feat, gate, id_attn_map, cloth_attn_map
+            return base_outputs + (None, None)
         else:
-            return id_feat, cloth_feat, gate
+            return base_outputs
 
 
 class Model(nn.Module):
