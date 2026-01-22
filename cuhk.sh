@@ -105,7 +105,7 @@ CMD="$CMD \
 # Fusion配置 (SAMG-RCSM)
 CMD="$CMD \
     --fusion-type \"samg_rcsm\" \
-    --fusion-dim 256 \
+    --fusion-dim 768 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 3 \
@@ -133,14 +133,12 @@ CMD="$CMD \
     --loss-freq-consistency 0.0 \
     --loss-freq-separation 0.0"
 
-echo "🔥 架构升级: SAMG + R-CSM (Pyramid Text Encoder)"
-echo "   - anti_collapse: EMA追踪 (修复loss=0 BUG), 权重1.5"
-echo "   - cls权重: 0.15 (降低60%, 避免过拟合)"
-echo "   - cloth_semantic: 0.2 (降低60% + 延迟激活)"
-echo "   - orthogonal: 0.3 (提升100%, 强化解耦)"
-echo "   - gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   - gate_clamp: [0.05, 0.95] (放宽范围)"
-echo "   - prompts: 7+23个细粒度描述"
+echo "🔥 System Configuration (v3.0):"
+echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
+echo "   • Fusion Dim: 768 (Matched to Backbone)"
+echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
+echo "   • Loss Weights: Optimized (Orth=0.3, Anti-Collapse=1.5)"
+echo "   • Prompts: 7+23 Fine-grained Templates"
 
 # 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then

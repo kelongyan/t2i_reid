@@ -298,28 +298,11 @@ class Trainer:
 
         return loss_dict
 
-    def compute_similarity(self, train_loader):
-        # 计算图像和文本特征的相似度
-        self.model.eval()
-        with torch.no_grad():
-            for image, cloth_captions, id_captions, pid, cam_id, is_matched in train_loader:
-                image = image.to(self.device)
-                outputs = self.model(image=image, cloth_instruction=cloth_captions, id_instruction=id_captions)
-                # 对称解耦：12个输出
-                image_feats, id_text_feats, _, _, _, _, _, _, gate_weights, _, _, _ = outputs
-                sim = torch.matmul(image_feats, id_text_feats.t())
-                pos_sim = sim.diag().mean().item()
-                neg_sim = sim[~torch.eye(sim.shape[0], dtype=bool, device=self.device)].mean().item()
-                scale = self.model.scale
-                return pos_sim, neg_sim, None, scale
-        self.model.train()
-        return None, None, None, None
-
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'gate_adaptive', 'reconstruction', 'total']
-        hidden_losses = set()  # 所有损失都显示
-
+        # [Modify] Removed deprecated losses (gate_adaptive, etc) from display
+        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'anti_collapse', 'reconstruction', 'orthogonal', 'total']
+        
         avg_losses = []
         for key in display_order:
             if key in loss_meters and loss_meters[key].count > 0:

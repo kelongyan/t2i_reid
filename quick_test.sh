@@ -81,9 +81,10 @@ echo -e "  • 可视化: ${ENABLE_VISUALIZATION}"
 echo ""
 echo -e "${YELLOW}✨ 优化亮点:${NC}"
 echo -e "  ✅ anti_collapse: 修复自适应margin (权重2.0)"
-echo -e "  ✅ gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo -e "  ✅ reconstruction: 多样性+能量守恒 (权重1.5)"
-echo -e "  ✅ 频域/语义损失: 阶段1禁用，Epoch 21+激活"
+echo -e "  ✅ Architecture: Pyramid Text + OFC-Gate + SAMG-RCSM"
+echo -e "  ✅ Gating: Physics-Aware (DCT) + Ortho-Suppression"
+echo -e "  ✅ Fusion: Residual Cross-Scan Mamba (Dim=768)"
+echo -e "  ✅ Loss: Anti-Collapse(1.5) + Ortho(0.3) + Reconstruction(0.2)"
 echo ""
 
 # 3. 检查预训练模型
@@ -144,7 +145,7 @@ CMD="$CMD \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15 \
     --fusion-type \"samg_rcsm\" \
-    --fusion-dim 256 \
+    --fusion-dim 768 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 3 \

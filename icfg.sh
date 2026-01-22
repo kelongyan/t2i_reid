@@ -99,7 +99,7 @@ CMD="$CMD \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15 \
     --fusion-type \"samg_rcsm\" \
-    --fusion-dim 256 \
+    --fusion-dim 768 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 3 \
@@ -124,10 +124,12 @@ CMD="$CMD \
     --loss-freq-consistency 0.0 \
     --loss-freq-separation 0.0"
 
-echo "🔥 架构升级: SAMG + R-CSM (Pyramid Text Encoder)"
-echo "   - gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   - gate_clamp: [0.05, 0.95] (放宽范围)"
-echo "   - prompts: 7+23个细粒度描述"
+echo "🔥 System Configuration (v3.0):"
+echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
+echo "   • Fusion Dim: 768 (Matched to Backbone)"
+echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
+echo "   • Loss Weights: Optimized (Orth=0.3, Anti-Collapse=1.5)"
+echo "   • Prompts: 7+23 Fine-grained Templates"
 
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \

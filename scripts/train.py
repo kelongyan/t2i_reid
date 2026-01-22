@@ -40,11 +40,7 @@ def configuration():
     parser.add_argument('--fp16', action='store_true', help='Use mixed precision training')
     
     # [Modify] Pretrained Model Paths
-    # BERT path kept for compatibility if needed, but CLIP is default now
-    parser.add_argument('--bert-base-path', type=str, default=str(ROOT_DIR / 'pretrained' / 'bert-base-uncased'),
-                       help='Path to BERT model (Legacy)')
-    
-    # [New] CLIP Path
+    # CLIP Path (Standard)
     parser.add_argument('--clip-pretrained', type=str, 
                        default=str(ROOT_DIR / 'pretrained' / 'clip-vit-base-patch16'),
                        help='Path to CLIP text encoder model')
@@ -72,7 +68,6 @@ def configuration():
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
     
     # G-S3/FSHD module parameters
-    # [Modify] Fixed to 'fshd' as default, removed 'gs3' option
     parser.add_argument('--disentangle-type', type=str, default='fshd', 
                        choices=['fshd', 'simple'],
                        help='Type of disentangle module: fshd (FSHD-Net) or simple (DisentangleModule)')
@@ -87,27 +82,21 @@ def configuration():
                        help='Dropout rate for G-S3 module')
     
     # [New] FSHD specific parameters
-    # [Modify] Removed freq-type choice (fixed to dct)
     parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true',
                        help='Whether to use multi-scale CNN in FSHD (true/false)')
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
-    # Loss weights (优化版默认值)
-    # 🔥 紧急修复版损失权重默认值
+    # Loss weights (Active Losses Only)
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.15, help='Classification loss weight (降低60%)')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=0.2, help='Cloth semantic loss weight (降低60% + 延迟激活)')
-    parser.add_argument('--loss-gate-adaptive', type=float, default=0.0, help='Gate adaptive loss weight (已废弃)')
-    
-    # [New] Relax & Constrain Losses (紧急修复版权重)
+    parser.add_argument('--loss-cls', type=float, default=0.15, help='Classification loss weight')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.2, help='Cloth semantic loss weight')
     parser.add_argument('--loss-id-triplet', type=float, default=0.8, help='ID Triplet loss weight')
-    parser.add_argument('--loss-anti-collapse', type=float, default=1.5, help='Anti-collapse loss weight (EMA修复)')
-    parser.add_argument('--loss-reconstruction', type=float, default=0.2, help='Reconstruction loss weight (降低)')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight (提升100%)')
-    parser.add_argument('--loss-semantic-alignment', type=float, default=0.0, help='Semantic alignment loss weight (已废弃)')
-    parser.add_argument('--loss-freq-consistency', type=float, default=0.0, help='Frequency consistency loss weight (已废弃)')
-    parser.add_argument('--loss-freq-separation', type=float, default=0.0, help='Frequency separation loss weight (已废弃)')
+    parser.add_argument('--loss-anti-collapse', type=float, default=1.5, help='Anti-collapse loss weight')
+    parser.add_argument('--loss-reconstruction', type=float, default=0.2, help='Reconstruction loss weight')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight')
+    
+    # [Deprecated Losses are removed from CLI and set to 0.0 internally]
 
     # [New] Visualization parameters
     parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
@@ -133,18 +122,20 @@ def configuration():
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
     else:
+        # 仅保留活跃的损失，废弃的损失固定为 0.0
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
             'cls': args.loss_cls,
             'cloth_semantic': args.loss_cloth_semantic,
-            'gate_adaptive': args.loss_gate_adaptive,
             'id_triplet': args.loss_id_triplet,
             'anti_collapse': args.loss_anti_collapse,
             'reconstruction': args.loss_reconstruction,
             'orthogonal': args.loss_orthogonal,
-            'semantic_alignment': args.loss_semantic_alignment,
-            'freq_consistency': args.loss_freq_consistency,
-            'freq_separation': args.loss_freq_separation
+            # Deprecated / Disabled
+            'gate_adaptive': 0.0,
+            'semantic_alignment': 0.0,
+            'freq_consistency': 0.0,
+            'freq_separation': 0.0
         }
     
     # 初始化可视化配置
@@ -172,7 +163,6 @@ def configuration():
             }
         ]
 
-    args.bert_base_path = str(Path(args.bert_base_path))
     args.clip_pretrained = str(Path(args.clip_pretrained))
     args.vit_pretrained = str(Path(args.vit_pretrained))
     args.logs_dir = str(Path(args.logs_dir))

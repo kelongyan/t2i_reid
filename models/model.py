@@ -10,7 +10,6 @@ from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module, SamgRcsmFusion
 from .fshd_module import FSHDModule  # 新的FSHD模块（频域-空域联合解耦）
 from .semantic_guidance import SemanticGuidedDecoupling  # 新增CLIP语义引导
-# from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
 from .vim import VisionMamba
 
 # 尝试导入 Mamba
@@ -85,27 +84,6 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, 
             
     return posemb
 
-
-class LayerNorm1d(nn.Module):
-    """
-    1D LayerNorm 适配器，支持 (B, C, L) 或 (B, L, C) 输入
-    默认为 channels_last=True，即输入 (B, L, C)
-    """
-    def __init__(self, normalized_shape, eps=1e-6, channels_last=True):
-        super().__init__()
-        self.channels_last = channels_last
-        self.ln = nn.LayerNorm(normalized_shape, eps=eps)
-
-    def forward(self, x):
-        # x: [B, D, L] if channels_last=False
-        # x: [B, L, D] if channels_last=True
-        if not self.channels_last:
-            x = x.transpose(1, 2) # [B, L, D]
-            x = self.ln(x)
-            x = x.transpose(1, 2) # [B, D, L]
-        else:
-            x = self.ln(x)
-        return x
 
 class ResidualBottleneck1d(nn.Module):
     """
