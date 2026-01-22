@@ -57,7 +57,7 @@ find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
 # JSON Config String (Single quoted for safety)
-DATASET_CONFIG="[{'name': 'ICFG-PEDES', 'root': 'ICFG-PEDES', 'json_file': 'ICFG-PEDES/annotations/ICFG-PEDES.json', 'cloth_json': 'ICFG-PEDES/annotations/caption_cloth.json', 'id_json': 'ICFG-PEDES/annotations/caption_id.json'}]"
+DATASET_CONFIG="[{'name': 'ICFG-PEDES', 'root': 'ICFG-PEDES', 'json_file': 'ICFG-PEDES/annotations/caption_all.json'}]"
 
 # 构建基础命令
 CMD="python scripts/train.py \
@@ -98,7 +98,7 @@ CMD="$CMD \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15 \
-    --fusion-type \"enhanced_mamba\" \
+    --fusion-type \"samg_rcsm\" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
@@ -112,19 +112,19 @@ CMD="$CMD \
 
 # 损失权重（优化版）
 CMD="$CMD \
-    --loss-info-nce 1.2 \
-    --loss-cls 0.05 \
-    --loss-cloth-semantic 1.0 \
-    --loss-orthogonal 0.12 \
-    --loss-gate-adaptive 0.05 \
+    --loss-info-nce 1.0 \
+    --loss-cls 0.15 \
+    --loss-cloth-semantic 0.2 \
+    --loss-orthogonal 0.3 \
     --loss-id-triplet 0.8 \
-    --loss-anti-collapse 2.0 \
-    --loss-reconstruction 1.5 \
+    --loss-anti-collapse 1.5 \
+    --loss-reconstruction 0.2 \
+    --loss-gate-adaptive 0.0 \
     --loss-semantic-alignment 0.0 \
     --loss-freq-consistency 0.0 \
     --loss-freq-separation 0.0"
 
-echo "🚀 优化模式: 修复anti_collapse/gate_adaptive/reconstruction，提升辅助损失权重"
+echo "🔥 架构升级: SAMG + R-CSM (Pyramid Text Encoder)"
 
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \

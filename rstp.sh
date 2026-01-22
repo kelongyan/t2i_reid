@@ -52,7 +52,7 @@ find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
 # JSON Config String (Single quoted for safety)
-DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/data_captions.json', 'cloth_json': 'RSTPReid/annotations/caption_cloth.json', 'id_json': 'RSTPReid/annotations/caption_id.json'}]"
+DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/data_captions.json'}]"
 
 # 构建基础命令
 CMD="python scripts/train.py \
@@ -61,8 +61,8 @@ CMD="python scripts/train.py \
     --batch-size 64 \
     --lr 0.00003 \
     --weight-decay 0.0001 \
-    --epochs 80 \
-    --milestones 40 60 \
+    --epochs 50 \
+    --milestones 25 40 \
     --warmup-step 800 \
     --workers 8 \
     --height 224 \
@@ -92,7 +92,7 @@ CMD="$CMD \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15 \
-    --fusion-type \"enhanced_mamba\" \
+    --fusion-type \"samg_rcsm\" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
@@ -102,23 +102,26 @@ CMD="$CMD \
     --id-projection-dim 768 \
     --cloth-projection-dim 768 \
     --optimizer \"AdamW\" \
-    --scheduler \"cosine\""
-
-# 损失权重（优化版）
-CMD="$CMD \
-    --loss-info-nce 1.2 \
-    --loss-cls 0.05 \
-    --loss-cloth-semantic 1.0 \
-    --loss-orthogonal 0.12 \
-    --loss-gate-adaptive 0.05 \
+    --scheduler \"cosine\" \
+    --loss-info-nce 1.0 \
+    --loss-cls 0.15 \
+    --loss-cloth-semantic 0.2 \
+    --loss-orthogonal 0.3 \
     --loss-id-triplet 0.8 \
-    --loss-anti-collapse 2.0 \
-    --loss-reconstruction 1.5 \
+    --loss-anti-collapse 1.5 \
+    --loss-reconstruction 0.2 \
+    --loss-gate-adaptive 0.0 \
     --loss-semantic-alignment 0.0 \
     --loss-freq-consistency 0.0 \
     --loss-freq-separation 0.0"
 
-echo "🚀 优化模式: 修复anti_collapse/gate_adaptive/reconstruction，提升辅助损失权重"
+echo "🔥 架构升级: SAMG + R-CSM (Pyramid Text Encoder)"
+echo "   - anti_collapse: EMA追踪 (修复loss=0 BUG), 权重1.5"
+echo "   - cls权重: 0.15 (降低60%, 避免过拟合)"
+echo "   - cloth_semantic: 0.2 (降低60% + 延迟激活)"
+echo "   - orthogonal: 0.3 (提升100%, 强化解耦)"
+echo "   - gate_clamp: [0.1, 0.95] (放宽85%)"
+echo "   - prompts: 7+23个细粒度描述"
 
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \

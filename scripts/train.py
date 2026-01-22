@@ -94,19 +94,20 @@ def configuration():
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
     # Loss weights (优化版默认值)
-    parser.add_argument('--loss-info-nce', type=float, default=1.2, help='InfoNCE loss weight (optimized)')
-    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight (increased)')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=1.0, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-gate-adaptive', type=float, default=0.05, help='Gate adaptive loss weight (increased)')
+    # 🔥 紧急修复版损失权重默认值
+    parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
+    parser.add_argument('--loss-cls', type=float, default=0.15, help='Classification loss weight (降低60%)')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.2, help='Cloth semantic loss weight (降低60% + 延迟激活)')
+    parser.add_argument('--loss-gate-adaptive', type=float, default=0.0, help='Gate adaptive loss weight (已废弃)')
     
-    # [New] Relax & Constrain Losses (优化版权重)
-    parser.add_argument('--loss-id-triplet', type=float, default=0.8, help='ID Triplet loss weight (increased)')
-    parser.add_argument('--loss-anti-collapse', type=float, default=2.0, help='Anti-collapse loss weight (greatly increased)')
-    parser.add_argument('--loss-reconstruction', type=float, default=1.5, help='Reconstruction loss weight (greatly increased)')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.12, help='Orthogonal loss weight (increased)')
-    parser.add_argument('--loss-semantic-alignment', type=float, default=0.0, help='Semantic alignment loss weight (disabled in stage 1)')
-    parser.add_argument('--loss-freq-consistency', type=float, default=0.0, help='Frequency consistency loss weight (disabled in stage 1)')
-    parser.add_argument('--loss-freq-separation', type=float, default=0.0, help='Frequency separation loss weight (disabled in stage 1)')
+    # [New] Relax & Constrain Losses (紧急修复版权重)
+    parser.add_argument('--loss-id-triplet', type=float, default=0.8, help='ID Triplet loss weight')
+    parser.add_argument('--loss-anti-collapse', type=float, default=1.5, help='Anti-collapse loss weight (EMA修复)')
+    parser.add_argument('--loss-reconstruction', type=float, default=0.2, help='Reconstruction loss weight (降低)')
+    parser.add_argument('--loss-orthogonal', type=float, default=0.3, help='Orthogonal loss weight (提升100%)')
+    parser.add_argument('--loss-semantic-alignment', type=float, default=0.0, help='Semantic alignment loss weight (已废弃)')
+    parser.add_argument('--loss-freq-consistency', type=float, default=0.0, help='Frequency consistency loss weight (已废弃)')
+    parser.add_argument('--loss-freq-separation', type=float, default=0.0, help='Frequency separation loss weight (已废弃)')
 
     # [New] Visualization parameters
     parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
@@ -167,9 +168,7 @@ def configuration():
             {
                 'name': 'CUHK-PEDES',
                 'root': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES'),
-                'json_file': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_all.json'),
-                'cloth_json': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_cloth.json'),
-                'id_json': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_id.json')
+                'json_file': str(ROOT_DIR / 'datasets' / 'CUHK-PEDES' / 'annotations' / 'caption_all.json')
             }
         ]
 

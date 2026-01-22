@@ -104,7 +104,7 @@ echo -e "${BLUE}[4/5] 启动训练程序...${NC}"
 echo ""
 
 # JSON Config String
-DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/data_captions.json', 'cloth_json': 'RSTPReid/annotations/caption_cloth.json', 'id_json': 'RSTPReid/annotations/caption_id.json'}]"
+DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/data_captions.json'}]"
 
 # 构建命令字符串
 CMD="python scripts/train.py \
@@ -143,7 +143,7 @@ CMD="$CMD \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15 \
-    --fusion-type \"enhanced_mamba\" \
+    --fusion-type \"samg_rcsm\" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
@@ -158,14 +158,14 @@ CMD="$CMD \
 
 # 损失权重（优化版）
 CMD="$CMD \
-    --loss-info-nce 1.2 \
-    --loss-cls 0.05 \
-    --loss-cloth-semantic 1.0 \
-    --loss-orthogonal 0.12 \
-    --loss-gate-adaptive 0.05 \
+    --loss-info-nce 1.0 \
+    --loss-cls 0.15 \
+    --loss-cloth-semantic 0.2 \
+    --loss-orthogonal 0.3 \
+    --loss-gate-adaptive 0.0 \
     --loss-id-triplet 0.8 \
-    --loss-anti-collapse 2.0 \
-    --loss-reconstruction 1.5 \
+    --loss-anti-collapse 1.5 \
+    --loss-reconstruction 0.2 \
     --loss-semantic-alignment 0.0 \
     --loss-freq-consistency 0.0 \
     --loss-freq-separation 0.0"

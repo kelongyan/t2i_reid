@@ -156,29 +156,38 @@ class FSHDModule(nn.Module):
         id_feat = self.pool_id(id_seq_filtered.transpose(1, 2)).squeeze(-1)      # [B, D]
         attr_feat = self.pool_attr(attr_seq_filtered.transpose(1, 2)).squeeze(-1) # [B, D]
         
-        # === 阶段5：对称门控 ===
+        # === 阶段5：对称门控（🔥 修复版：放宽约束）===
         concat_feat = torch.cat([id_feat, attr_feat], dim=-1)  # [B, D*2]
         
         gate_id = self.gate_id(concat_feat)      # [B, D]
         gate_attr = self.gate_attr(concat_feat)  # [B, D]
         
-        # 防止门控塌缩
-        gate_id = torch.clamp(gate_id, min=0.2, max=0.8)
-        gate_attr = torch.clamp(gate_attr, min=0.2, max=0.8)
+        # 🔥 放宽门控约束：[0.2, 0.8] → [0.1, 0.95]
+        # 使用更宽松的clamp，允许门控有更大的表达空间
+        gate_id = torch.clamp(gate_id, min=0.1, max=0.95)
+        gate_attr = torch.clamp(gate_attr, min=0.1, max=0.95)
         
         # 应用门控
         id_feat_gated = gate_id * id_feat
         attr_feat_gated = gate_attr * attr_feat
         
         # === 门控统计信息 ===
+        # 计算频域能量比率 (r_E) 用于 SAMG
+        # 使用 Parseval 定理：时域能量等于频域能量
+        # r_E = Energy_High / Energy_Total
+        energy_high = high_freq_seq.norm(p=2, dim=-1).mean(dim=1) # [B]
+        energy_total = x.norm(p=2, dim=-1).mean(dim=1) + 1e-8      # [B]
+        r_E = energy_high / energy_total                           # [B]
+
         gate_stats = {
             'gate_id_mean': gate_id.mean().item(),
             'gate_id_std': gate_id.std().item(),
             'gate_attr_mean': gate_attr.mean().item(),
             'gate_attr_std': gate_attr.std().item(),
             'diversity': torch.abs(gate_id - gate_attr).mean().item(),
-            'freq_type': 'dct',  # Fixed to DCT
-            'low_freq_energy': freq_info.get('freq_magnitude', torch.tensor(0.0)).mean().item() if 'freq_magnitude' in freq_info else 0.0
+            'freq_type': 'dct',
+            'low_freq_energy': freq_info.get('freq_magnitude', torch.tensor(0.0)).mean().item() if 'freq_magnitude' in freq_info else 0.0,
+            'energy_ratio': r_E  # [B] Tensor, not item, passed to fusion
         }
         
         # === 构建返回值 ===

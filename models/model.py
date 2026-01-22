@@ -8,10 +8,23 @@ from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
 from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module
+# === 新增: Fusion V2 ===
+try:
+    from .fusion_v2 import FusionV2
+except ImportError:
+    FusionV2 = None
+    
 from .fshd_module import FSHDModule  # 新的FSHD模块（频域-空域联合解耦）
 from .semantic_guidance import SemanticGuidedDecoupling  # 新增CLIP语义引导
 # from .residual_classifier import ResidualClassifier, DeepResidualClassifier  # Deprecated in Optimization Plan
 from .vim import VisionMamba
+# === 新增：PyramidTextEncoder 导入 ===
+try:
+    from .text_encoder_v2 import PyramidTextEncoder
+    HAS_MAMBA = True
+except ImportError:
+    PyramidTextEncoder = None
+    HAS_MAMBA = False
 
 # 设置transformers库日志级别
 import logging as _logging
@@ -384,16 +397,42 @@ class Model(nn.Module):
             self.debug_logger.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
             self.debug_logger.info("=" * 60)
 
-        # 修改为 3 层文本自注意力模块
-        self.text_attn_layers = nn.ModuleList([
-            nn.MultiheadAttention(embed_dim=self.text_width, num_heads=4, dropout=0.1) for _ in range(3)
-        ])
-        self.text_attn_norm_layers = nn.ModuleList([
-            nn.LayerNorm(self.text_width) for _ in range(3)
-        ])
+        # === 文本编码器升级：PyramidTextEncoder ===
+        # 替代原有的 3 层文本自注意力模块
+        if HAS_MAMBA:
+            self.text_encoder_v2 = PyramidTextEncoder(dim=self.text_width)
+            if self.logger:
+                self.debug_logger.info("✅ Initialized PyramidTextEncoder (CNN+Mamba) for text processing")
+        else:
+            self.text_encoder_v2 = None
+            if self.logger:
+                self.debug_logger.warning("⚠️  Mamba not found. Falling back to legacy Attention layers for text encoder.")
+            
+            # Legacy Fallback
+            self.text_attn_layers = nn.ModuleList([
+                nn.MultiheadAttention(embed_dim=self.text_width, num_heads=4, dropout=0.1) for _ in range(3)
+            ])
+            self.text_attn_norm_layers = nn.ModuleList([
+                nn.LayerNorm(self.text_width) for _ in range(3)
+            ])
 
         # 初始化融合模块
-        self.fusion = get_fusion_module(fusion_config) if fusion_config else None
+        if fusion_config and fusion_config.get('type') == 'samg_rcsm':
+            if FusionV2 is not None:
+                self.fusion = FusionV2(
+                    dim=self.text_width, 
+                    output_dim=256,
+                    d_state=fusion_config.get('d_state', 16),
+                    d_conv=fusion_config.get('d_conv', 4),
+                    dropout=fusion_config.get('dropout', 0.1)
+                )
+                if self.logger:
+                    self.debug_logger.info("🔥 Initialized Fusion V2 (SAMG + RCSM)")
+            else:
+                raise ImportError("FusionV2 (Mamba) selected but not available.")
+        else:
+            self.fusion = get_fusion_module(fusion_config) if fusion_config else None
+        
         self.feat_dim = fusion_config.get("output_dim", 256) if fusion_config else 256
 
         # 初始化可学习的缩放参数
@@ -496,29 +535,43 @@ class Model(nn.Module):
         # === 维度适配: 512 -> 768 ===
         text_embeds = self.text_proj(text_embeds) # [B, 77, 768]
 
-        # 3 层自注意力处理
-        # 注意: CLIP attention mask 是 1 (attend), 0 (ignore)
-        # nn.MultiheadAttention key_padding_mask 需要 True (ignore), False (attend)
-        # 所以使用 ~attention_mask.bool()
-        
-        text_embeds = text_embeds.transpose(0, 1)  # [seq_len, batch_size, hidden_size]
-        for attn, norm in zip(self.text_attn_layers, self.text_attn_norm_layers):
-            attn_output, _ = attn(
-                query=text_embeds,
-                key=text_embeds,
-                value=text_embeds,
-                key_padding_mask=~attention_mask.bool()
-            )
-            text_embeds = attn_output + text_embeds  # 残差连接
-            text_embeds = norm(text_embeds)
-        text_embeds = text_embeds.transpose(0, 1)  # [batch_size, seq_len, hidden_size]
+        # === 文本特征提取 (Pyramid vs Legacy) ===
+        if self.text_encoder_v2 is not None:
+            # 使用 PyramidTextEncoder
+            # output dict: {'feat_attr', 'feat_id', 'feat_id_bn'}
+            out_v2 = self.text_encoder_v2(text_embeds)
+            
+            # 对于 encode_text (通常用于检索)，我们使用 ID 特征
+            # 注意：Pyramid Encoder 返回的 feat_id 已经是 [B, D] 且经过 LayerNorm
+            text_embeds = out_v2['feat_id']
+            
+            # 为了兼容后续的 MLP 投影 (shared_mlp -> text_mlp)
+            # 原始逻辑是: text_embeds (Attn output) -> shared_mlp -> text_mlp
+            # 这里的 text_embeds 相当于 Attn output
+        else:
+            # Legacy Fallback: 3 层自注意力处理
+            # 注意: CLIP attention mask 是 1 (attend), 0 (ignore)
+            # nn.MultiheadAttention key_padding_mask 需要 True (ignore), False (attend)
+            # 所以使用 ~attention_mask.bool()
+            
+            text_embeds = text_embeds.transpose(0, 1)  # [seq_len, batch_size, hidden_size]
+            for attn, norm in zip(self.text_attn_layers, self.text_attn_norm_layers):
+                attn_output, _ = attn(
+                    query=text_embeds,
+                    key=text_embeds,
+                    value=text_embeds,
+                    key_padding_mask=~attention_mask.bool()
+                )
+                text_embeds = attn_output + text_embeds  # 残差连接
+                text_embeds = norm(text_embeds)
+            text_embeds = text_embeds.transpose(0, 1)  # [batch_size, seq_len, hidden_size]
 
-        # 均值池化，结合 attention_mask 忽略填充 token
-        attention_mask = attention_mask.unsqueeze(-1)  # [batch_size, seq_len, 1]
-        text_embeds = torch.sum(text_embeds * attention_mask, dim=1) / torch.sum(attention_mask, dim=1)
-        # 形状: [batch_size, hidden_size]
+            # 均值池化，结合 attention_mask 忽略填充 token
+            attention_mask = attention_mask.unsqueeze(-1)  # [batch_size, seq_len, 1]
+            text_embeds = torch.sum(text_embeds * attention_mask, dim=1) / torch.sum(attention_mask, dim=1)
+            # 形状: [batch_size, hidden_size]
 
-        # 降维和标准化
+        # 降维和标准化 (统一投影接口)
         text_embeds = self.shared_mlp(text_embeds)
         text_embeds = self.text_mlp(text_embeds)
         # 使用更稳定的归一化，添加eps避免除零
@@ -662,15 +715,98 @@ class Model(nn.Module):
             gate_stats = None
 
         # ============================================================
-        # 步骤5：文本编码和融合
+        # 步骤5：文本编码和融合 (Updated for Pyramid Encoder)
         # ============================================================
-        cloth_text_embeds = self.encode_text(cloth_instruction)
-        id_text_embeds = self.encode_text(id_instruction)
+        
+        # 策略：如果使用 PyramidTextEncoder，我们倾向于使用一段完整的文本 (id_instruction) 
+        # 来同时提取 cloth 和 id 特征，而不是分别编码两个片段。
+        # 但为了兼容现有接口，我们保留 cloth_instruction 的输入，但主要逻辑基于 id_instruction
+        
+        # 确定主文本输入 (Main Text Source)
+        # 如果提供了 id_instruction，我们假设它是包含丰富信息的完整描述（或ID部分）
+        main_instruction = id_instruction if id_instruction is not None else cloth_instruction
+        
+        # 初始化变量
+        feat_attr_raw, feat_id_raw = None, None
+        
+        if self.text_encoder_v2 is not None and main_instruction is not None:
+            # === 新逻辑: 单流输入，双头输出 ===
+            
+            # 1. 获取 CLIP 原始 Embeddings [B, 77, 768] (无池化)
+            if isinstance(main_instruction, (list, tuple)):
+                texts = list(main_instruction)
+            else:
+                texts = [main_instruction]
+                
+            cache_key = tuple(texts)
+            if cache_key in self.text_cache:
+                tokenized = self.text_cache[cache_key]
+            else:
+                tokenized = self.tokenizer(texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
+                self.text_cache[cache_key] = tokenized
+            
+            input_ids = tokenized['input_ids'].to(device)
+            attention_mask = tokenized['attention_mask'].to(device)
+            
+            text_outputs = self.text_encoder(input_ids, attention_mask=attention_mask)
+            text_seq_embeds = text_outputs.last_hidden_state # [B, 77, 512]
+            text_seq_embeds = self.text_proj(text_seq_embeds) # [B, 77, 768]
+            
+            # 2. Pyramid Encoder 处理
+            out_v2 = self.text_encoder_v2(text_seq_embeds)
+            
+            # 3. 获取解耦特征 [B, 768]
+            feat_attr_raw = out_v2['feat_attr']
+            feat_id_raw = out_v2['feat_id']
+            # feat_id_bn = out_v2['feat_id_bn'] # 用于分类损失
+            
+            # 4. 投影到公共空间 (768 -> 512 -> 256) 以匹配图像特征
+            #    cloth_text_embeds (Attr)
+            cloth_text_embeds = self.shared_mlp(feat_attr_raw)
+            cloth_text_embeds = self.text_mlp(cloth_text_embeds)
+            cloth_text_embeds = torch.nn.functional.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
+            
+            #    id_text_embeds (ID)
+            id_text_embeds = self.shared_mlp(feat_id_raw)
+            id_text_embeds = self.text_mlp(id_text_embeds)
+            id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
+            
+        else:
+            # === 旧逻辑: 双流分别编码 ===
+            # Fallback to separate encoding
+            cloth_text_embeds = self.encode_text(cloth_instruction)
+            id_text_embeds = self.encode_text(id_instruction)
         
         fused_embeds, gate_weights = None, None
+        
+        # === 融合模块调用 (支持 Fusion V2) ===
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
-            fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
-            fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1, eps=1e-8)
+            if isinstance(self.fusion, FusionV2):
+                # Fusion V2 需要: img_id, img_attr, txt_id, txt_attr, energy_ratio
+                # 图像特征: id_embeds, cloth_embeds (来自 disentangle)
+                # 文本特征: feat_id_raw, feat_attr_raw (来自 Pyramid)
+                # 能量比率: gate_stats['energy_ratio']
+                
+                energy_ratio = gate_stats.get('energy_ratio') if gate_stats else None
+                
+                # 确保所有输入都可用
+                if feat_id_raw is not None and feat_attr_raw is not None and energy_ratio is not None:
+                    fused_embeds, gate_weights = self.fusion(
+                        img_id=id_embeds, 
+                        img_attr=cloth_embeds,
+                        txt_id=feat_id_raw, 
+                        txt_attr=feat_attr_raw,
+                        energy_ratio=energy_ratio
+                    )
+                    fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1, eps=1e-8)
+                else:
+                    # 如果缺少某些输入（如Legacy Text Encoder导致无raw特征），回退或跳过
+                     if self.logger:
+                        self.debug_logger.warning("FusionV2 active but missing inputs (raw text feats or energy).")
+            else:
+                # Legacy Fusion
+                fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
+                fused_embeds = self.scale * torch.nn.functional.normalize(fused_embeds, dim=-1, eps=1e-8)
         else:
             # Fusion模块未激活时，使用image_embeds作为fallback
             # 确保fused_embeds始终有值参与损失计算

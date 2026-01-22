@@ -62,49 +62,50 @@ def parse_args():
                        help='Path to Vision Mamba model')
 
     
-    # G-S3 module parameters (for model initialization)
-    parser.add_argument('--disentangle-type', type=str, default='gs3',
-                       choices=['gs3', 'simple'],
-                       help='Type of disentangle module')
-    parser.add_argument('--gs3-num-heads', type=int, default=8,
-                       help='Number of attention heads in G-S3 OPA')
-    parser.add_argument('--gs3-d-state', type=int, default=16,
-                       help='State dimension for G-S3 Mamba filter')
-    parser.add_argument('--gs3-d-conv', type=int, default=4,
-                       help='Convolution kernel size for G-S3 Mamba filter')
-    parser.add_argument('--gs3-dropout', type=float, default=0.1,
-                       help='Dropout rate for G-S3 module')
-    
+    # G-S3/FSHD module parameters
+    parser.add_argument('--disentangle-type', type=str, default='fshd',
+                       choices=['fshd', 'simple'], help='Type of disentangle module')
+    parser.add_argument('--gs3-num-heads', type=int, default=8, help='Number of attention heads')
+    parser.add_argument('--gs3-d-state', type=int, default=16, help='State dimension for G-S3')
+    parser.add_argument('--gs3-d-conv', type=int, default=4, help='Conv kernel size for G-S3')
+    parser.add_argument('--gs3-dropout', type=float, default=0.1, help='Dropout rate for G-S3')
+    parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true', help='Use multi-scale CNN')
+    parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14], help='Image patch grid size')
+
+    # Fusion module parameters
+    parser.add_argument('--fusion-type', type=str, default='samg_rcsm', help='Type of fusion module')
+    parser.add_argument('--fusion-dim', type=int, default=256, help='Fusion module dimension')
+    parser.add_argument('--fusion-d-state', type=int, default=16, help='Fusion module d_state')
+    parser.add_argument('--fusion-d-conv', type=int, default=4, help='Fusion module d_conv')
+    parser.add_argument('--fusion-num-layers', type=int, default=3, help='Fusion module number of layers')
+    parser.add_argument('--fusion-output-dim', type=int, default=256, help='Fusion module output dimension')
+    parser.add_argument('--fusion-dropout', type=float, default=0.15, help='Fusion module dropout')
+
+    # CLIP
+    parser.add_argument('--clip-pretrained', type=str, default=str(ROOT_DIR / 'pretrained' / 'clip-vit-base-patch16'),
+                       help='Path to CLIP text encoder model')
+
     args = parser.parse_args()
 
-    # 验证配置文件路径
-    config_path = Path(args.config)
-    if not config_path.exists():
-        raise FileNotFoundError(f"Config file not found at: {config_path}")
-    with open(config_path, encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    
-    # 更新参数
-    for k, v in config.items():
-        if not hasattr(args, k) or getattr(args, k) == parser.get_default(k):
-            setattr(args, k, v)
-    
-    # 安全解析 dataset-configs
-    if args.dataset_configs:
-        dataset_configs = []
-        for cfg in args.dataset_configs:
-            try:
-                parsed = ast.literal_eval(cfg)
-                dataset_configs.extend(parsed if isinstance(parsed, list) else [parsed])
-            except (ValueError, SyntaxError) as e:
-                raise ValueError(f"Invalid JSON format in dataset-configs: {cfg}, error: {e}")
-        args.dataset_configs = dataset_configs
+    # 验证配置文件路径 (Config file is optional now, args take precedence)
+    if args.config:
+        config_path = Path(args.config)
+        if config_path.exists():
+            with open(config_path, encoding='utf-8') as f:
+                config = yaml.safe_load(f)
+            # Update args from config if not specified in cmdline (simplification: just merge)
+            # But we rely mostly on defaults in args now for structure
+            pass 
     
     # 确保路径使用 Path 对象
     args.logs_dir = str(Path(args.logs_dir))
     args.root = str(Path(args.root))
     args.checkpoint = str(Path(args.checkpoint))
+    args.clip_pretrained = str(Path(args.clip_pretrained))
     
+    # Process boolean
+    args.gs3_use_multi_scale_cnn = args.gs3_use_multi_scale_cnn.lower() == 'true'
+
     # 验证检查点路径
     if not Path(args.checkpoint).exists():
         raise FileNotFoundError(f"Checkpoint file not found at: {args.checkpoint}")
@@ -144,25 +145,37 @@ def main():
     args.num_classes = data_builder.get_num_classes()
     
     query_loader, gallery_loader = data_builder.build_data(is_train=False)
-    logger.info(f"Query data size: {len(query_loader.dataset.data)}, "
-                f"sample: {[(d[0], d[1], d[2], d[3]) for d in query_loader.dataset.data[:2]]}")
-    logger.info(f"Gallery data size: {len(gallery_loader.dataset.data)}, "
-                f"sample: {[(d[0], d[1], d[2], d[3]) for d in gallery_loader.dataset.data[:2]]}")
+    logger.info(f"Query data size: {len(query_loader.dataset.data)}")
+    logger.info(f"Gallery data size: {len(gallery_loader.dataset.data)}")
 
     # 初始化模型
-    net_config = args.model.copy()
-    net_config['num_classes'] = args.num_classes
-    net_config['vision_backbone'] = args.vision_backbone
-    net_config['vim_pretrained'] = args.vim_pretrained
-    net_config['img_size'] = (getattr(args, 'height', 224), getattr(args, 'width', 224))
-    # 添加 G-S3 配置
-    net_config['disentangle_type'] = args.disentangle_type
-    net_config['gs3'] = {
-        'num_heads': args.gs3_num_heads,
-        'd_state': args.gs3_d_state,
-        'd_conv': args.gs3_d_conv,
-        'dropout': args.gs3_dropout
+    net_config = {
+        'clip_pretrained': args.clip_pretrained,
+        'vit_pretrained': str(ROOT_DIR / 'pretrained' / 'vit-base-patch16-224'), # Default
+        'vision_backbone': args.vision_backbone,
+        'vim_pretrained': args.vim_pretrained,
+        'img_size': (getattr(args, 'height', 224), getattr(args, 'width', 224)),
+        'num_classes': args.num_classes,
+        'disentangle_type': args.disentangle_type,
+        'gs3': {
+            'num_heads': args.gs3_num_heads,
+            'd_state': args.gs3_d_state,
+            'd_conv': args.gs3_d_conv,
+            'dropout': args.gs3_dropout,
+            'use_multi_scale_cnn': args.gs3_use_multi_scale_cnn,
+            'img_size': tuple(args.gs3_img_size)
+        },
+        'fusion': {
+            'type': args.fusion_type,
+            'dim': args.fusion_dim,
+            'd_state': args.fusion_d_state,
+            'd_conv': args.fusion_d_conv,
+            'num_layers': args.fusion_num_layers,
+            'output_dim': args.fusion_output_dim,
+            'dropout': args.fusion_dropout
+        }
     }
+    
     model = Model(net_config=net_config)
 
     # 加载检查点

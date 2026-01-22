@@ -46,19 +46,19 @@ class Trainer:
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === FSHD权重配置（优化版 - 平衡权重）===
+        # === 🔥 紧急修复版权重配置（与loss.py保持一致）===
         default_loss_weights = {
-            'info_nce': 1.2,               # 对比学习
-            'cls': 0.05,                   # 分类损失（提升）
-            'cloth_semantic': 1.0,         # 衣服语义
-            'orthogonal': 0.12,            # 正交约束（提升）
-            'gate_adaptive': 0.05,         # 门控自适应（大幅提升）
-            'reconstruction': 1.5,         # 对称重构（大幅提升）
-            'id_triplet': 0.8,             # ID一致性（提升）
-            'anti_collapse': 2.0,          # 防坍缩（大幅提升）
-            'semantic_alignment': 0.0,     # 【阶段1：完全禁用】
-            'freq_consistency': 0.0,       # 【阶段1：完全禁用】
-            'freq_separation': 0.0,        # 【阶段1：完全禁用】
+            'info_nce': 1.0,               # 对比学习 - 主任务
+            'cls': 0.15,                   # 🔥 大幅降低（避免过拟合）
+            'cloth_semantic': 0.2,         # 🔥 大幅降低（减少冲突）
+            'orthogonal': 0.3,             # 🔥 提升（强化解耦）
+            'id_triplet': 0.8,             # ID一致性
+            'anti_collapse': 1.5,          # 🔥 提升（修复后激活）
+            'reconstruction': 0.2,         # 🔥 降低
+            'gate_adaptive': 0.0,          # 已删除
+            'semantic_alignment': 0.0,     # 已删除
+            'freq_consistency': 0.0,       # 已删除
+            'freq_separation': 0.0,        # 已删除
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -335,8 +335,8 @@ class Trainer:
         total_batches = len(train_loader)
         loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
         
-        # 【新增】早停机制
-        early_stopping = EarlyStopping(patience=10, min_delta=0.001, logger=self.monitor)
+        # 【紧急修复】早停机制 - 增加patience
+        early_stopping = EarlyStopping(patience=15, min_delta=0.001, logger=self.monitor)
         
         # 【新增】学习率预热和全局步数
         warmup_steps = 1000
