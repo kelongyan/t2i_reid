@@ -157,10 +157,10 @@ CMD="$CMD \
     --scheduler \"cosine\" \
     --logs-dir \"log/quick_test\""
 
-# 损失权重（优化版）
+# 损失权重（方案B：频域对齐损失版）
 CMD="$CMD \
     --loss-info-nce 1.0 \
-    --loss-cls 0.05 \
+    --loss-frequency-alignment 0.3 \
     --loss-cloth-semantic 0.5 \
     --loss-orthogonal 0.05 \
     --loss-id-triplet 1.0"

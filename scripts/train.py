@@ -87,9 +87,9 @@ def configuration():
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
-    # Loss weights (Active Losses Only)
+    # Loss weights (方案B：频域对齐损失版）
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-cls', type=float, default=0.05, help='Classification loss weight')
+    parser.add_argument('--loss-frequency-alignment', type=float, default=0.3, help='Frequency alignment loss weight (方案B新增）')
     parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
     parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
     parser.add_argument('--loss-orthogonal', type=float, default=0.05, help='Orthogonal loss weight')
@@ -120,13 +120,13 @@ def configuration():
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
     else:
-        # 仅保留活跃的损失，废弃的损失已移除
+        # 方案B：频域对齐损失权重配置（移除CLS，添加frequency_alignment）
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
-            'cls': args.loss_cls,
             'cloth_semantic': args.loss_cloth_semantic,
             'id_triplet': args.loss_id_triplet,
-            'orthogonal': args.loss_orthogonal
+            'orthogonal': args.loss_orthogonal,
+            'frequency_alignment': args.loss_frequency_alignment  # 新增
         }
     
     # 初始化可视化配置

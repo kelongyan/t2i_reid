@@ -110,17 +110,17 @@ CMD="$CMD \
     --optimizer \"AdamW\" \
     --scheduler \"cosine\""
 
-# 损失权重（优化版）
+# 损失权重（方案B：频域对齐损失版）
 CMD="$CMD \
     --optimizer "AdamW" \
     --scheduler "cosine" \
     --loss-info-nce 1.0 \
-    --loss-cls 0.05 \
+    --loss-frequency-alignment 0.3 \
     --loss-cloth-semantic 0.5 \
     --loss-orthogonal 0.05 \
     --loss-id-triplet 1.0"
 
-echo "🔥 System Configuration (v3.0):"
+echo "🔥 System Configuration (方案B: Frequency Alignment Loss v3.0):"
 echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
 echo "   • Fusion Dim: 768 (Matched to Backbone)"
 echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"

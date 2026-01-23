@@ -346,7 +346,7 @@ class DisentangleModule(nn.Module):
 class Model(nn.Module):
     def __init__(self, net_config, logger=None):
         """
-        文本-图像行人重识别模型（消融实验版本），移除了复杂的解纠缠模块。
+        文本-图像行人重识别模型（方案B：频域对齐损失版）
 
         Args:
             net_config (dict): 模型配置字典，包含BERT路径、ViT路径、融合模块配置等。
@@ -526,29 +526,12 @@ class Model(nn.Module):
             self.debug_logger.info("✅ Initialized CLIP Semantic Guidance for ID/Attr decoupling")
 
         # ================================================================
-        # === 方案C (优化版)：BNNeck 监督 - 使用 BNNeck 替代深层残差分类器 ===
+        # === 方案B：频域对齐损失版（移除分类分支）===
         # ================================================================
+        # 注：移除分类分支，使用频域对齐损失进行身份监督
+        #     这与检索任务使用相同的特征空间（768维L2归一化）
         
-        # === 分支1：专用于分类的id特征处理 ===
-        # 使用 BNNeck (BatchNorm1d) 规范化特征分布
-        # 这一步将特征拉向超球面，有利于 CrossEntropy 收敛，同时不破坏流形结构
-        self.id_bn = nn.BatchNorm1d(self.text_width)
-        # 初始化 BNNeck：weight=1, bias=0 (标准做法)
-        nn.init.constant_(self.id_bn.weight, 1.0)
-        nn.init.constant_(self.id_bn.bias, 0.0)
-        
-        if self.logger:
-            self.debug_logger.info("Using BNNeck (BatchNorm1d) for classification branch")
-
-        # 身份分类器：从 text_width (768) 直接映射到类别数
-        # bias=False 是 ReID 常见 Trick，让模型关注向量角度而非模长
-        self.id_classifier = nn.Linear(self.text_width, num_classes, bias=False)
-        # 初始化分类器权重
-        nn.init.normal_(self.id_classifier.weight, std=0.02)
-        
-        # === 分支2：专用于检索的id特征处理（保持原有设计）===
-        # 共享MLP：用于降维
-        # === 分支2：专用于检索的id特征处理（保持原有设计）===
+        # === 检索分支：专用于检索的id特征处理 ===
         # 共享MLP：用于降维
         self.shared_mlp = nn.Linear(self.text_width, 512)
 
@@ -566,16 +549,16 @@ class Model(nn.Module):
             nn.Linear(256, 256)
         )
         
-        # === 分支3：cloth特征处理（共享检索分支的MLP）===
+        # === cloth特征处理（共享检索分支的MLP）===
         # cloth_embeds也使用shared_mlp和image_mlp进行投影
         # 这样可以确保cloth特征和id特征在同一空间中对比
         
         if self.logger:
             self.debug_logger.info("=" * 60)
-            self.debug_logger.info("Branch Decoupling Architecture (Optimized):")
-            self.debug_logger.info(f"  - Classification Branch: {self.text_width} → BNNeck(768) → {num_classes}")
-            self.debug_logger.info(f"  - Retrieval Branch: {self.text_width} → 512 → 256")
-            self.debug_logger.info(f"  - Total Classifier Params: ~{self._count_classifier_params() / 1e6:.2f}M")
+            self.debug_logger.info("Architecture (Solution B: Frequency Alignment):")
+            self.debug_logger.info(f"  - Retrieval Branch: {self.text_width} -> 512 -> 256 (L2 normalized)")
+            self.debug_logger.info(f"  - Cloth Branch: {self.text_width} -> 512 -> 256 (L2 normalized)")
+            self.debug_logger.info(f"  - Loss Function: Frequency Alignment (替代CLS)")
             self.debug_logger.info("=" * 60)
 
         # === 文本编码器升级：PyramidTextEncoder ===
@@ -611,12 +594,6 @@ class Model(nn.Module):
 
         # 文本分词结果缓存
         self.text_cache = {}
-    
-    def _count_classifier_params(self):
-        """计算分类分支的参数量"""
-        params = sum(p.numel() for p in self.id_bn.parameters())
-        params += sum(p.numel() for p in self.id_classifier.parameters())
-        return params
 
     def encode_image(self, image):
         """
@@ -648,7 +625,7 @@ class Model(nn.Module):
             image_outputs = self.visual_encoder(image)
             image_embeds_raw = image_outputs.last_hidden_state
             
-        # 投影到统一维度 (如果是 Vim: 384->768; 如果是 ViT: Identity)
+        # 投影到统一维度 (如果是 Vim: 384->768; 如果是 ViT: 768->768)
         image_embeds_raw = self.visual_proj(image_embeds_raw)
         
         # 后续处理保持不变 (解耦 -> 检索MLP -> 归一化)
@@ -751,12 +728,11 @@ class Model(nn.Module):
         """
         前向传播，处理图像和文本输入，输出多模态特征和分类结果。
         
-        === 重构后的流程（分支解耦）===
+        === 重构后的流程（方案B：频域对齐版）===
         1. ViT编码 → image_embeds [B, 197, 768]
         2. G-S3解耦 → id_embeds, cloth_embeds [B, 768]
-        3. 分支1（分类）：id_embeds → id_for_classification → id_logits
-        4. 分支2（检索）：id_embeds → shared_mlp → image_mlp → image_embeds
-        5. 分支3（cloth）：cloth_embeds → shared_mlp → image_mlp → cloth_image_embeds
+        3. 检索分支：id_embeds → shared_mlp → image_mlp → image_embeds
+        4. Cloth分支：cloth_embeds → shared_mlp → image_mlp → cloth_image_embeds
 
         Args:
             image (torch.Tensor, optional): 输入图像，形状为 [batch_size, channels, height, width]。
@@ -767,13 +743,13 @@ class Model(nn.Module):
         Returns:
             tuple: (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                     cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate, gate_weights,
-                    id_cls_features)  # 新增：分类分支的中间特征
+                    id_cls_features, original_feat)  # id_logits和id_cls_features保留为None
                    或包含注意力图的扩展元组
         """
         device = next(self.parameters()).device
         id_logits, id_embeds, cloth_embeds, gate = None, None, None, None
         id_attn_map, cloth_attn_map = None, None
-        id_cls_features = None  # 新增：分类分支的中间特征
+        id_cls_features = None  # 已废弃：分类分支的中间特征
         
         if image is not None:
             if image.dim() == 5:
@@ -847,21 +823,7 @@ class Model(nn.Module):
                     self._debug_features.update(self.disentangle._debug_info)
             
             # ============================================================
-            # 步骤2：分支1 - 分类分支（BNNeck 隐式监督）
-            # ============================================================
-            # 1. 通过 BNNeck 进行特征规范化
-            # id_embeds [B, 768] → id_cls_features [B, 768]
-            id_cls_features = self.id_bn(id_embeds)
-            
-            # 2. 计算分类 Logits
-            # id_cls_features [B, 768] → id_logits [B, num_classes]
-            id_logits = self.id_classifier(id_cls_features)
-            
-            # 注意：检索分支依然使用原始 id_embeds，这使得 id_embeds 同时受到 
-            # BNNeck(分类) 和 MLP(检索) 的双重梯度约束，促进特征鲁棒性
-            
-            # ============================================================
-            # 步骤3：分支2 - 检索分支（用于info_nce）
+            # 步骤2：检索分支（用于info_nce）
             # ============================================================
             # id_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             image_embeds = self.shared_mlp(id_embeds)
@@ -869,7 +831,7 @@ class Model(nn.Module):
             image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
             
             # ============================================================
-            # 步骤4：分支3 - cloth检索分支（用于cloth_semantic）
+            # 步骤3：cloth检索分支（用于cloth_semantic）
             # ============================================================
             # cloth_embeds [B, 768] → shared_mlp [B, 512] → image_mlp [B, 256]
             cloth_image_embeds = self.shared_mlp(cloth_embeds)
@@ -881,7 +843,7 @@ class Model(nn.Module):
             gate_stats = None
 
         # ============================================================
-        # 步骤5：文本编码和融合 (Updated for Pyramid Encoder)
+        # 步骤4：文本编码和融合 (Updated for Pyramid Encoder)
         # ============================================================
         
         # 策略：如果使用 PyramidTextEncoder，我们倾向于使用一段完整的文本 (id_instruction) 
@@ -980,12 +942,13 @@ class Model(nn.Module):
                 fused_embeds = image_embeds
         
         # ============================================================
-        # 返回值（新增：original_feat用于重构监督）
+        # 返回值（保留original_feat用于频域对齐损失）
         # ============================================================
         # 注意：gate_stats是dict，包含门控统计信息
+        # id_logits和id_cls_features保留为None以保持向后兼容
         base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
                        cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights,
-                       id_cls_features, original_feat)  # 新增original_feat
+                       id_cls_features, original_feat)
         
         if return_attention:
             return base_outputs + (id_attn_map, cloth_attn_map)

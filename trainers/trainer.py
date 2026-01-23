@@ -46,14 +46,16 @@ class Trainer:
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === 🔥 紧急修复版权重配置（与loss.py保持一致）===
+        # === 🔥 方案B：频域对齐损失版权重配置（移除CLS损失）===
+        # 新的权重配置：
+        #   - 移除 'cls' 损失（已废弃）
+        #   - 新增 'frequency_alignment' 损失（替代CLS）
         default_loss_weights = {
             'info_nce': 1.0,               # 对比学习 - 主任务
-            'cls': 0.05,                   # 🔥 大幅降低 (0.15 -> 0.05) + Logit缩放
-            'cloth_semantic': 0.5,         # 🔥 激活 (0.2 -> 0.5) 
-            'orthogonal': 0.05,            # 🔥 降级 (0.3 -> 0.05)
-            'id_triplet': 1.0,             # ID一致性 (0.8 -> 1.0)
-            'anti_collapse': 1.0,          # 基础正则
+            'id_triplet': 1.0,             # ID一致性 (保持）
+            'cloth_semantic': 0.5,         # 服装语义对齐 (保持）
+            'orthogonal': 0.05,            # 正交约束 (保持）
+            'frequency_alignment': 0.3,    # 频域对齐 (新增，替代CLS）
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -232,14 +234,15 @@ class Trainer:
                             image_embeds_raw, return_freq_info=True
                         )
             
-            # === 损失计算（新增freq_info参数）===
+            # === 损失计算（方案B：频域对齐损失版）===
+            # 注意：id_logits和id_cls_features保留参数以保持向后兼容，但传入None
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
-                id_logits=id_logits, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
+                id_logits=None, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
                 pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                id_cls_features=id_cls_features, original_feat=original_feat,
-                freq_info=freq_info  # 【新增】传递频域信息
+                id_cls_features=None, original_feat=original_feat,
+                freq_info=freq_info  # 【新增】传递频域信息用于frequency_alignment损失
             )
 
         # === 可视化回调 ===
@@ -258,15 +261,21 @@ class Trainer:
                 # 注意：当前gate_stats只包含统计值，如果需要可视化需要修改模型返回gate tensor
                 pass
         
-        # 记录模型内部状态信息
-        if self.monitor and batch_idx % 200 == 0:  # 每200个批次记录一次详细信息
-            self.monitor.log_feature_statistics(image_feats, "image_features")
-            self.monitor.log_feature_statistics(id_text_feats, "id_text_features")
-            self.monitor.log_feature_statistics(fused_feats, "fused_features")
-            self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
-            self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
-            self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
-            self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
+            # 记录特征统计信息（移除分类器诊断）
+            if self.monitor and batch_idx % 200 == 0:  # 每200个批次记录一次详细信息
+                self.monitor.log_feature_statistics(image_feats, "image_features")
+                self.monitor.log_feature_statistics(id_text_feats, "id_text_features")
+                self.monitor.log_feature_statistics(fused_feats, "fused_features")
+                self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
+                self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
+                self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
+                self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
+                
+                # 频域对齐损失统计（新增）
+                if 'frequency_alignment' in loss_dict:
+                    self.monitor.debug_logger.debug(
+                        f"Frequency Alignment Loss: {loss_dict['frequency_alignment'].item():.6f}"
+                    )
 
             # gate_stats是dict，记录统计信息
             if gate_stats is not None and isinstance(gate_stats, dict):
@@ -292,11 +301,12 @@ class Trainer:
             self.monitor.log_memory_usage()
 
         return loss_dict
+    
 
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
-        # [Modify] Removed deprecated losses (gate_adaptive, etc) from display
-        display_order = ['info_nce', 'cls', 'cloth_semantic', 'id_triplet', 'orthogonal', 'total']
+        # [Modify] 移除 'cls'，添加 'frequency_alignment'
+        display_order = ['info_nce', 'frequency_alignment', 'cloth_semantic', 'id_triplet', 'orthogonal', 'total']
         
         avg_losses = []
         for key in display_order:

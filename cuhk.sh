@@ -117,20 +117,20 @@ CMD="$CMD \
     --id-projection-dim 768 \
     --cloth-projection-dim 768"
 
-# 优化器
+# 优化器（方案B：频域对齐损失版）
     --optimizer "AdamW" \
     --scheduler "cosine" \
     --loss-info-nce 1.0 \
-    --loss-cls 0.05 \
+    --loss-frequency-alignment 0.3 \
     --loss-cloth-semantic 0.5 \
     --loss-orthogonal 0.05 \
     --loss-id-triplet 1.0"
 
-echo "🔥 System Configuration (v3.0):"
+echo "🔥 System Configuration (方案B: Frequency Alignment Loss v3.0):"
 echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
 echo "   • Fusion Dim: 768 (Matched to Backbone)"
 echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   • Loss Weights: Optimized (Orth=0.3, Anti-Collapse=1.5)"
+echo "   • Loss: Frequency Alignment (替代CLS) + InfoNCE + Triplet + Orthogonal + Cloth Semantic"
 echo "   • Prompts: 7+23 Fine-grained Templates"
 
 # 可视化配置

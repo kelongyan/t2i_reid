@@ -182,11 +182,9 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
     
-    if 'id_classifier.weight' in state_dict and state_dict['id_classifier.weight'].shape[0] != net_config['num_classes']:
-        logger.info(
-            f"Adapting id_classifier dimensions: checkpoint ({state_dict['id_classifier.weight'].shape[0]}) -> model ({net_config['num_classes']})")
-        state_dict['id_classifier.weight'] = state_dict['id_classifier.weight'][:net_config['num_classes'], :]
-        state_dict['id_classifier.bias'] = state_dict['id_classifier.bias'][:net_config['num_classes']]
+    # 方案B：移除id_classifier相关代码（分类分支已废弃）
+    # 如果旧checkpoint包含id_classifier，则跳过维度适配
+    # 因为新模型不再有这个层
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
 
