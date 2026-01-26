@@ -1,62 +1,56 @@
 #!/bin/bash
 
 # ============================================================================
-# ICFG-PEDES Training Script - FSHD-Net Version
+# ICFG-PEDES Training Script - AH-Net Version
 # ============================================================================
-# 支持FSHD模块配置
-# ICFG-PEDES特点：
-#   - 中等类别数 (4,102)
-#   - 最大数据集 (~54k训练样本)
-#   - batch_size: 112
-#
-# 预期性能：
-#   - FSHD-Full: mAP 75-78%
-#   - FSHD-Lite: mAP 74-77%
+# AH-Net: Asymmetric Heterogeneous Network
+# 核心特性：
+#   • 不对称双流架构 (Mamba结构流 + CNN纹理流)
+#   • 空间结构解耦
+#   • 原型引导的语义交互
+#   • 空间互斥与重构损失
 # ============================================================================
 
-# 默认参数配置（FSHD-Full完整版）
-DISENTANGLE_TYPE="fshd"
-USE_MULTI_SCALE_CNN=true
+# 默认参数配置
+DISENTANGLE_TYPE="ahnet"  # ahnet | simple
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
 
-echo "🔥 默认配置: FSHD-Full (disentangle=fshd, multi_scale_cnn=true, visualization=true)"
-echo "   可通过参数覆盖，例如: bash icfg.sh --disentangle-type=simple --no-viz"
+echo "=========================================="
+echo "  ICFG-PEDES Training Script"
+echo "  Architecture: AH-Net (Asymmetric Heterogeneous Network)"
+echo "=========================================="
+echo ""
+echo "默认配置: disentangle=ahnet, visualization=true"
+echo "参数覆盖示例: bash icfg.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
-        --disentangle-type=*) 
+        --disentangle-type=*)
             DISENTANGLE_TYPE="${arg#*=}"
             shift
-            ;; 
-        --use-cnn)
-            USE_MULTI_SCALE_CNN=true
-            shift
-            ;; 
-        --no-cnn)
-            USE_MULTI_SCALE_CNN=false
-            shift
-            ;; 
+            ;;
         --no-viz)
             ENABLE_VISUALIZATION=false
             shift
-            ;; 
-        --resume=*) 
+            ;;
+        --resume=*)
             RESUME_PATH="${arg#*=}"
             shift
-            ;; 
+            ;;
         *)
             shift
-            ;; 
+            ;;
     esac
 done
 
-# 清理缓存
+# 清理Python缓存
+echo "清理缓存文件..."
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-# JSON Config String (Single quoted for safety)
+# JSON Config String
 DATASET_CONFIG="[{'name': 'ICFG-PEDES', 'root': 'ICFG-PEDES', 'json_file': 'ICFG-PEDES/annotations/caption_all.json'}]"
 
 # 构建基础命令
@@ -80,77 +74,99 @@ CMD="python scripts/train.py \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
 # 添加解耦模块配置
-CMD="$CMD \
-    --disentangle-type $DISENTANGLE_TYPE"
+CMD="$CMD --disentangle-type $DISENTANGLE_TYPE"
 
-if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    CMD="$CMD \
-    --gs3-use-multi-scale-cnn $USE_MULTI_SCALE_CNN \
-    --gs3-img-size 14 14"
-    echo "🔥 使用FSHD模块: multi_scale_cnn=$USE_MULTI_SCALE_CNN (Frequency: DCT fixed)"
+if [ "$DISENTANGLE_TYPE" = "ahnet" ] || [ "$DISENTANGLE_TYPE" = "fshd" ]; then
+    CMD="$CMD --gs3-img-size 14 14"
+    echo "✓ 解耦模块: AH-Net (Mamba Structure + CNN Texture)"
 else
-    echo "🔧 使用简化解耦模块"
+    echo "✓ 解耦模块: Simple"
 fi
 
-# ICFG使用更多的heads（数据集更大）
+# ICFG 数据集更大，使用更多的 attention heads
 CMD="$CMD \
     --gs3-num-heads 12 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
-    --gs3-dropout 0.15 \
+    --gs3-dropout 0.15"
+
+# Fusion 配置 (SAMG-RCSM)
+CMD="$CMD \
     --fusion-type \"samg_rcsm\" \
     --fusion-dim 768 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 3 \
     --fusion-output-dim 256 \
-    --fusion-dropout 0.15 \
+    --fusion-dropout 0.15"
+
+# 投影维度
+CMD="$CMD \
     --id-projection-dim 768 \
-    --cloth-projection-dim 768 \
+    --cloth-projection-dim 768"
+
+# 优化器配置
+CMD="$CMD \
     --optimizer \"AdamW\" \
     --scheduler \"cosine\""
 
-# 损失权重（方案B：频域对齐损失版）
+# 损失权重配置 (AH-Net + 方案书 Phase 3)
 CMD="$CMD \
-    --optimizer "AdamW" \
-    --scheduler "cosine" \
     --loss-info-nce 1.0 \
-    --loss-frequency-alignment 0.3 \
+    --loss-id-triplet 1.0 \
     --loss-cloth-semantic 0.5 \
-    --loss-orthogonal 0.05 \
-    --loss-id-triplet 1.0"
+    --loss-reconstruction 0.5 \
+    --loss-spatial-orthogonal 0.1 \
+    --loss-semantic-alignment 0.1"
 
-echo "🔥 System Configuration (方案B: Frequency Alignment Loss v3.0):"
-echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
-echo "   • Fusion Dim: 768 (Matched to Backbone)"
-echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   • Loss Weights: Optimized (Orth=0.3, Anti-Collapse=1.5)"
-echo "   • Prompts: 7+23 Fine-grained Templates"
-
+# 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \
     --visualization-enabled \
     --visualization-save-dir \"visualizations/icfg_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
+    echo "✓ 可视化: enabled (visualizations/icfg_${DISENTANGLE_TYPE})"
+else
+    echo "✓ 可视化: disabled"
 fi
 
+# Resume training
 if [ -n "$RESUME_PATH" ]; then
     CMD="$CMD --resume \"$RESUME_PATH\""
+    echo "✓ 从检查点恢复: $RESUME_PATH"
 fi
 
 echo ""
-echo "🚀 开始训练 ICFG-PEDES 数据集 (${DISENTANGLE_TYPE}模式)"
-echo "Executing command..."
+echo "=========================================="
+echo "  配置摘要"
+echo "=========================================="
+echo "数据集: ICFG-PEDES (4,102 IDs)"
+echo "架构: AH-Net (Asymmetric Heterogeneous) + S-CAG Fusion"
+echo "创新点: Conflict Score驱动动态融合"
+echo "注意: ICFG 数据集较大，使用12个 attention heads"
+echo "损失权重: info_nce=1.0, id_triplet=1.0, cloth_semantic=0.5"
+echo "        reconstruction=0.5, spatial_orthogonal=0.1"
+echo "        semantic_alignment=0.1 (Phase 3)"
+echo "=========================================="
+echo ""
+echo "🚀 开始训练..."
 echo ""
 
+# 执行训练
 eval $CMD
 
 exit_code=$?
+
+echo ""
 if [ $exit_code -eq 0 ]; then
+    echo "=========================================="
     echo "✅ ICFG-PEDES 训练完成！"
+    echo "=========================================="
 else
-    echo "❌ ICFG-PEDES 训练失败，退出码：$exit_code"
+    echo "=========================================="
+    echo "❌ 训练失败 (退出码: $exit_code)"
+    echo "=========================================="
 fi
 
 exit $exit_code

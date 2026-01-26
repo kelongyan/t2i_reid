@@ -181,10 +181,8 @@ def main():
     # 加载检查点
     checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
-    
-    # 方案B：移除id_classifier相关代码（分类分支已废弃）
-    # 如果旧checkpoint包含id_classifier，则跳过维度适配
-    # 因为新模型不再有这个层
+
+    # 加载模型权重（strict=False 允容旧版 checkpoint）
     model.load_state_dict(state_dict, strict=False)
     model = model.to(device)
 

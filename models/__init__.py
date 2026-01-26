@@ -1,17 +1,16 @@
 from .model import Model
-from .fshd_module import FSHDModule, GS3Module, SymmetricGS3Module
-from .frequency_module import DCTFrequencySplitter
-from .hybrid_stream import HybridDualStream, MultiScaleCNN, FrequencyGuidedAttention
+from .ahnet_module import AHNetModule, FSHDModule
+from .ahnet_streams import IDStructureStream, AttributeTextureStream
 from .semantic_guidance import SemanticGuidedDecoupling
+from .fusion import get_fusion_module
 
 __factory = {
     'Model': Model,
-    'FSHDModule': FSHDModule,
-    'GS3Module': GS3Module,
-    'SymmetricGS3Module': SymmetricGS3Module,
+    'AHNetModule': AHNetModule,
+    'FSHDModule': FSHDModule, # Kept for backward compatibility
+    'IDStructureStream': IDStructureStream,
+    'AttributeTextureStream': AttributeTextureStream,
     'SemanticGuidedDecoupling': SemanticGuidedDecoupling,
-    'DCTFrequencySplitter': DCTFrequencySplitter,
-    'HybridDualStream': HybridDualStream,
 }
 
 

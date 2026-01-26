@@ -1,64 +1,56 @@
 #!/bin/bash
 
 # ============================================================================
-# CUHK-PEDES Training Script - FSHD-Net Version
+# CUHK-PEDES Training Script - AH-Net Version
 # ============================================================================
-# 支持FSHD模块配置
+# AH-Net: Asymmetric Heterogeneous Network
 # 核心特性：
-#   ✅ 支持FSHD/Simple两种解耦模式
-#   ✅ 频域分解固化为DCT
-#   ✅ 异构双流配置（Multi-scale CNN开关）
-#   ✅ 可视化配置
-#   ✅ 渐进解冻策略
-#
-# 预期性能：
-#   - FSHD-Full: mAP 68-70%
-#   - FSHD-Lite: mAP 67-69%
+#   • 不对称双流架构 (Mamba结构流 + CNN纹理流)
+#   • 空间结构解耦
+#   • 原型引导的语义交互
+#   • 空间互斥与重构损失
 # ============================================================================
 
-# 默认参数配置（FSHD-Full完整版）
-DISENTANGLE_TYPE="fshd"  # fshd | simple
-USE_MULTI_SCALE_CNN=true # true | false
+# 默认参数配置
+DISENTANGLE_TYPE="ahnet"  # ahnet | simple
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
 
-echo "🔥 默认配置: FSHD-Full (disentangle=fshd, multi_scale_cnn=true, visualization=true)"
-echo "   可通过参数覆盖，例如: bash cuhk.sh --disentangle-type=simple --no-viz"
+echo "=========================================="
+echo "  CUHK-PEDES Training Script"
+echo "  Architecture: AH-Net (Asymmetric Heterogeneous Network)"
+echo "=========================================="
+echo ""
+echo "默认配置: disentangle=ahnet, visualization=true"
+echo "参数覆盖示例: bash cuhk.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
-        --disentangle-type=*) 
+        --disentangle-type=*)
             DISENTANGLE_TYPE="${arg#*=}"
             shift
-            ;; 
-        --use-cnn)
-            USE_MULTI_SCALE_CNN=true
-            shift
-            ;; 
-        --no-cnn)
-            USE_MULTI_SCALE_CNN=false
-            shift
-            ;; 
+            ;;
         --no-viz)
             ENABLE_VISUALIZATION=false
             shift
-            ;; 
-        --resume=*) 
+            ;;
+        --resume=*)
             RESUME_PATH="${arg#*=}"
             shift
-            ;; 
+            ;;
         *)
             shift
-            ;; 
+            ;;
     esac
 done
 
-# 清理缓存
+# 清理Python缓存
+echo "清理缓存文件..."
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-# JSON Config String (Single quoted for safety)
+# JSON Config String
 DATASET_CONFIG="[{'name': 'CUHK-PEDES', 'root': 'CUHK-PEDES/imgs', 'json_file': 'CUHK-PEDES/annotations/caption_all.json'}]"
 
 # 构建基础命令
@@ -68,8 +60,8 @@ CMD="python scripts/train.py \
     --batch-size 96 \
     --lr 0.00003 \
     --weight-decay 0.0002 \
-    --epochs 50 \
-    --milestones 25 40 \
+    --epochs 60 \
+    --milestones 30 50 \
     --warmup-step 1000 \
     --workers 8 \
     --height 224 \
@@ -82,27 +74,23 @@ CMD="python scripts/train.py \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
 # 添加解耦模块配置
-CMD="$CMD \
-    --disentangle-type $DISENTANGLE_TYPE"
+CMD="$CMD --disentangle-type $DISENTANGLE_TYPE"
 
-# FSHD特定配置
-if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    CMD="$CMD \
-    --gs3-use-multi-scale-cnn $USE_MULTI_SCALE_CNN \
-    --gs3-img-size 14 14"
-    echo "🔥 使用FSHD模块: multi_scale_cnn=$USE_MULTI_SCALE_CNN (Frequency: DCT fixed)"
+if [ "$DISENTANGLE_TYPE" = "ahnet" ] || [ "$DISENTANGLE_TYPE" = "fshd" ]; then
+    CMD="$CMD --gs3-img-size 14 14"
+    echo "✓ 解耦模块: AH-Net (Mamba Structure + CNN Texture)"
 else
-    echo "🔧 使用简化解耦模块"
+    echo "✓ 解耦模块: Simple"
 fi
 
-# G-S3/FSHD通用配置
+# AH-Net 配置参数
 CMD="$CMD \
     --gs3-num-heads 8 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
     --gs3-dropout 0.15"
 
-# Fusion配置 (SAMG-RCSM)
+# Fusion 配置 (SAMG-RCSM)
 CMD="$CMD \
     --fusion-type \"samg_rcsm\" \
     --fusion-dim 768 \
@@ -117,21 +105,19 @@ CMD="$CMD \
     --id-projection-dim 768 \
     --cloth-projection-dim 768"
 
-# 优化器（方案B：频域对齐损失版）
-    --optimizer "AdamW" \
-    --scheduler "cosine" \
-    --loss-info-nce 1.0 \
-    --loss-frequency-alignment 0.3 \
-    --loss-cloth-semantic 0.5 \
-    --loss-orthogonal 0.05 \
-    --loss-id-triplet 1.0"
+# 优化器配置
+CMD="$CMD \
+    --optimizer \"AdamW\" \
+    --scheduler \"cosine\""
 
-echo "🔥 System Configuration (方案B: Frequency Alignment Loss v3.0):"
-echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
-echo "   • Fusion Dim: 768 (Matched to Backbone)"
-echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   • Loss: Frequency Alignment (替代CLS) + InfoNCE + Triplet + Orthogonal + Cloth Semantic"
-echo "   • Prompts: 7+23 Fine-grained Templates"
+# 损失权重配置 (AH-Net + 方案书 Phase 3)
+CMD="$CMD \
+    --loss-info-nce 1.0 \
+    --loss-id-triplet 1.0 \
+    --loss-cloth-semantic 0.5 \
+    --loss-reconstruction 0.5 \
+    --loss-spatial-orthogonal 0.1 \
+    --loss-semantic-alignment 0.1"
 
 # 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then
@@ -140,18 +126,30 @@ if [ "$ENABLE_VISUALIZATION" = true ]; then
     --visualization-save-dir \"visualizations/cuhk_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
-    echo "📊 可视化已启用，保存到: visualizations/cuhk_${DISENTANGLE_TYPE}"
+    echo "✓ 可视化: enabled (visualizations/cuhk_${DISENTANGLE_TYPE})"
+else
+    echo "✓ 可视化: disabled"
 fi
 
-# Resume
+# Resume training
 if [ -n "$RESUME_PATH" ]; then
     CMD="$CMD --resume \"$RESUME_PATH\""
-    echo "📂 从检查点恢复训练：$RESUME_PATH"
+    echo "✓ 从检查点恢复: $RESUME_PATH"
 fi
 
 echo ""
-echo "🚀 开始训练 CUHK-PEDES 数据集 (${DISENTANGLE_TYPE}模式)"
-echo "Executing command..."
+echo "=========================================="
+echo "  配置摘要"
+echo "=========================================="
+echo "数据集: CUHK-PEDES (11,003 IDs)"
+echo "架构: AH-Net (Asymmetric Heterogeneous) + S-CAG Fusion"
+echo "创新点: Conflict Score驱动动态融合"
+echo "损失权重: info_nce=1.0, id_triplet=1.0, cloth_semantic=0.5"
+echo "        reconstruction=0.5, spatial_orthogonal=0.1"
+echo "        semantic_alignment=0.1 (Phase 3)"
+echo "=========================================="
+echo ""
+echo "🚀 开始训练..."
 echo ""
 
 # 执行训练
@@ -159,12 +157,15 @@ eval $CMD
 
 exit_code=$?
 
+echo ""
 if [ $exit_code -eq 0 ]; then
-    echo ""
+    echo "=========================================="
     echo "✅ CUHK-PEDES 训练完成！"
+    echo "=========================================="
 else
-    echo ""
-    echo "❌ CUHK-PEDES 训练失败，退出码：$exit_code"
+    echo "=========================================="
+    echo "❌ 训练失败 (退出码: $exit_code)"
+    echo "=========================================="
 fi
 
 exit $exit_code

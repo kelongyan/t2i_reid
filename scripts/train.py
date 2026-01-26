@@ -67,10 +67,10 @@ def configuration():
     parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
     
-    # G-S3/FSHD module parameters
-    parser.add_argument('--disentangle-type', type=str, default='fshd', 
-                       choices=['fshd', 'simple'],
-                       help='Type of disentangle module: fshd (FSHD-Net) or simple (DisentangleModule)')
+    # AH-Net module parameters (方案书 Phase 1: Asymmetric Heterogeneous Network)
+    parser.add_argument('--disentangle-type', type=str, default='ahnet',
+                       choices=['ahnet', 'fshd', 'simple'],
+                       help='Type of disentangle module: ahnet (AH-Net), fshd (alias for ahnet), or simple')
     
     parser.add_argument('--gs3-num-heads', type=int, default=8, 
                        help='Number of attention heads in G-S3 OPA')
@@ -82,17 +82,16 @@ def configuration():
                        help='Dropout rate for G-S3 module')
     
     # [New] FSHD specific parameters
-    parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true',
-                       help='Whether to use multi-scale CNN in FSHD (true/false)')
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
-    # Loss weights (方案B：频域对齐损失版）
+    # Loss weights (AH-Net Configuration + 方案书 Phase 3)
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-frequency-alignment', type=float, default=0.3, help='Frequency alignment loss weight (方案B新增）')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
     parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
-    parser.add_argument('--loss-orthogonal', type=float, default=0.05, help='Orthogonal loss weight')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
+    parser.add_argument('--loss-reconstruction', type=float, default=0.5, help='Reconstruction loss weight')
+    parser.add_argument('--loss-spatial-orthogonal', type=float, default=0.1, help='Spatial Orthogonal loss weight')
+    parser.add_argument('--loss-semantic-alignment', type=float, default=0.1, help='Semantic Alignment loss weight (方案书 Phase 3)')
     
     # [Deprecated Losses are removed from CLI]
 
@@ -113,20 +112,18 @@ def configuration():
     # 初始化 disentangle 字典
     args.disentangle = {}
 
-    # 处理布尔值字符串
-    args.gs3_use_multi_scale_cnn = args.gs3_use_multi_scale_cnn.lower() == 'true'
-
     # 处理损失权重
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
     else:
-        # 方案B：频域对齐损失权重配置（移除CLS，添加frequency_alignment）
+        # AH-Net 损失权重配置 + 方案书 Phase 3
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
             'cloth_semantic': args.loss_cloth_semantic,
             'id_triplet': args.loss_id_triplet,
-            'orthogonal': args.loss_orthogonal,
-            'frequency_alignment': args.loss_frequency_alignment  # 新增
+            'reconstruction': args.loss_reconstruction,
+            'spatial_orthogonal': args.loss_spatial_orthogonal,
+            'semantic_alignment': args.loss_semantic_alignment  # 🔥 方案书 Phase 3
         }
     
     # 初始化可视化配置
@@ -563,7 +560,6 @@ class Runner:
                 'd_state': args.gs3_d_state,
                 'd_conv': args.gs3_d_conv,
                 'dropout': args.gs3_dropout,
-                'use_multi_scale_cnn': args.gs3_use_multi_scale_cnn,
                 'img_size': tuple(args.gs3_img_size)
             },
             'fusion': {

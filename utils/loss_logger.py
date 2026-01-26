@@ -14,78 +14,60 @@ class LossLogger:
         self.debug_logger = debug_logger
         self.log_intervals = {
             'info_nce': 500,
-            'cls': 500,
             'cloth_semantic': 500,
-            'orthogonal': 200,
             'id_triplet': 500,
-            'anti_collapse': 500,
             'reconstruction': 500,
+            'spatial_orthogonal': 200,
         }
         self._counters = {k: 0 for k in self.log_intervals.keys()}
 
     def should_log(self, loss_type):
         """检查是否应该记录该损失的日志"""
+        if loss_type not in self._counters:
+            self._counters[loss_type] = 0
+            # Default interval if not specified
+            self.log_intervals[loss_type] = 500 
+            
         self._counters[loss_type] += 1
         return self._counters[loss_type] % self.log_intervals[loss_type] == 0
 
-    def log_feature_norms(self, features, name):
-        """记录特征范数统计"""
-        if features is None:
-            self.debug_logger.debug(f"[{name}] Feature is None")
+    def log_spatial_orthogonality_stats(self, map_id, map_attr, loss_value):
+        """记录空间互斥统计信息 (AH-Net)"""
+        if map_id is None or map_attr is None:
             return
 
-        norms = torch.norm(features, p=2, dim=-1)
+        # map_id, map_attr: [B, 1, H, W]
+        # Calculate overlap
+        overlap = map_id * map_attr
+        
+        # Calculate mean activation
+        mean_id = map_id.mean().item()
+        mean_attr = map_attr.mean().item()
+        
+        # Calculate overlap ratio relative to activations
+        overlap_mean = overlap.mean().item()
+        
         self.debug_logger.debug(
-            f"[{name}] mean_norm={norms.mean().item():.4f} | "
-            f"std_norm={norms.std().item():.4f} | "
-            f"min_norm={norms.min().item():.4f} | "
-            f"max_norm={norms.max().item():.4f}"
-        )
-
-    def log_orthogonality_stats(self, id_embeds, cloth_embeds, loss_value):
-        """记录正交性统计信息"""
-        id_norm = F.normalize(id_embeds, dim=-1, eps=1e-8)
-        cloth_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-8)
-        cosine_sim = (id_norm * cloth_norm).sum(dim=-1)
-
-        self.debug_logger.debug(
-            f"[Orthogonal] cosine_sim: mean={cosine_sim.mean().item():.4f} | "
-            f"std={cosine_sim.std().item():.4f} | "
-            f"min={cosine_sim.min().item():.4f} | "
-            f"max={cosine_sim.max().item():.4f} | "
+            f"[SpatialOrtho] mean_id={mean_id:.4f} | "
+            f"mean_attr={mean_attr:.4f} | "
+            f"overlap={overlap_mean:.6f} | "
             f"loss={loss_value.item():.6f}"
         )
 
-    def log_anti_collapse_stats(self, features, target_norm, margin_ratio, loss_value):
-        """记录防坍缩统计信息"""
-        norms = torch.norm(features, p=2, dim=-1)
-        feature_std = features.std(dim=0)
-
-        self.debug_logger.debug(
-            f"[AntiCollapse] target_norm={target_norm:.2f} | "
-            f"actual_mean_norm={norms.mean().item():.2f} | "
-            f"margin={target_norm * margin_ratio:.2f} | "
-            f"norm_loss={F.relu(target_norm * margin_ratio - norms).mean().item():.6f} | "
-            f"collapse_loss={F.relu(0.01 - feature_std).mean().item():.6f} | "
-            f"total_loss={loss_value.item():.6f}"
-        )
-
-    def log_reconstruction_stats(self, id_feat, attr_feat, original_feat, loss_value):
-        """记录重构统计信息"""
-        reconstructed = id_feat + attr_feat
-
+    def log_reconstruction_stats(self, recon_feat, target_feat, loss_value):
+        """记录重构统计信息 (AH-Net)"""
         # 计算重构误差
-        mse_error = F.mse_loss(reconstructed, original_feat)
+        mse_error = F.mse_loss(recon_feat, target_feat)
 
         # 计算能量保留率
-        recon_energy = torch.norm(reconstructed, p=2, dim=-1).mean()
-        orig_energy = torch.norm(original_feat, p=2, dim=-1).mean()
-        energy_ratio = (recon_energy / orig_energy).item()
+        recon_energy = torch.norm(recon_feat, p=2, dim=-1).mean()
+        target_energy = torch.norm(target_feat, p=2, dim=-1).mean()
+        energy_ratio = (recon_energy / (target_energy + 1e-8)).item()
 
         # 计算方向一致性
-        recon_norm = F.normalize(reconstructed, dim=-1, eps=1e-8)
-        orig_norm = F.normalize(original_feat, dim=-1, eps=1e-8)
-        cosine_sim = (recon_norm * orig_norm).sum(dim=-1).mean().item()
+        recon_norm = F.normalize(recon_feat, dim=-1, eps=1e-8)
+        target_norm = F.normalize(target_feat, dim=-1, eps=1e-8)
+        cosine_sim = (recon_norm * target_norm).sum(dim=-1).mean().item()
 
         self.debug_logger.debug(
             f"[Reconstruction] mse={mse_error.item():.6f} | "
@@ -131,31 +113,6 @@ class LossLogger:
             f"loss={loss_value.item():.4f}"
         )
 
-    def log_cls_stats(self, logits, pids, loss_value):
-        """记录分类损失统计"""
-        # 计算预测准确率
-        preds = torch.argmax(logits, dim=-1)
-        accuracy = (preds == pids).float().mean().item()
-
-        # 计算Top-5准确率
-        _, top5_preds = torch.topk(logits, k=5, dim=-1)
-        top5_accuracy = (top5_preds == pids.unsqueeze(1)).any(dim=1).float().mean().item()
-
-        # 计算置信度
-        probs = F.softmax(logits, dim=-1)
-        confidence = probs.max(dim=-1)[0].mean().item()
-
-        # 计算熵
-        entropy = -(probs * torch.log(probs + 1e-10)).sum(dim=-1).mean().item()
-
-        self.debug_logger.debug(
-            f"[CLS] accuracy={accuracy:.4f} | "
-            f"top5_accuracy={top5_accuracy:.4f} | "
-            f"confidence={confidence:.4f} | "
-            f"entropy={entropy:.4f} | "
-            f"loss={loss_value.item():.4f}"
-        )
-
     def log_cloth_semantic_stats(self, cloth_image, cloth_text, loss_value, temperature=0.1):
         """记录服装语义损失统计"""
         cloth_image_norm = F.normalize(cloth_image, dim=-1, eps=1e-8)
@@ -178,13 +135,17 @@ class LossLogger:
         weighted_losses = {k: weights.get(k, 0) * v.item() if isinstance(v, torch.Tensor) else weights.get(k, 0) * v
                           for k, v in losses.items() if k != 'total'}
 
-        total = weighted_losses['total'] if 'total' in weighted_losses else sum(weighted_losses.values())
+        total = losses.get('total', sum(weighted_losses.values()))
+        if isinstance(total, torch.Tensor):
+            total = total.item()
 
         self.debug_logger.debug("=== Weighted Loss Summary ===")
-        for k in ['info_nce', 'cls', 'cloth_semantic', 'orthogonal', 'id_triplet', 'anti_collapse', 'reconstruction']:
+        # AH-Net Losses
+        for k in ['info_nce', 'id_triplet', 'cloth_semantic', 'reconstruction', 'spatial_orthogonal']:
             if k in weighted_losses and weights.get(k, 0) > 0:
-                ratio = (weighted_losses[k] / total * 100) if total > 0 else 0
+                val = weighted_losses[k]
+                ratio = (val / total * 100) if total > 0 else 0
                 self.debug_logger.debug(
-                    f"  {k:15s}: {weighted_losses[k]:.6f} (weight={weights.get(k, 0):.2f}, {ratio:5.2f}%)"
+                    f"  {k:20s}: {val:.6f} (weight={weights.get(k, 0):.2f}, {ratio:5.2f}%)"
                 )
-        self.debug_logger.debug(f"  {'total':15s}: {total:.6f}")
+        self.debug_logger.debug(f"  {'total':20s}: {total:.6f}")

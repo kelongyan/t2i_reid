@@ -312,5 +312,61 @@ class TrainingMonitor:
     def log_disentangle_info(self, id_feat, cloth_feat, gate=None):
         self.log_gs3_module_info(id_feat, cloth_feat, gate_stats=gate if isinstance(gate, dict) else None)
 
+    def log_conflict_score(self, conflict_score, step_name=""):
+        """
+        🔥 方案书 Phase 3: Conflict Score 日志追踪
+
+        核心指标：衡量 ID 和 Attr 注意力图的空间重叠程度
+        - conflict_score 高 → 解耦失败 → 图像特征不可信
+        - conflict_score 低 → 解耦成功 → 图像特征可信
+
+        Args:
+            conflict_score: [B] 冲突分数
+            step_name: 步骤名称 (用于日志区分)
+        """
+        if conflict_score is None:
+            return
+
+        # 转为 numpy 便于统计
+        if isinstance(conflict_score, torch.Tensor):
+            scores = conflict_score.detach().cpu().numpy()
+        else:
+            scores = conflict_score
+
+        # 统计信息
+        mean_score = scores.mean()
+        std_score = scores.std()
+        min_score = scores.min()
+        max_score = scores.max()
+
+        # 分档统计
+        low_conflict = (scores < 0.01).sum()   # < 1% 重叠 → 优秀
+        mid_conflict = (scores >= 0.01) & (scores < 0.05)  # 1-5% → 良好
+        high_conflict = (scores >= 0.05) & (scores < 0.1)  # 5-10% → 一般
+        severe_conflict = (scores >= 0.1)  # > 10% → 差
+
+        # 记录到 debug.txt
+        self.debug_logger.debug(
+            f"[Conflict Score{step_name}] "
+            f"mean={mean_score:.6f} std={std_score:.6f} | "
+            f"min={min_score:.6f} max={max_score:.6f}"
+        )
+        self.debug_logger.debug(
+            f"  Distribution: "
+            f"Excellent(<1%)={low_conflict} Good(1-5%)={mid_conflict} "
+            f"Fair(5-10%)={high_conflict} Poor(>10%)={severe_conflict}"
+        )
+
+        # 异常检测：如果平均冲突分数过高，发出警告
+        if mean_score > 0.1:
+            self.debug_logger.warning(
+                f"⚠️  [Conflict Score{step_name}] Average conflict too high: {mean_score:.4f} "
+                f"(Expected < 0.05). Decoupling quality is poor!"
+            )
+        elif mean_score < 0.02:
+            self.debug_logger.info(
+                f"✅ [Conflict Score{step_name}] Excellent decoupling quality: {mean_score:.4f}"
+            )
+
 def get_monitor_for_dataset(dataset_name: str, log_dir: str = "log") -> "TrainingMonitor":
     return TrainingMonitor(dataset_name=dataset_name, log_dir=log_dir)

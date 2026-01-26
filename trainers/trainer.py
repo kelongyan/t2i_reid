@@ -46,16 +46,13 @@ class Trainer:
         self.runner = runner  # 添加runner引用以便调用freeze方法
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === 🔥 方案B：频域对齐损失版权重配置（移除CLS损失）===
-        # 新的权重配置：
-        #   - 移除 'cls' 损失（已废弃）
-        #   - 新增 'frequency_alignment' 损失（替代CLS）
+        # === 🔥 AH-Net 损失权重配置 ===
         default_loss_weights = {
             'info_nce': 1.0,               # 对比学习 - 主任务
-            'id_triplet': 1.0,             # ID一致性 (保持）
-            'cloth_semantic': 0.5,         # 服装语义对齐 (保持）
-            'orthogonal': 0.05,            # 正交约束 (保持）
-            'frequency_alignment': 0.3,    # 频域对齐 (新增，替代CLS）
+            'id_triplet': 1.0,             # ID一致性
+            'cloth_semantic': 0.5,         # 服装语义对齐
+            'spatial_orthogonal': 0.1,     # 空间互斥
+            'reconstruction': 0.5,         # 结构重构
         }
         
         # 从配置文件获取损失权重，合并默认值
@@ -64,14 +61,13 @@ class Trainer:
             if key not in loss_weights:
                 loss_weights[key] = value
         
-        # 初始化Loss模块
-        self.combined_loss = Loss(temperature=0.1, weights=loss_weights, logger=monitor).to(self.device)
-        
-        # === 设置语义引导模块到Loss（关键！）===
-        if hasattr(model, 'semantic_guidance'):
-            self.combined_loss.set_semantic_guidance(model.semantic_guidance)
-            if self.monitor:
-                self.monitor.debug_logger.info("✅ Semantic guidance module connected to Loss system")
+        # 初始化Loss模块 (包含语义引导模块)
+        self.combined_loss = Loss(
+            temperature=0.1,
+            weights=loss_weights,
+            logger=monitor,
+            semantic_guidance=model.semantic_guidance  # 🔥 传递语义引导模块
+        ).to(self.device)
         
         # === 新增：初始化可视化器 ===
         visualize_config = getattr(args, 'visualization', {})
@@ -234,24 +230,24 @@ class Trainer:
                             image_embeds_raw, return_freq_info=True
                         )
             
-            # === 损失计算（方案B：频域对齐损失版）===
-            # 注意：id_logits和id_cls_features保留参数以保持向后兼容，但传入None
+            # === 损失计算（方案书完整版）===
+            # aux_info (通过 freq_info 参数传入) 包含 conflict_score, attention maps 等
             loss_dict = self.combined_loss(
                 image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
                 id_logits=None, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
                 cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
                 pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                id_cls_features=None, original_feat=original_feat,
-                freq_info=freq_info  # 【新增】传递频域信息用于frequency_alignment损失
+                freq_info=freq_info  # 包含 conflict_score 的 aux_info
             )
 
-        # === 可视化回调 ===
+            # 可视化回调
         if self.visualizer is not None and batch_idx % self.visualize_batch_interval == 0:
-            # 频域掩码可视化
+            # 频域掩码可视化 (Now maps to AH-Net Attention Maps)
             if freq_info is not None:
-                self.visualizer.plot_frequency_masks(freq_info, epoch, batch_idx)
+                # Pass original images for overlay
+                self.visualizer.plot_frequency_masks(freq_info, epoch, batch_idx, images=image)
                 
-                # 频域能量谱
+                # 频域能量谱 (Stubbed)
                 if 'freq_magnitude' in freq_info:
                     self.visualizer.plot_frequency_energy_spectrum(freq_info, epoch, batch_idx)
             
@@ -271,11 +267,20 @@ class Trainer:
                 self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
                 self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
                 
-                # 频域对齐损失统计（新增）
-                if 'frequency_alignment' in loss_dict:
+                # AH-Net 损失统计
+                if 'reconstruction' in loss_dict:
                     self.monitor.debug_logger.debug(
-                        f"Frequency Alignment Loss: {loss_dict['frequency_alignment'].item():.6f}"
+                        f"Reconstruction Loss: {loss_dict['reconstruction'].item():.6f}"
                     )
+
+            # 🔥 方案书 Phase 3: Conflict Score 日志追踪
+            # 记录解耦质量的核心指标
+            if freq_info is not None and isinstance(freq_info, dict):
+                conflict_score = freq_info.get('conflict_score')
+                if conflict_score is not None and self.monitor:
+                    # 每200个batch记录一次详细的conflict_score统计
+                    if batch_idx % 200 == 0:
+                        self.monitor.log_conflict_score(conflict_score, step_name=f"_E{epoch}_B{batch_idx}")
 
             # gate_stats是dict，记录统计信息
             if gate_stats is not None and isinstance(gate_stats, dict):
@@ -284,14 +289,7 @@ class Trainer:
                     f"Attr[{gate_stats.get('gate_attr_mean', 0):.4f}], "
                     f"Diversity[{gate_stats.get('diversity', 0):.4f}]"
                 )
-                
-                # 【新增】频域信息记录
-                if 'freq_type' in gate_stats:
-                    self.monitor.debug_logger.debug(
-                        f"Frequency: type={gate_stats.get('freq_type')}, "
-                        f"energy={gate_stats.get('low_freq_energy', 0):.4f}"
-                    )
-            
+
             if gate_weights is not None:
                 self.monitor.log_gate_weights(gate_weights, "fusion_gate")
 
@@ -305,9 +303,10 @@ class Trainer:
 
     def _format_loss_display(self, loss_meters):
         # 格式化损失显示，按指定顺序排列并隐藏特定项
-        # [Modify] 移除 'cls'，添加 'frequency_alignment'
-        display_order = ['info_nce', 'frequency_alignment', 'cloth_semantic', 'id_triplet', 'orthogonal', 'total']
-        
+        # [Modify] 适配 AH-Net + 方案书 Phase 3
+        display_order = ['info_nce', 'reconstruction', 'cloth_semantic', 'id_triplet',
+                        'spatial_orthogonal', 'semantic_alignment', 'total']
+
         avg_losses = []
         for key in display_order:
             if key in loss_meters and loss_meters[key].count > 0:

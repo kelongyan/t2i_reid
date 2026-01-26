@@ -1,58 +1,56 @@
 #!/bin/bash
 
 # ============================================================================
-# RSTPReid Training Script - FSHD-Net Version
+# RSTPReid Training Script - AH-Net Version
 # ============================================================================
-# 支持FSHD模块配置
-# 预期效果：
-#   - FSHD-Full: mAP 78-81%
-#   - FSHD-Lite: mAP 77-80%
+# AH-Net: Asymmetric Heterogeneous Network
+# 核心特性：
+#   • 不对称双流架构 (Mamba结构流 + CNN纹理流)
+#   • 空间结构解耦
+#   • 原型引导的语义交互
+#   • 空间互斥与重构损失
 # ============================================================================
 
-# 默认参数配置（FSHD-Full完整版）
-DISENTANGLE_TYPE="fshd"
-USE_MULTI_SCALE_CNN=true
+# 默认参数配置
+DISENTANGLE_TYPE="ahnet"  # ahnet | simple
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
 
-echo "🔥 默认配置: FSHD-Full (disentangle=fshd, multi_scale_cnn=true, visualization=true)"
-echo "   可通过参数覆盖，例如: bash rstp.sh --disentangle-type=simple --no-viz"
+echo "=========================================="
+echo "  RSTPReid Training Script"
+echo "  Architecture: AH-Net (Asymmetric Heterogeneous Network)"
+echo "=========================================="
+echo ""
+echo "默认配置: disentangle=ahnet, visualization=true"
+echo "参数覆盖示例: bash rstp.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
-        --disentangle-type=*) 
+        --disentangle-type=*)
             DISENTANGLE_TYPE="${arg#*=}"
             shift
-            ;; 
-        --use-cnn) 
-            USE_MULTI_SCALE_CNN=true
-            shift
-            ;; 
-        --no-cnn) 
-            USE_MULTI_SCALE_CNN=false
-            shift
-            ;; 
-        --no-viz) 
+            ;;
+        --no-viz)
             ENABLE_VISUALIZATION=false
             shift
-            ;; 
-        --resume=*) 
+            ;;
+        --resume=*)
             RESUME_PATH="${arg#*=}"
             shift
-            ;; 
-        *) 
+            ;;
+        *)
             shift
-            ;; 
+            ;;
     esac
 done
 
-# 清理缓存
+# 清理Python缓存
+echo "清理缓存文件..."
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
-# JSON Config String (Single quoted for safety)
-# 注意：已更新为使用新版 caption_all.json（包含大模型生成的精细化描述）
+# JSON Config String
 DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/caption_all.json'}]"
 
 # 构建基础命令
@@ -62,13 +60,13 @@ CMD="python scripts/train.py \
     --batch-size 64 \
     --lr 0.00003 \
     --weight-decay 0.0001 \
-    --epochs 50 \
-    --milestones 25 40 \
+    --epochs 120 \
+    --milestones 50 80 \
     --warmup-step 800 \
     --workers 8 \
     --height 224 \
     --width 224 \
-    --print-freq 50 \
+    --print-freq 200 \
     --fp16 \
     --num-classes 3701 \
     --clip-pretrained \"pretrained/clip-vit-base-patch16\" \
@@ -76,71 +74,99 @@ CMD="python scripts/train.py \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
 # 添加解耦模块配置
-CMD="$CMD \
-    --disentangle-type $DISENTANGLE_TYPE"
+CMD="$CMD --disentangle-type $DISENTANGLE_TYPE"
 
-if [ "$DISENTANGLE_TYPE" = "fshd" ]; then
-    CMD="$CMD \
-    --gs3-use-multi-scale-cnn $USE_MULTI_SCALE_CNN \
-    --gs3-img-size 14 14"
-    echo "🔥 使用FSHD模块: multi_scale_cnn=$USE_MULTI_SCALE_CNN (Frequency: DCT fixed)"
+if [ "$DISENTANGLE_TYPE" = "ahnet" ] || [ "$DISENTANGLE_TYPE" = "fshd" ]; then
+    CMD="$CMD --gs3-img-size 14 14"
+    echo "✓ 解耦模块: AH-Net (Mamba Structure + CNN Texture)"
 else
-    echo "🔧 使用简化解耦模块"
+    echo "✓ 解耦模块: Simple"
 fi
 
+# AH-Net 配置参数
 CMD="$CMD \
     --gs3-num-heads 8 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
-    --gs3-dropout 0.15 \
+    --gs3-dropout 0.15"
+
+# Fusion 配置 (SAMG-RCSM)
+CMD="$CMD \
     --fusion-type \"samg_rcsm\" \
     --fusion-dim 768 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 3 \
     --fusion-output-dim 256 \
-    --fusion-dropout 0.15 \
+    --fusion-dropout 0.15"
+
+# 投影维度
+CMD="$CMD \
     --id-projection-dim 768 \
-    --cloth-projection-dim 768 \
+    --cloth-projection-dim 768"
+
+# 优化器配置
+CMD="$CMD \
     --optimizer \"AdamW\" \
-    --scheduler \"cosine\" \
+    --scheduler \"cosine\""
+
+# 损失权重配置 (AH-Net + 方案书 Phase 3)
+CMD="$CMD \
     --loss-info-nce 1.0 \
-    --loss-frequency-alignment 0.3 \
+    --loss-id-triplet 1.0 \
     --loss-cloth-semantic 0.5 \
-    --loss-orthogonal 0.05 \
-    --loss-id-triplet 1.0"
+    --loss-reconstruction 0.5 \
+    --loss-spatial-orthogonal 0.1 \
+    --loss-semantic-alignment 0.1"
 
-echo "🔥 System Configuration (方案B: Frequency Alignment Loss v3.0):"
-echo "   • Architecture: Pyramid Text Encoder + FSHD (OFC-Gate) + SAMG-RCSM Fusion"
-echo "   • Fusion Dim: 768 (Matched to Backbone)"
-echo "   • Gating: OFC-Gate (Physics-Aware + Ortho-Suppression)"
-echo "   • Loss Weights: Optimized (Orth=0.3, Anti-Collapse=1.5)"
-echo "   • Prompts: 7+23 Fine-grained Templates"
-
+# 可视化配置
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \
     --visualization-enabled \
     --visualization-save-dir \"visualizations/rstp_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
+    echo "✓ 可视化: enabled (visualizations/rstp_${DISENTANGLE_TYPE})"
+else
+    echo "✓ 可视化: disabled"
 fi
 
+# Resume training
 if [ -n "$RESUME_PATH" ]; then
     CMD="$CMD --resume \"$RESUME_PATH\""
+    echo "✓ 从检查点恢复: $RESUME_PATH"
 fi
 
 echo ""
-echo "🚀 开始训练 RSTPReid 数据集 (${DISENTANGLE_TYPE}模式)"
-echo "Executing command..."
+echo "=========================================="
+echo "  配置摘要"
+echo "=========================================="
+echo "数据集: RSTPReid (3,701 IDs)"
+echo "架构: AH-Net (Asymmetric Heterogeneous) + S-CAG Fusion"
+echo "创新点: Conflict Score驱动动态融合"
+echo "训练轮数: 120 epochs (数据集较小，训练更长)"
+echo "损失权重: info_nce=1.0, id_triplet=1.0, cloth_semantic=0.5"
+echo "        reconstruction=0.5, spatial_orthogonal=0.1"
+echo "        semantic_alignment=0.1 (Phase 3)"
+echo "=========================================="
+echo ""
+echo "🚀 开始训练..."
 echo ""
 
+# 执行训练
 eval $CMD
 
 exit_code=$?
+
+echo ""
 if [ $exit_code -eq 0 ]; then
+    echo "=========================================="
     echo "✅ RSTPReid 训练完成！"
+    echo "=========================================="
 else
-    echo "❌ RSTPReid 训练失败，退出码：$exit_code"
+    echo "=========================================="
+    echo "❌ 训练失败 (退出码: $exit_code)"
+    echo "=========================================="
 fi
 
 exit $exit_code
