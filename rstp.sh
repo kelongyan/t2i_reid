@@ -1,59 +1,60 @@
 #!/bin/bash
 
 # ============================================================================
-# RSTPReid Training Script - AH-Net Version
+# RSTPReid Training Script - Updated Version
 # ============================================================================
-# AH-Net: Asymmetric Heterogeneous Network
-# 核心特性：
-#   • 不对称双流架构 (Mamba结构流 + CNN纹理流)
-#   • 空间结构解耦
-#   • 原型引导的语义交互
-#   • 空间互斥与重构损失
+# Current Architecture: CLIP + Vision Mamba (Vim) with Disentanglement Module
+# Core Features:
+#   • CLIP-based Text-Image ReID
+#   • Vision Mamba backbone
+#   • Disentanglement module (AH-Net)
+#   • Multi-modal fusion
 # ============================================================================
 
-# 默认参数配置
+# Default parameter configuration
 DISENTANGLE_TYPE="ahnet"  # ahnet | simple
 ENABLE_VISUALIZATION=true
 RESUME_PATH=""
+FINETUNE_FROM=""
 
 echo "=========================================="
 echo "  RSTPReid Training Script"
-echo "  Architecture: AH-Net (Asymmetric Heterogeneous Network)"
+echo "  Architecture: CLIP + Vision Mamba with Disentanglement"
 echo "=========================================="
 echo ""
-echo "默认配置: disentangle=ahnet, visualization=true"
-echo "参数覆盖示例: bash rstp.sh --disentangle-type=simple --no-viz"
+echo "Default config: disentangle=ahnet, visualization=true"
+echo "Parameter override examples: bash rstp.sh --disentangle-type=simple --no-viz"
 echo ""
 
 for arg in "$@"; do
     case $arg in
         --disentangle-type=*)
             DISENTANGLE_TYPE="${arg#*=}"
-            shift
             ;;
         --no-viz)
             ENABLE_VISUALIZATION=false
-            shift
             ;;
         --resume=*)
             RESUME_PATH="${arg#*=}"
-            shift
+            ;;
+        --finetune-from=*)
+            FINETUNE_FROM="${arg#*=}"
             ;;
         *)
-            shift
+            echo "Unknown option: $arg"
             ;;
     esac
 done
 
-# 清理Python缓存
-echo "清理缓存文件..."
+# Clean Python cache
+echo "Cleaning cache files..."
 find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find . -type f -name "*.pyc" -delete 2>/dev/null || true
 
 # JSON Config String
-DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid/imgs', 'json_file': 'RSTPReid/annotations/caption_all.json'}]"
+DATASET_CONFIG="[{'name': 'RSTPReid', 'root': 'RSTPReid', 'json_file': 'RSTPReid/annotations/caption_all.json'}]"
 
-# 构建基础命令
+# Build base command
 CMD="python scripts/train.py \
     --root datasets \
     --dataset-configs \"${DATASET_CONFIG}\" \
@@ -66,94 +67,107 @@ CMD="python scripts/train.py \
     --workers 8 \
     --height 224 \
     --width 224 \
-    --print-freq 200 \
-    --fp16 \
-    --num-classes 3701 \
-    --clip-pretrained \"pretrained/clip-vit-base-patch16\" \
+     --print-freq 200 \
+     --fp16 \
+     --num-classes 4101 \
+     --clip-pretrained \"pretrained/clip-vit-base-patch16\" \
     --vision-backbone vim \
     --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
 
-# 添加解耦模块配置
+# Add disentangle module configuration
 CMD="$CMD --disentangle-type $DISENTANGLE_TYPE"
 
-if [ "$DISENTANGLE_TYPE" = "ahnet" ] || [ "$DISENTANGLE_TYPE" = "fshd" ]; then
+if [ "$DISENTANGLE_TYPE" = "ahnet" ]; then
     CMD="$CMD --gs3-img-size 14 14"
-    echo "✓ 解耦模块: AH-Net (Mamba Structure + CNN Texture)"
+    echo "✓ Disentangle module: AH-Net (Mamba Structure + CNN Texture)"
 else
-    echo "✓ 解耦模块: Simple"
+    echo "✓ Disentangle module: Simple"
 fi
 
-# AH-Net 配置参数
+# FSHD/AH-Net configuration parameters
 CMD="$CMD \
     --gs3-num-heads 8 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
-    --gs3-dropout 0.15"
+    --gs3-dropout 0.1"
 
-# Fusion 配置 (SAMG-RCSM)
+# Fusion configuration
 CMD="$CMD \
-    --fusion-type \"samg_rcsm\" \
-    --fusion-dim 768 \
+    --fusion-type \"enhanced_mamba\" \
+    --fusion-dim 256 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
-    --fusion-num-layers 3 \
+    --fusion-num-layers 2 \
     --fusion-output-dim 256 \
-    --fusion-dropout 0.15"
+    --fusion-dropout 0.1"
 
-# 投影维度
+# Projection dimensions
 CMD="$CMD \
     --id-projection-dim 768 \
     --cloth-projection-dim 768"
 
-# 优化器配置
+# Optimizer configuration
 CMD="$CMD \
     --optimizer \"AdamW\" \
     --scheduler \"cosine\""
 
-# 损失权重配置 (AH-Net + 方案书 Phase 3)
+# Loss weights configuration (🔥 修复后的权重)
+# 修复说明：id_triplet 从 10.0 降到 2.0，cloth_semantic 从 0.01 提升到 0.1
+# Phase 1 初始值，后续会被 CurriculumScheduler 动态调整
 CMD="$CMD \
     --loss-info-nce 1.0 \
-    --loss-id-triplet 1.0 \
-    --loss-cloth-semantic 0.5 \
-    --loss-reconstruction 0.5 \
-    --loss-spatial-orthogonal 0.1 \
-    --loss-semantic-alignment 0.1"
+    --loss-id-triplet 2.0 \
+    --loss-cloth-semantic 0.1 \
+    --loss-spatial-orthogonal 0.0 \
+    --loss-semantic-alignment 0.0 \
+    --loss-ortho-reg 0.0 \
+    --loss-adversarial-attr 0.0 \
+    --loss-adversarial-domain 0.0 \
+    --loss-discriminator-attr 0.0 \
+    --loss-discriminator-domain 0.0"
 
-# 可视化配置
+# Visualization configuration
 if [ "$ENABLE_VISUALIZATION" = true ]; then
     CMD="$CMD \
     --visualization-enabled \
     --visualization-save-dir \"visualizations/rstp_${DISENTANGLE_TYPE}\" \
     --visualization-frequency 5 \
     --visualization-batch-interval 200"
-    echo "✓ 可视化: enabled (visualizations/rstp_${DISENTANGLE_TYPE})"
+    echo "✓ Visualization: enabled (visualizations/rstp_${DISENTANGLE_TYPE})"
 else
-    echo "✓ 可视化: disabled"
+    echo "✓ Visualization: disabled"
 fi
 
 # Resume training
 if [ -n "$RESUME_PATH" ]; then
     CMD="$CMD --resume \"$RESUME_PATH\""
-    echo "✓ 从检查点恢复: $RESUME_PATH"
+    echo "✓ Resuming from checkpoint: $RESUME_PATH"
+fi
+
+# Finetune from checkpoint
+if [ -n "$FINETUNE_FROM" ]; then
+    CMD="$CMD --finetune-from \"$FINETUNE_FROM\""
+    echo "✓ Finetuning from checkpoint: $FINETUNE_FROM"
 fi
 
 echo ""
 echo "=========================================="
-echo "  配置摘要"
+echo "  Configuration Summary"
 echo "=========================================="
-echo "数据集: RSTPReid (3,701 IDs)"
-echo "架构: AH-Net (Asymmetric Heterogeneous) + S-CAG Fusion"
-echo "创新点: Conflict Score驱动动态融合"
-echo "训练轮数: 120 epochs (数据集较小，训练更长)"
-echo "损失权重: info_nce=1.0, id_triplet=1.0, cloth_semantic=0.5"
-echo "        reconstruction=0.5, spatial_orthogonal=0.1"
-echo "        semantic_alignment=0.1 (Phase 3)"
+echo "Dataset: RSTPReid (4,101 IDs)"
+echo "Architecture: CLIP + Vision Mamba with Disentanglement Module"
+echo "Features: Multi-modal fusion, AH-Net disentanglement"
+echo "Epochs: 120 (smaller dataset, longer training)"
+echo "🔥 Loss weights (Phase 1 Initial - Fixed):"
+echo "              info_nce=1.0, id_triplet=2.0, cloth_semantic=0.1"
+echo "              spatial_orthogonal=0.0, semantic_alignment=0.0, ortho_reg=0.0"
+echo "              (Dynamic adjustment by CurriculumScheduler)"
 echo "=========================================="
 echo ""
-echo "🚀 开始训练..."
+echo "🚀 Starting training..."
 echo ""
 
-# 执行训练
+# Execute training
 eval $CMD
 
 exit_code=$?
@@ -161,11 +175,11 @@ exit_code=$?
 echo ""
 if [ $exit_code -eq 0 ]; then
     echo "=========================================="
-    echo "✅ RSTPReid 训练完成！"
+    echo "✅ RSTPReid Training completed!"
     echo "=========================================="
 else
     echo "=========================================="
-    echo "❌ 训练失败 (退出码: $exit_code)"
+    echo "❌ Training failed (Exit code: $exit_code)"
     echo "=========================================="
 fi
 

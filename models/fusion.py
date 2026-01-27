@@ -123,31 +123,48 @@ class SCAG_Gate(nn.Module):
     语义置信度感知门控 (Semantic-Confidence Aware Gating)
 
     核心创新：
-    - 不再依赖频谱能量比 (energy_ratio)
     - 使用冲突分数 (conflict_score) 来衡量解耦质量
     - conflict_score 高 → 解耦失败 → 降低图像权重 → "弃图保文"
     - conflict_score 低 → 解耦成功 → 提升图像权重 → "图文并重"
-
-    这是方案书的核心设计，相比 SAMG 实现了从"物理统计"到"语义质量"的跨越。
     """
-    def __init__(self, dim):
+    def __init__(self, dim, temperature=1.0):
         super().__init__()
+        self.temperature = temperature  # 🔥 从0.1增加到1.0，让门控更平滑
 
-        # Confidence MLP: 将冲突分数转换为置信度权重
-        # conflict_score ∈ [0, 1] → confidence ∈ [0, 1]
-        # 冲突分数高 → 置信度低 (解耦失败)
-        # 冲突分数低 → 置信度高 (解耦成功)
+        # Confidence MLP: 将冲突分数转换为置信度权重的修正量
         self.confidence_mlp = nn.Sequential(
             nn.Linear(1, dim // 4),
+            nn.LayerNorm(dim // 4),
             nn.ReLU(),
+            nn.Dropout(0.1),
             nn.Linear(dim // 4, dim // 2),
+            nn.LayerNorm(dim // 2),
             nn.ReLU(),
-            nn.Linear(dim // 2, dim),
-            nn.Sigmoid()  # 输出 0~1 的置信度权重
+            nn.Linear(dim // 2, dim)
+            # 移除最后的 Sigmoid，改在 forward 中统一处理
         )
 
         # 互查询分支 (保留原 SAMG 的逻辑，用于特征交互)
         self.mutual_proj = nn.Linear(dim * 2, dim * 2)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        """🔥 初始化权重"""
+        for m in self.confidence_mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+        
+        # 最后一层初始化为接近0，使得初始状态主要由 conflict_score 决定
+        if isinstance(self.confidence_mlp[-1], nn.Linear):
+            nn.init.constant_(self.confidence_mlp[-1].weight, 0)
+            nn.init.constant_(self.confidence_mlp[-1].bias, 0)
+
+        nn.init.xavier_normal_(self.mutual_proj.weight, gain=1.0)
+        if self.mutual_proj.bias is not None:
+            nn.init.constant_(self.mutual_proj.bias, 0)
 
     def forward(self, id_feat, attr_feat, conflict_score):
         """
@@ -159,29 +176,63 @@ class SCAG_Gate(nn.Module):
         Returns:
             id_out: [B, D] 门控后的 ID 特征
             attr_out: [B, D] 门控后的 Attr 特征
-            confidence_weight: [B, D] 置信度权重 (用于日志记录)
+            confidence_weight: [B, D] 置信度权重
         """
+        # 🔥 添加NaN检测，防止数值不稳定
+        if torch.isnan(id_feat).any() or torch.isnan(attr_feat).any():
+            # 如果输入有NaN，返回安全的默认值
+            B, D = id_feat.shape
+            device = id_feat.device
+            return (
+                torch.zeros_like(id_feat),
+                torch.zeros_like(attr_feat),
+                torch.ones(B, D, device=device) * 0.5
+            )
+        
         if conflict_score.dim() == 1:
             conflict_score = conflict_score.unsqueeze(1)  # [B, 1]
-
+        
         # 1. 计算置信度权重
-        # conflict_score 高 → confidence 低 → 降低图像权重
-        # conflict_score 低 → confidence 高 → 提升图像权重
-        confidence_weight = self.confidence_mlp(conflict_score)  # [B, D]
-
-        # 2. 互查询门控 (保留原 SAMG 的特征交互逻辑)
+        # 基础逻辑：Conflict 高 -> Confidence 低
+        # Base Confidence: 1.0 - conflict_score
+        base_confidence = 1.0 - conflict_score
+        
+        # MLP 学习的是针对每个维度的精细调整 (Residual correction)
+        delta_confidence = self.confidence_mlp(conflict_score) # [B, D]
+        
+        # 🔥 添加中间结果NaN检测
+        if torch.isnan(delta_confidence).any():
+            delta_confidence = torch.zeros_like(delta_confidence)
+        
+        # 结合并应用温度缩放
+        # Logit = (Base + Delta) / T
+        # Sigmoid(Logit) 将在 0 或 1 附近饱和，避免停留在 0.5
+        logits = (base_confidence + delta_confidence) / self.temperature
+        
+        # 🔥 限制logit范围，防止sigmoid数值不稳定
+        logits = torch.clamp(logits, min=-10, max=10)
+        confidence_weight = torch.sigmoid(logits)  # [B, D]
+        
+        # 2. 互查询门控
         joint_feat = torch.cat([id_feat, attr_feat], dim=-1)  # [B, 2D]
         raw_gates = self.mutual_proj(joint_feat)  # [B, 2D]
+        
+        # 🔥 添加NaN检测
+        if torch.isnan(raw_gates).any():
+            raw_gates = torch.zeros_like(raw_gates)
+        
         raw_gates = raw_gates.view(-1, 2, id_feat.shape[-1])  # [B, 2, D]
         gates = F.softmax(raw_gates, dim=1)  # [B, 2, D]
 
         g_id = gates[:, 0, :]     # [B, D]
         g_attr = gates[:, 1, :]   # [B, D]
 
-        # 3. 应用置信度调节
-        # 这是核心创新点：根据解耦质量动态调整图像特征权重
-        id_out = id_feat * g_id * confidence_weight
-        attr_out = attr_feat * g_attr * confidence_weight
+        # 3. 应用置信度调节 + 🔥 添加Residual Connection
+        # 原始方案：完全替换特征
+        # 改进方案：保留部分原始特征，避免信息丢失
+        alpha = 0.7  # Residual权重
+        id_out = alpha * (id_feat * g_id * confidence_weight) + (1 - alpha) * id_feat
+        attr_out = alpha * (attr_feat * g_attr * confidence_weight) + (1 - alpha) * attr_feat
 
         return id_out, attr_out, confidence_weight
 
@@ -252,6 +303,9 @@ class ScagRcsmFusion(nn.Module):
         super().__init__()
         self.scag = SCAG_Gate(dim)
         self.rcsm = RCSM_Fusion(dim, output_dim=output_dim, **kwargs)
+        
+        # 🔥 添加维度投影用于residual connection
+        self.residual_proj = nn.Linear(dim, output_dim)
 
     def forward(self, img_id, img_attr, txt_id, txt_attr, conflict_score):
         """
@@ -266,6 +320,12 @@ class ScagRcsmFusion(nn.Module):
 
         # RCSM 融合
         fused_embeds = self.rcsm(img_id_gated, img_attr_gated, txt_id, txt_attr)
+        
+        # 🔥 添加Multi-modal Residual Connection
+        # 投影img_id到输出维度，然后加权融合
+        residual_weight = 0.3
+        img_id_proj = self.residual_proj(img_id)
+        fused_embeds = (1 - residual_weight) * fused_embeds + residual_weight * img_id_proj
 
         return fused_embeds, confidence_weight
 

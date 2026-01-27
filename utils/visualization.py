@@ -81,20 +81,21 @@ class FSHDVisualizer:
         overlay = cv2.addWeighted(image, 1 - alpha, heatmap, alpha, 0)
         return overlay, attn_resized
 
-    def plot_frequency_masks(self, aux_info, epoch, batch_idx, images=None):
+    def plot_attention_maps(self, aux_info, epoch, batch_idx, images=None):
         """
-        Plot AH-Net Attention Maps (Replacing old frequency masks).
-        Layout: [Original] | [ID Map (Low-Res)] | [Attr Map (High-Res)]
+        Plot AH-Net Attention Maps (Spatial/Semantic).
+        Layout: [Original] | [ID Map (Structure)] | [Attr Map (Texture)]
         """
+        # 🔥 修复: 先检查 aux_info 是否为 dict 类型
+        if not isinstance(aux_info, dict):
+            return
+        
         if 'map_id' not in aux_info or 'map_attr' not in aux_info:
             return
             
-        map_id = aux_info['map_id']     # [B, 1, H, W] (upsampled inside model, but let's check)
+        map_id = aux_info['map_id']     # [B, 1, H, W]
         map_attr = aux_info['map_attr'] # [B, 1, H, W]
-        
-        # Note: In AHNetModule, map_id is upsampled for loss calculation.
-        # Ideally, we visualize the raw low-res map if available, but the model returns upsampled.
-        # It's fine, it will still look "smoother" or "coarser" based on origin.
+        conflict_scores = aux_info.get('conflict_score', None)
         
         num_samples = min(4, map_id.size(0))
         
@@ -103,12 +104,7 @@ class FSHDVisualizer:
         gs = GridSpec(num_samples, 3, figure=fig, wspace=0.05, hspace=0.1)
         
         for i in range(num_samples):
-            # 1. Original Image (if provided via some global buffer, usually not here)
-            # We assume images might not be passed directly here in old Trainer logic.
-            # If images are None, we just plot heatmaps. 
-            # Ideally, modify Trainer to pass images.
-            # Assuming images is NOT None for now (Trainer modification needed).
-            
+            # 1. Original Image
             if images is not None:
                 img_np = self._denormalize_image(images[i])
             else:
@@ -118,11 +114,16 @@ class FSHDVisualizer:
             overlay_id, _ = self._apply_heatmap(img_np, map_id[i], 'low')
             overlay_attr, _ = self._apply_heatmap(img_np, map_attr[i], 'high')
             
+            # Conflict Score Text
+            c_score = conflict_scores[i].item() if conflict_scores is not None else 0.0
+            
             # 3. Plot
             # Col 0: Original
             ax0 = fig.add_subplot(gs[i, 0])
             ax0.imshow(img_np)
-            if i == 0: ax0.set_title("Original Image", fontweight='bold')
+            if i == 0: ax0.set_title("Original", fontweight='bold')
+            ax0.text(5, 20, f"C-Score: {c_score:.2f}", color='white', 
+                     bbox=dict(facecolor='black', alpha=0.5))
             ax0.axis('off')
             
             # Col 1: ID Attention
@@ -144,7 +145,3 @@ class FSHDVisualizer:
         
         if self.logger:
             self.logger.debug_logger.info(f"📊 Saved AH-Net maps to {save_path}")
-
-    # Keep compatibility with Trainer calls
-    def plot_frequency_energy_spectrum(self, *args, **kwargs): pass 
-    # AH-Net doesn't use spectrum, empty stub.

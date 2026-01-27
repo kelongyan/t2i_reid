@@ -1,6 +1,9 @@
 """
-AH-Net Module (原 FSHDModule 重构)
+AH-Net Module (Optimized)
 实现不对称异构网络的核心交互逻辑
+- 升级: 静态 Query -> 动态实例感知 Query
+- 升级: 单头 Attention -> 多头 Attention (8 Heads)
+- 新增: Query 正交性正则化
 """
 
 import torch
@@ -8,17 +11,141 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .ahnet_streams import IDStructureStream, AttributeTextureStream
 
+class DynamicQueryGenerator(nn.Module):
+    """
+    动态 Query 生成器
+    将特征图压缩并映射为 Query 向量，赋予模型"实例感知"能力。
+    """
+    def __init__(self, dim, hidden_dim=None):
+        super().__init__()
+        hidden_dim = hidden_dim or dim // 2
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, dim),
+            nn.LayerNorm(dim)
+        )
+        
+        # 初始化
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, m):
+        """🔥 更安全的权重初始化"""
+        if isinstance(m, nn.Linear):
+            # 使用更小的标准差，防止NaN梯度
+            nn.init.xavier_normal_(m.weight, gain=0.05)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.ones_(m.weight)
+            nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        """
+        Args:
+            x: [B, D, H, W]
+        Returns:
+            query: [B, 1, D]
+        """
+        B, D, H, W = x.shape
+        x_flat = self.pool(x).flatten(1) # [B, D]
+        query = self.mlp(x_flat)         # [B, D]
+        return query.unsqueeze(1)        # [B, 1, D]
+
+
+class MultiHeadAttention2D(nn.Module):
+    """
+    针对 2D 特征图优化的多头注意力模块
+    🔥 改进：更安全的权重初始化
+    """
+    def __init__(self, dim, num_heads=8, dropout=0.1):
+        super().__init__()
+        self.num_heads = num_heads
+        self.scale = (dim // num_heads) ** -0.5
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Conv2d(dim, dim, 1) # Use 1x1 Conv for spatial features
+        self.v_proj = nn.Conv2d(dim, dim, 1)
+        
+        self.out_proj = nn.Linear(dim, dim)
+        self.dropout = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(dim)
+        
+        # 🔥 初始化权重
+        self._init_weights()
+    
+    def _init_weights(self):
+        """🔥 更安全的权重初始化"""
+        # Q, K, V投影：使用更小的标准差
+        for m in [self.q_proj, self.out_proj]:
+            nn.init.xavier_normal_(m.weight, gain=0.05)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        
+        # K, V的1x1卷积
+        for m in [self.k_proj, self.v_proj]:
+            nn.init.xavier_normal_(m.weight, gain=0.05)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, query, feature_map):
+        """
+        Args:
+            query: [B, 1, D] (Dynamic Query)
+            feature_map: [B, D, H, W] (Key/Value Source)
+        Returns:
+            context: [B, D]
+            attn_map: [B, 1, H, W] (Averaged over heads for visualization)
+        """
+        B, _, D = query.shape
+        _, _, H, W = feature_map.shape
+        
+        # 1. Projections
+        # Q: [B, 1, D] -> [B, 1, Heads, Dim_Head] -> [B, Heads, 1, Dim_Head]
+        q = self.q_proj(query).view(B, 1, self.num_heads, -1).permute(0, 2, 1, 3)
+        
+        # K, V: [B, D, H, W] -> [B, Heads, Dim_Head, H*W]
+        k = self.k_proj(feature_map).flatten(2).view(B, self.num_heads, -1, H*W) # [B, H, D_h, N]
+        v = self.v_proj(feature_map).flatten(2).view(B, self.num_heads, -1, H*W) # [B, H, D_h, N]
+        
+        # 2. Attention
+        # Scores: Q * K^T -> [B, Heads, 1, N]
+        attn = (q @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        attn = self.dropout(attn) # [B, Heads, 1, N]
+        
+        # 3. Context
+        # Context: Attn * V^T -> [B, Heads, 1, Dim_Head] -> [B, 1, D]
+        context = (attn @ v.transpose(-1, -2)).permute(0, 2, 1, 3).reshape(B, 1, D)
+        context = self.out_proj(context)
+        context = self.norm(context + query) # Residual + Norm
+        context = context.squeeze(1) # [B, D]
+        
+        # 4. Attention Map for Visualization / Loss
+        # Reshape [B, Heads, 1, H*W] -> [B, Heads, H, W]
+        attn_map_heads = attn.view(B, self.num_heads, H, W)
+        
+        # Average over heads for downstream "Spatial Conflict" calculation
+        # Or keep heads? AH-Net original logic uses simple overlap. 
+        # Mean is a safe proxy for "Global Attention Intensity".
+        attn_map_avg = attn_map_heads.mean(dim=1, keepdim=True) # [B, 1, H, W]
+        
+        return context, attn_map_avg
+
+
 class AHNetModule(nn.Module):
     """
-    AH-Net: Asymmetric Heterogeneous Network Module
+    AH-Net: Asymmetric Heterogeneous Network Module (Extreme Performance Ver.)
     
-    架构：
+    架构升级：
     1. 输入处理: Seq -> Grid
-    2. 双流分支: 
-       - ID Stream (Low-Res, Global, Mamba)
-       - Attr Stream (High-Res, Local, CNN)
-    3. 语义交互: 原型引导的 Cross-Attention
-    4. 互斥解耦: Masking
+    2. 双流分支: ID Stream (Mamba) & Attr Stream (CNN)
+    3. 交互机制: 
+       - Dynamic Query Generation (Instance Aware)
+       - Multi-Head Attention (High Capacity)
+    4. 互斥解耦: Conflict Score + Orthogonality Regularization
     """
     def __init__(self, dim=384, img_size=(384, 128), patch_size=16, 
                  d_state=16, d_conv=4, expand=2, logger=None):
@@ -31,96 +158,45 @@ class AHNetModule(nn.Module):
         self.grid_w = img_size[1] // patch_size
         
         if logger:
-            logger.debug_logger.info(f"AH-Net Init: Grid Size=({self.grid_h}, {self.grid_w}), Dim={dim}")
+            logger.debug_logger.info(f"🚀 AH-Net (Extreme): Grid=({self.grid_h}, {self.grid_w}), Dim={dim}, Heads=8")
         
         # === 1. 不对称双流 ===
         self.id_stream = IDStructureStream(
             dim=dim, d_state=d_state, d_conv=d_conv, expand=expand, logger=logger
         )
-        
         self.attr_stream = AttributeTextureStream(
             dim=dim, grid_size=(self.grid_h, self.grid_w), logger=logger
         )
         
-        # === 2. 语义原型 (Learnable Prototypes) ===
-        # Query 向量: [1, 1, D]
-        self.query_id = nn.Parameter(torch.randn(1, 1, dim))
-        self.query_attr = nn.Parameter(torch.randn(1, 1, dim))
+        # === 2. 动态查询生成器 (Dynamic Query) ===
+        self.id_query_gen = DynamicQueryGenerator(dim)
+        self.attr_query_gen = DynamicQueryGenerator(dim)
         
-        # === 3. 简单的特征解码器 (用于重构 Loss) ===
-        # 接收 ID + Attr -> 重构原始特征
+        # === 3. 多头注意力 (Multi-Head Attention) ===
+        self.id_attn = MultiHeadAttention2D(dim, num_heads=8)
+        self.attr_attn = MultiHeadAttention2D(dim, num_heads=8)
+        
+        # === 4. 特征解码器 (用于重构 Loss) ===
         self.decoder = nn.Sequential(
             nn.Linear(dim, dim),
-            nn.ReLU(),
+            nn.LayerNorm(dim),
+            nn.GELU(),
+            nn.Dropout(0.1),
             nn.Linear(dim, dim)
         )
         
-        # 初始化权重
-        nn.init.xavier_uniform_(self.query_id)
-        nn.init.xavier_uniform_(self.query_attr)
-
-    def forward_cross_attention(self, query, key_value_map):
-        """
-        简单的 Cross Attention
-        Args:
-            query: [B, 1, D]
-            key_value_map: [B, D, H, W]
-        Returns:
-            context: [B, D] 全局特征
-            attn_map: [B, 1, H, W] 注意力热力图 (已softmax)
-        """
-        B, D, H, W = key_value_map.shape
-        # Flatten KV: [B, H*W, D]
-        kv = key_value_map.flatten(2).transpose(1, 2)
-
-        # Query: [B, 1, D]
-        # Attention Scores: Q * K^T -> [B, 1, H*W]
-        scores = torch.matmul(query, kv.transpose(1, 2))
-        scores = scores / (D ** 0.5)
-        attn_weights = F.softmax(scores, dim=-1) # [B, 1, H*W]
-
-        # Context: weights * V -> [B, 1, D]
-        context = torch.matmul(attn_weights, kv)
-        context = context.squeeze(1) # [B, D]
-
-        # Reshape Map: [B, 1, H, W]
-        attn_map = attn_weights.reshape(B, 1, H, W)
-
-        return context, attn_map
+        # 🔥 初始化权重，防止NaN梯度
+        self._init_weights()
 
     def _compute_conflict_score(self, map_id, map_attr):
         """
-        计算ID和Attr注意力图的冲突分数 (Conflict Score)
-
-        核心指标：衡量两个注意力图在空间上的重叠程度
-        - 冲突分数高：ID和Attr关注同一区域 → 解耦失败 → 图像特征不可信
-        - 冲突分数低：ID和Attr关注不同区域 → 解耦成功 → 图像特征可信
-
-        Args:
-            map_id: [B, 1, H, W] ID注意力图 (已softmax)
-            map_attr: [B, 1, H, W] Attr注意力图 (已softmax)
-
-        Returns:
-            conflict_score: [B] 每个样本的冲突分数 (范围 0~1)
-
-        公式：
-            S_conflict = Sum(map_id · map_attr) / (H · W)
-
-        物理意义：
-            - 如果两个注意力图完全重叠 → conflict_score ≈ 1/(H*W) * sum = 1.0
-            - 如果两个注意力图完全不重叠 → conflict_score ≈ 0.0
+        计算冲突分数。
+        输入为已平均的多头注意力图 [B, 1, H, W]
         """
-        # 逐像素相乘，计算重叠区域
-        # map_id 和 map_attr 都是 softmax 过的，值在 [0, 1] 之间
         overlap = map_id * map_attr  # [B, 1, H, W]
-
-        # 对空间维度求和
         conflict = overlap.sum(dim=(2, 3))  # [B, 1]
-
-        # 除以像素数，归一化到 [0, 1]
         pixel_count = map_id.shape[2] * map_id.shape[3]
         conflict_score = conflict.squeeze(1) / pixel_count  # [B]
-
         return conflict_score
 
     def forward(self, x_grid, return_attention=False):
@@ -128,81 +204,79 @@ class AHNetModule(nn.Module):
         Args:
             x_grid: [B, D, H, W] 输入特征网格
         Returns:
-            id_feat: [B, D]
-            attr_feat: [B, D]
-            aux_info: dict (包含 Loss 所需的 map, recon 等)
+            v_id: [B, D]
+            v_attr: [B, D]
+            aux_info: dict
         """
+        # 🔥 添加输入验证
+        assert x_grid.dim() == 4, f"Expected 4D tensor [B, D, H, W], got {x_grid.dim()}D"
         B, D, H, W = x_grid.shape
+        assert D == self.dim, f"Expected dim={self.dim}, got {D}"
         
         # === 1. 双流处理 ===
-        # ID Stream: [B, D, H/2, W/2]
-        f_id_map = self.id_stream(x_grid)
+        f_id_map = self.id_stream(x_grid) # [B, D, H/2, W/2]
+        f_attr_map = self.attr_stream(x_grid) # [B, D, H, W]
         
-        # Attr Stream: [B, D, H, W]
-        f_attr_map = self.attr_stream(x_grid)
+        # === 2. 动态查询生成 ===
+        # 根据各自流的特征生成"想看什么"的 Query
+        q_id = self.id_query_gen(f_id_map)     # [B, 1, D]
+        q_attr = self.attr_query_gen(f_attr_map) # [B, 1, D]
         
-        # === 2. 基于原型的 Cross-Attention ===
-        # 扩展 Query 到 Batch
-        q_id = self.query_id.expand(B, -1, -1)
-        q_attr = self.query_attr.expand(B, -1, -1)
+        # === 3. 多头注意力交互 ===
+        v_id, map_id = self.id_attn(q_id, f_id_map)
+        v_attr, map_attr = self.attr_attn(q_attr, f_attr_map)
         
-        # ID Attention
-        v_id, map_id = self.forward_cross_attention(q_id, f_id_map)
-        
-        # Attr Attention
-        v_attr, map_attr = self.forward_cross_attention(q_attr, f_attr_map)
-        
-        # === 3. 语义互斥 (Semantic Exclusion) ===
-        # 将 ID Map 上采样到 Attr Map 尺寸
+        # === 4. 后处理与互斥 ===
+        # 上采样 ID Map 使得尺寸匹配
         map_id_up = F.interpolate(map_id, size=(H, W), mode='bilinear', align_corners=False)
         
-        # 互斥掩码: 抑制 ID 关注的区域
-        # 逻辑: v_attr 应该主要来自 map_id 没关注的地方
-        # 这里我们对 v_attr 做一个简单的抑制操作，或者更复杂的特征级抑制
-        # 方案书建议: F_final_attr = V_attr * (1 - Sigmoid(Map_id))
-        # 注意: V_attr 是全局向量 [B, D], Map_id 是空间图 [B, 1, H, W]
-        # 直接相乘不合适。通常是在 Feature Map 聚合时做 Masking。
-        # 但既然我们已经得到了 v_attr (Context), 这里的 Masking 更多是用于 Loss 或 特征修正。
-        # 修正: 我们使用 Mask 对 Attr Map 进行加权，重新计算 v_attr_refined
+        # 计算空间冲突分数
+        conflict_score = self._compute_conflict_score(map_id_up, map_attr)
         
-        exclusion_mask = 1.0 - map_id_up # [B, 1, H, W] (假设 map_id 已经是 softmax 过的，在 0-1 之间)
-        # 注意: softmax 后的 weights 通常很小，sum=1。直接用 1-weight 可能抑制不够。
-        # 方案书提到 "Sigmoid(Map_id)"， implies Map_id might be logits. 
-        # 但 forward_cross_attention 返回的是 softmax 后的 weights。
-        # 为了更强的互斥，我们对 weights 进行 Min-Max 归一化或直接使用
-        
-        # 简化策略:
-        # id_feat = v_id
-        # attr_feat = v_attr
-        # 互斥主要靠 Loss 驱动
-        
-        # === 4. 计算冲突分数 (Conflict Score) ===
-        # 这是方案书的核心指标，用于驱动 S-CAG 融合模块
-        conflict_score = self._compute_conflict_score(map_id_up, map_attr)  # [B]
+        # 计算 Query 正交性 (用于 Loss 惩罚)
+        # Cosine Similarity between Q_id and Q_attr
+        q_id_norm = F.normalize(q_id.squeeze(1), p=2, dim=1)
+        q_attr_norm = F.normalize(q_attr.squeeze(1), p=2, dim=1)
+        ortho_reg = (q_id_norm * q_attr_norm).sum(dim=1).abs().mean()
 
-        # === 5. 重构准备 ===
-        # 重构输入: v_id (detach) + v_attr
-        recon_input = v_id.detach() + v_attr
-        recon_feat = self.decoder(recon_input) # [B, D]
+        # === 5. 重构 ===
+        # 🔥 修复 Bug #4: 移除v_id的detach(),让重构损失同时优化ID和Attr分支
+        recon_input = v_id + v_attr
+        recon_feat = self.decoder(recon_input)
+        original_global = x_grid.mean(dim=(2, 3))
 
-        # 原始特征的全局表示 (用于重构目标)
-        original_global = x_grid.mean(dim=(2, 3)) # [B, D]
+        # 🔥 调试日志
+        if self.logger and hasattr(self, '_log_counter'):
+            self._log_counter = getattr(self, '_log_counter', 0) + 1
+            if self._log_counter % 200 == 0:
+                self.logger.debug_logger.debug(
+                    f"[AH-Net Extreme] Conflict: {conflict_score.mean():.4f} | Ortho Reg: {ortho_reg.item():.4f}"
+                )
 
         aux_info = {
-            'map_id': map_id_up,        # [B, 1, H, W] ID注意力图
-            'map_attr': map_attr,       # [B, 1, H, W] Attr注意力图
-            'conflict_score': conflict_score,  # [B] 冲突分数 (核心指标！)
-            'recon_feat': recon_feat,   # [B, D] 重构特征
-            'target_feat': original_global,  # [B, D] 目标特征
-            'v_id': v_id,               # [B, D] ID全局特征
-            'v_attr': v_attr            # [B, D] Attr全局特征
+            'map_id': map_id_up,
+            'map_attr': map_attr,
+            'conflict_score': conflict_score,
+            'recon_feat': recon_feat,
+            'target_feat': original_global,
+            'ortho_reg': ortho_reg, # 新增：正交正则项
+            'v_id': v_id,
+            'v_attr': v_attr
         }
         
-        # 兼容旧接口的返回值结构
-        # id_feat, attr_feat, gate_stats(dummy), original_feat
-        # 这里的 original_feat 用于 model.py 中的后续流程，通常不需要
-        
         return v_id, v_attr, aux_info
+    
+    def _init_weights(self):
+        """🔥 改进的权重初始化，防止NaN梯度"""
+        # 初始化解码器
+        for m in self.decoder.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_normal_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.LayerNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
 
-# Alias for compatibility if needed, though we will change imports
+# Alias
 FSHDModule = AHNetModule

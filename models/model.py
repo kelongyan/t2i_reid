@@ -67,21 +67,27 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, 
 
 class ResidualBottleneck1d(nn.Module):
     """
-    Stage 1: 局部残差瓶颈模块
+    Stage 1: 局部残差瓶颈模块 (Enhanced)
+    Upgrade: Uses Depthwise Separable Conv with Kernel=5 for broader context.
     """
-    def __init__(self, dim, reduction=4):
+    def __init__(self, dim, reduction=4, kernel_size=5):
         super().__init__()
         hidden_dim = dim // reduction
+        padding = (kernel_size - 1) // 2
+        
         self.squeeze = nn.Sequential(
             nn.Conv1d(dim, hidden_dim, kernel_size=1, bias=False),
             nn.BatchNorm1d(hidden_dim),
             nn.SiLU(inplace=True)
         )
-        self.process = nn.Sequential(
-            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1, bias=False),
+        # Depthwise Separable: Depthwise
+        self.dw_conv = nn.Sequential(
+            nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, 
+                      padding=padding, groups=hidden_dim, bias=False),
             nn.BatchNorm1d(hidden_dim),
             nn.SiLU(inplace=True)
         )
+        # Depthwise Separable: Pointwise
         self.expand = nn.Sequential(
             nn.Conv1d(hidden_dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm1d(dim)
@@ -90,7 +96,7 @@ class ResidualBottleneck1d(nn.Module):
     def forward(self, x):
         identity = x
         out = self.squeeze(x)
-        out = self.process(out)
+        out = self.dw_conv(out)
         out = self.expand(out)
         return identity + out
 
@@ -249,9 +255,24 @@ class Model(nn.Module):
             dim=self.text_width,
             logger=self.logger
         )
+        
+        # 🔥 4.5 Adversarial Decoupler (新增)
+        from .adversarial import AdversarialDecoupler
+        self.adversarial_decoupler = AdversarialDecoupler(
+            dim=self.text_width,
+            num_attributes=128,  # 伪属性类别数
+            use_domain_disc=False,  # Phase 1不使用域判别器
+            logger=self.logger
+        )
+        if self.logger:
+            self.logger.debug_logger.info("🔥 Adversarial Decoupler Initialized (Attribute Discriminator)")
 
         # 5. Retrieval Projection Heads
         self.shared_mlp = nn.Linear(self.text_width, 512)
+
+        # 🔥 修复：为clothing_embeds添加单独的LayerNorm，防止范数爆炸
+        self.cloth_norm = nn.LayerNorm(512)
+
         self.image_mlp = nn.Sequential(
             nn.BatchNorm1d(512), nn.ReLU(), nn.Dropout(0.2),
             nn.Linear(512, 256), nn.BatchNorm1d(256), nn.ReLU(), nn.Dropout(0.2),
@@ -263,6 +284,9 @@ class Model(nn.Module):
             nn.Linear(256, 256)
         )
 
+        # 初始化MLP权重，防止梯度问题
+        self._init_weights()
+
         # 6. Text Encoder V2 (Pyramid Text Encoder)
         if HAS_MAMBA:
             self.text_encoder_v2 = PyramidTextEncoder(dim=self.text_width)
@@ -273,6 +297,36 @@ class Model(nn.Module):
         self.fusion = get_fusion_module(fusion_config) if fusion_config else None
         self.scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self.text_cache = {}
+
+    def _init_weights(self):
+        """🔥 改进的权重初始化，防止NaN梯度"""
+        # 🔥 1. 共享MLP和投影层：使用更小的初始化
+        for module in [self.shared_mlp]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    # 使用更小的标准差
+                    nn.init.xavier_normal_(m.weight, gain=0.01)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+        
+        # 🔥 2. 图像和文本MLP：使用更小的初始化
+        for module in [self.image_mlp, self.text_mlp]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_normal_(m.weight, gain=0.05)
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+        
+        # 🔥 3. cloth_norm：初始化为单位矩阵
+        if hasattr(self, 'cloth_norm'):
+            if hasattr(self.cloth_norm, 'weight'):
+                nn.init.ones_(self.cloth_norm.weight)
+            if hasattr(self.cloth_norm, 'bias'):
+                nn.init.zeros_(self.cloth_norm.bias)
+        
+        # 🔥 4. scale参数：初始化为1.0
+        if hasattr(self, 'scale'):
+            nn.init.constant_(self.scale, 1.0)
 
     def _seq_to_grid(self, seq_feat):
         """
@@ -367,7 +421,7 @@ class Model(nn.Module):
 
     def forward(self, image=None, cloth_instruction=None, id_instruction=None, return_attention=False):
         device = next(self.parameters()).device
-        id_logits, id_embeds, cloth_embeds = None, None, None
+        id_embeds, cloth_embeds = None, None
         aux_info = None
         
         # === Image Branch ===
@@ -389,12 +443,18 @@ class Model(nn.Module):
             # AH-Net Disentangle
             id_embeds, cloth_embeds, aux_info = self.disentangle(image_grid)
             
+            # 🔥 修复：立即归一化，防止 Triplet Loss 梯度爆炸
+            id_embeds = torch.nn.functional.normalize(id_embeds, dim=-1)
+            cloth_embeds = torch.nn.functional.normalize(cloth_embeds, dim=-1)
+            
             # Projection
             image_embeds = self.shared_mlp(id_embeds)
             image_embeds = self.image_mlp(image_embeds)
             image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
-            
+
+            # 🔥 修复：为clothing_embeds添加LayerNorm，防止范数爆炸
             cloth_image_embeds = self.shared_mlp(cloth_embeds)
+            cloth_image_embeds = self.cloth_norm(cloth_image_embeds)  # 添加LayerNorm
             cloth_image_embeds = self.image_mlp(cloth_image_embeds)
             cloth_image_embeds = torch.nn.functional.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
         else:
@@ -408,7 +468,11 @@ class Model(nn.Module):
             if isinstance(main_instruction, (list, tuple)): texts = list(main_instruction)
             else: texts = [main_instruction]
             
+            # 🔥 修复 Bug #1: 添加缓存大小限制防止内存泄漏
             cache_key = tuple(texts)
+            if len(self.text_cache) > 10000:  # 限制缓存大小
+                self.text_cache.clear()
+            
             if cache_key in self.text_cache: tokenized = self.text_cache[cache_key]
             else:
                 tokenized = self.tokenizer(texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
@@ -422,8 +486,10 @@ class Model(nn.Module):
             
             out_v2 = self.text_encoder_v2(text_seq)
             feat_attr_raw, feat_id_raw = out_v2['feat_attr'], out_v2['feat_id']
-            
+
+            # 🔥 修复：为cloth_text_embeds添加LayerNorm
             cloth_text_embeds = self.shared_mlp(feat_attr_raw)
+            cloth_text_embeds = self.cloth_norm(cloth_text_embeds)  # 添加LayerNorm
             cloth_text_embeds = self.text_mlp(cloth_text_embeds)
             cloth_text_embeds = torch.nn.functional.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
             
@@ -431,8 +497,42 @@ class Model(nn.Module):
             id_text_embeds = self.text_mlp(id_text_embeds)
             id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
         else:
-            cloth_text_embeds = self.encode_text(cloth_instruction)
-            id_text_embeds = self.encode_text(id_instruction)
+            # 🔥 修复 Bug #1: 在else分支中也计算feat_attr_raw和feat_id_raw,确保融合模块正常工作
+            if cloth_instruction:
+                cloth_texts = [cloth_instruction] if isinstance(cloth_instruction, str) else cloth_instruction
+                cloth_tokens = self.tokenizer(
+                    cloth_texts, padding='max_length', max_length=77, truncation=True, 
+                    return_tensors="pt", return_attention_mask=True
+                )
+                cloth_tokens = {k: v.to(device) for k, v in cloth_tokens.items()}
+                cloth_seq = self.text_encoder(**cloth_tokens).last_hidden_state
+                cloth_seq = self.text_proj(cloth_seq)
+                feat_attr_raw = cloth_seq.mean(dim=1)
+            
+            if id_instruction:
+                id_texts = [id_instruction] if isinstance(id_instruction, str) else id_instruction
+                id_tokens = self.tokenizer(
+                    id_texts, padding='max_length', max_length=77, truncation=True,
+                    return_tensors="pt", return_attention_mask=True
+                )
+                id_tokens = {k: v.to(device) for k, v in id_tokens.items()}
+                id_seq = self.text_encoder(**id_tokens).last_hidden_state
+                id_seq = self.text_proj(id_seq)
+                feat_id_raw = id_seq.mean(dim=1)
+            
+            # 计算embeds用于损失
+            cloth_text_embeds = None
+            if feat_attr_raw is not None:
+                cloth_text_embeds = self.shared_mlp(feat_attr_raw)
+                cloth_text_embeds = self.cloth_norm(cloth_text_embeds)
+                cloth_text_embeds = self.text_mlp(cloth_text_embeds)
+                cloth_text_embeds = torch.nn.functional.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
+            
+            id_text_embeds = None
+            if feat_id_raw is not None:
+                id_text_embeds = self.shared_mlp(feat_id_raw)
+                id_text_embeds = self.text_mlp(id_text_embeds)
+                id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
 
         # === Fusion ===
         fused_embeds, gate_weights = None, None
@@ -457,7 +557,8 @@ class Model(nn.Module):
         # Returns
         # aux_info (9th element) 包含 conflict_score, attention maps, reconstruction features
         # gate_weights (10th element) 包含 confidence weights from S-CAG
-        base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_logits, id_embeds,
+        # 🔥 修复 Bug #5: 移除未使用的id_logits,返回11个元素
+        base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_embeds,
                        cloth_embeds, cloth_text_embeds, cloth_image_embeds, aux_info, gate_weights,
                        None, None)
 

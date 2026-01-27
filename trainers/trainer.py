@@ -7,11 +7,12 @@ from losses.loss import Loss
 from evaluators.evaluator import Evaluator
 from utils.serialization import save_checkpoint
 from utils.meters import AverageMeter
-from utils.visualization import FSHDVisualizer  # 新增：可视化工具
+from utils.visualization import FSHDVisualizer
+from trainers.curriculum import CurriculumScheduler  # 🔥 新增
 
 class EarlyStopping:
-    """早停机制，防止过拟合"""
-    def __init__(self, patience=10, min_delta=0.001, logger=None):
+    """早停机制，防止过拟合（修改为20个epoch）"""
+    def __init__(self, patience=20, min_delta=0.001, logger=None):
         self.patience = patience
         self.min_delta = min_delta
         self.logger = logger
@@ -42,39 +43,34 @@ class Trainer:
         # 初始化训练器，设置模型、参数和设备
         self.model = model
         self.args = args
-        self.monitor = monitor  # 添加监控器
-        self.runner = runner  # 添加runner引用以便调用freeze方法
+        self.monitor = monitor
+        self.runner = runner
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # === 🔥 AH-Net 损失权重配置 ===
-        default_loss_weights = {
-            'info_nce': 1.0,               # 对比学习 - 主任务
-            'id_triplet': 1.0,             # ID一致性
-            'cloth_semantic': 0.5,         # 服装语义对齐
-            'spatial_orthogonal': 0.1,     # 空间互斥
-            'reconstruction': 0.5,         # 结构重构
-        }
-        
-        # 从配置文件获取损失权重，合并默认值
-        loss_weights = getattr(args, 'disentangle', {}).get('loss_weights', default_loss_weights)
-        for key, value in default_loss_weights.items():
-            if key not in loss_weights:
-                loss_weights[key] = value
-        
-        # 初始化Loss模块 (包含语义引导模块)
-        self.combined_loss = Loss(
-            temperature=0.1,
-            weights=loss_weights,
+        # 🔥 新增：课程学习调度器
+        self.curriculum = CurriculumScheduler(
+            total_epochs=args.epochs,
+            logger=monitor
+        )
+
+        # 性能历史记录（用于课程学习）
+        self.performance_history = []
+
+        # 🔥 修复：初始化Loss模块（支持对抗训练，使用正确的温度参数）
+        self.loss = Loss(
+            temperature=0.07,  # 标准的InfoNCE温度参数
+            weights=self.curriculum.base_weights,  # 使用课程学习的初始权重
             logger=monitor,
-            semantic_guidance=model.semantic_guidance  # 🔥 传递语义引导模块
+            semantic_guidance=model.semantic_guidance,
+            adversarial_decoupler=model.adversarial_decoupler  # 🔥 新增
         ).to(self.device)
         
-        # === 新增：初始化可视化器 ===
+        # === 初始化可视化器 ===
         visualize_config = getattr(args, 'visualization', {})
         if visualize_config.get('enabled', True):
             vis_save_dir = visualize_config.get('save_dir', 'visualizations')
             self.visualizer = FSHDVisualizer(save_dir=vis_save_dir, logger=monitor)
-            self.visualize_freq = visualize_config.get('frequency', 5)  # 每N个epoch可视化一次
+            self.visualize_freq = visualize_config.get('frequency', 5)
             self.visualize_batch_interval = visualize_config.get('batch_interval', 200)
             if self.monitor:
                 self.monitor.debug_logger.info(f"✅ Visualizer enabled (freq={self.visualize_freq}, batch_interval={self.visualize_batch_interval})")
@@ -149,22 +145,25 @@ class Trainer:
         )
     
     def clip_grad_norm_by_layer(self, model, max_norm=1.0):
-        """对不同层使用不同的梯度裁剪阈值"""
+        """🔥 改进的分层梯度裁剪，特别针对Mamba模块"""
         for name, param in model.named_parameters():
             if param.grad is not None:
-                # CLIP文本编码器：更严格的裁剪
-                if 'text_encoder' in name:
+                # 🔥 Vim Mamba模块：最严格的裁剪（防止NaN）
+                if 'visual_encoder' in name and 'mixer' in name:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.3)
+                # Vim其他层：中等裁剪
+                elif 'visual_encoder' in name:
                     torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.5)
-                # 新解冻的层：较宽松的裁剪
-                elif 'layers' in name:
-                    try:
-                        layer_num = int([s for s in name.split('.') if s.isdigit()][0])
-                        if layer_num >= 11:
-                            torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 2.0)
-                        else:
-                            torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
-                    except (IndexError, ValueError):
-                        torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
+                # CLIP文本编码器：严格裁剪
+                elif 'text_encoder' in name:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.5)
+                # 解耦模块：宽松裁剪
+                elif 'disentangle' in name:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.7)
+                # Fusion模块：宽松裁剪
+                elif 'fusion' in name:
+                    torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm * 0.8)
+                # 其他层：标准裁剪
                 else:
                     torch.nn.utils.clip_grad_norm_([param], max_norm=max_norm)
     
@@ -177,8 +176,8 @@ class Trainer:
         if self.monitor:
             self.monitor.logger.info(f"BatchNorm warmup enabled with momentum={momentum}")
 
-    def run(self, inputs, epoch, batch_idx, total_batches):
-        # 执行单次训练步骤，计算所有损失（FSHD版本）
+    def run(self, inputs, epoch, batch_idx, total_batches, training_phase='feature'):
+        # 执行单次训练步骤，计算所有损失（支持对抗训练）
         image, cloth_captions, id_captions, pid, cam_id, is_matched = inputs
         image = image.to(self.device)
         pid = pid.to(self.device)
@@ -193,110 +192,80 @@ class Trainer:
                 raise ValueError("id_captions must be a list of strings")
 
         with torch.amp.autocast('cuda', enabled=self.args.fp16):
-            # === FSHD模块支持返回频域信息 ===
-            # 如果使用FSHD模块，需要获取频域信息
-            return_freq_info = (self.visualizer is not None and 
-                               batch_idx % self.visualize_batch_interval == 0)
-            
-            # 训练时可以选择性返回注意力图和频域信息
+            # 训练时可以选择性返回注意力图
             outputs = self.model(image=image, cloth_instruction=cloth_captions, 
                                id_instruction=id_captions)
 
-            # === FSHD模块返回12个输出（保持兼容）===
-            if len(outputs) != 12:
-                raise ValueError(f"Expected 12 model outputs during training, got {len(outputs)}")
+            # 模型返回11个输出
+            if len(outputs) != 11:
+                raise ValueError(f"Expected 11 model outputs during training, got {len(outputs)}")
 
-            image_feats, id_text_feats, fused_feats, id_logits, id_embeds, \
-            cloth_embeds, cloth_text_embeds, cloth_image_embeds, gate_stats, gate_weights, \
+            image_embeds, id_text_embeds, fused_embeds, id_embeds, \
+            cloth_embeds, cloth_text_embeds, cloth_image_embeds, aux_info, gate_weights, \
             id_cls_features, original_feat = outputs
             
-            # === 获取频域信息（如果使用FSHD模块）===
-            freq_info = None
-            if hasattr(self.model, 'disentangle') and hasattr(self.model.disentangle, 'forward'):
-                # 检查是否是FSHD模块（通过检查是否有freq_splitter属性）
-                if hasattr(self.model.disentangle, 'freq_splitter') and return_freq_info:
-                    # 重新调用disentangle获取频域信息（仅用于可视化，不参与梯度）
-                    with torch.no_grad():
-                        # 从模型中提取image_embeds_raw
-                        if self.model.vision_backbone_type == 'vim':
-                            image_embeds_raw = self.model.visual_encoder(image)
-                        else:
-                            image_outputs = self.model.visual_encoder(image)
-                            image_embeds_raw = image_outputs.last_hidden_state
-                        image_embeds_raw = self.model.visual_proj(image_embeds_raw)
-                        
-                        # 调用disentangle获取freq_info
-                        _, _, _, _, freq_info = self.model.disentangle(
-                            image_embeds_raw, return_freq_info=True
-                        )
-            
-            # === 损失计算（方案书完整版）===
-            # aux_info (通过 freq_info 参数传入) 包含 conflict_score, attention maps 等
-            loss_dict = self.combined_loss(
-                image_embeds=image_feats, id_text_embeds=id_text_feats, fused_embeds=fused_feats,
-                id_logits=None, id_embeds=id_embeds, cloth_embeds=cloth_embeds,
-                cloth_text_embeds=cloth_text_embeds, cloth_image_embeds=cloth_image_embeds,
-                pids=pid, is_matched=is_matched, epoch=epoch, gate=gate_stats,
-                freq_info=freq_info  # 包含 conflict_score 的 aux_info
-            )
+        # 🔥 计算损失（支持训练阶段区分）
+        loss_dict = self.loss(
+            image_embeds=image_embeds,
+            id_text_embeds=id_text_embeds,
+            fused_embeds=fused_embeds,
+            id_logits=None,
+            id_embeds=id_embeds,
+            cloth_embeds=cloth_embeds,
+            cloth_text_embeds=cloth_text_embeds,
+            cloth_image_embeds=cloth_image_embeds,
+            pids=pid,
+            epoch=epoch,
+            aux_info=aux_info,
+            training_phase=training_phase  # 🔥 新增：区分特征提取器/判别器训练
+        )
 
-            # 可视化回调
-        if self.visualizer is not None and batch_idx % self.visualize_batch_interval == 0:
-            # 频域掩码可视化 (Now maps to AH-Net Attention Maps)
-            if freq_info is not None:
-                # Pass original images for overlay
-                self.visualizer.plot_frequency_masks(freq_info, epoch, batch_idx, images=image)
-                
-                # 频域能量谱 (Stubbed)
-                if 'freq_magnitude' in freq_info:
-                    self.visualizer.plot_frequency_energy_spectrum(freq_info, epoch, batch_idx)
-            
-            # 门控统计
-            if gate_stats is not None and isinstance(gate_stats, dict):
-                # 从gate_stats中提取实际的gate tensor（如果存在）
-                # 注意：当前gate_stats只包含统计值，如果需要可视化需要修改模型返回gate tensor
-                pass
+        # 可视化
+        if self.visualizer and epoch % self.visualize_freq == 0 and batch_idx % self.visualize_batch_interval == 0:
+            if hasattr(self.model.disentangle, 'forward'):
+                if len(outputs) > 8:
+                    aux_info = outputs[8]
+                    if aux_info is not None and isinstance(aux_info, dict):
+                        self.visualizer.plot_attention_maps(aux_info, epoch, batch_idx, images=image)
         
-            # 记录特征统计信息（移除分类器诊断）
-            if self.monitor and batch_idx % 200 == 0:  # 每200个批次记录一次详细信息
-                self.monitor.log_feature_statistics(image_feats, "image_features")
-                self.monitor.log_feature_statistics(id_text_feats, "id_text_features")
-                self.monitor.log_feature_statistics(fused_feats, "fused_features")
-                self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
-                self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
-                self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
-                self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
-                
-                # AH-Net 损失统计
-                if 'reconstruction' in loss_dict:
-                    self.monitor.debug_logger.debug(
-                        f"Reconstruction Loss: {loss_dict['reconstruction'].item():.6f}"
-                    )
-
-            # 🔥 方案书 Phase 3: Conflict Score 日志追踪
-            # 记录解耦质量的核心指标
-            if freq_info is not None and isinstance(freq_info, dict):
-                conflict_score = freq_info.get('conflict_score')
+        # 记录特征统计信息
+        if self.monitor and batch_idx % 200 == 0:
+            self.monitor.log_feature_statistics(image_embeds, "image_features")
+            self.monitor.log_feature_statistics(id_text_embeds, "id_text_features")
+            self.monitor.log_feature_statistics(fused_embeds, "fused_features")
+            self.monitor.log_feature_statistics(id_embeds, "identity_embeds")
+            self.monitor.log_feature_statistics(cloth_embeds, "clothing_embeds")
+            self.monitor.log_feature_statistics(cloth_text_embeds, "cloth_text_embeds")
+            self.monitor.log_feature_statistics(cloth_image_embeds, "cloth_image_embeds")
+            
+            # Conflict Score日志
+            if aux_info is not None and isinstance(aux_info, dict):
+                conflict_score = aux_info.get('conflict_score')
                 if conflict_score is not None and self.monitor:
-                    # 每200个batch记录一次详细的conflict_score统计
                     if batch_idx % 200 == 0:
                         self.monitor.log_conflict_score(conflict_score, step_name=f"_E{epoch}_B{batch_idx}")
 
-            # gate_stats是dict，记录统计信息
-            if gate_stats is not None and isinstance(gate_stats, dict):
-                self.monitor.debug_logger.debug(
-                    f"Gate stats: ID[{gate_stats.get('gate_id_mean', 0):.4f}], "
-                    f"Attr[{gate_stats.get('gate_attr_mean', 0):.4f}], "
-                    f"Diversity[{gate_stats.get('diversity', 0):.4f}]"
-                )
+        # aux_info统计
+        if aux_info is not None and isinstance(aux_info, dict):
+            conflict_score = aux_info.get('conflict_score')
+            ortho_reg = aux_info.get('ortho_reg')
+            
+            # 🔥 修复: 将Tensor转换为标量值用于日志输出
+            conflict_val = conflict_score.mean().item() if conflict_score is not None else 0.0
+            ortho_val = ortho_reg.item() if ortho_reg is not None else 0.0
+            
+            self.monitor.debug_logger.debug(
+                f"Aux info: Conflict[{conflict_val:.4f}], "
+                f"Ortho Reg[{ortho_val:.4f}]"
+            )
 
-            if gate_weights is not None:
-                self.monitor.log_gate_weights(gate_weights, "fusion_gate")
+        if gate_weights is not None:
+            self.monitor.log_gate_weights(gate_weights, "fusion_gate")
 
-            self.monitor.log_loss_components(loss_dict)
+        self.monitor.log_loss_components(loss_dict)
 
-            # 记录内存使用情况
-            self.monitor.log_memory_usage()
+        # 记录内存使用情况
+        self.monitor.log_memory_usage()
 
         return loss_dict
     
@@ -315,381 +284,19 @@ class Trainer:
         return avg_losses
 
     def train(self, train_loader, optimizer, lr_scheduler, query_loader=None, gallery_loader=None, checkpoint_dir=None):
-        # 训练模型，包含损失计算、优化和检查点保存
-        self.model.train()
-        best_mAP = 0.0
-        best_checkpoint_path = None
-        total_batches = len(train_loader)
-        loss_meters = {k: AverageMeter() for k in self.combined_loss.weights.keys() | {'total'}}
+        """训练模型（使用课程学习）"""
+        from trainers.train_loop import train_with_curriculum
         
-        # 【紧急修复】早停机制 - 增加patience
-        early_stopping = EarlyStopping(patience=15, min_delta=0.001, logger=self.monitor)
+        # 调用新的训练循环
+        best_mAP, best_checkpoint_path = train_with_curriculum(
+            trainer=self,
+            train_loader=train_loader,
+            query_loader=query_loader,
+            gallery_loader=gallery_loader,
+            checkpoint_dir=checkpoint_dir
+        )
         
-        # 【新增】学习率预热和全局步数
-        warmup_steps = 1000
-        global_step = 0
-
-        for epoch in range(1, self.args.epochs + 1):
-            # 【方案B：渐进解冻策略】在特定epoch检查并调整冻结状态和优化器
-            stage_changed = False
-            
-            # Epoch 1: Initial Warmup Trigger
-            if epoch == 1:
-                stage_changed = True
-                if self.monitor: self.monitor.logger.info("🚀 Training Start: Stage 1 Warmup")
-
-            if self.runner:
-                # === 修复：推迟渐进式解冻，增加NaN检测 ===
-                
-                if epoch == 20:  # Stage 2: 推迟到Epoch 20（原Epoch 11）
-                    print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 2 (Delayed)")
-                    if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 20-40: Unfreezing Vim last 8 layers (layer 16-23)")
-                    if self.monitor: self.monitor.logger.info("             + CLIP last 1 layer (layer 11)")
-                    if self.monitor: self.monitor.logger.info("Goal: Stabilized adaptation with NaN protection")
-                    print("="*70 + "\n")
-                    
-                    # 【新增】NaN检测：检查模型参数是否健康
-                    nan_detected = False
-                    for name, param in self.model.named_parameters():
-                        if param.requires_grad and torch.isnan(param).any():
-                            if self.monitor:
-                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
-                            nan_detected = True
-                            break
-                    
-                    if nan_detected:
-                        if self.monitor:
-                            self.monitor.logger.warning("⚠️  Skipping progressive unfreezing due to NaN detection. Model will continue with current freeze state.")
-                    else:
-                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=11)
-                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=4)
-                        
-                        # 重新初始化CLIP bias防止梯度消失
-                        self.reinit_clip_bias_layers(self.model, self.monitor)
-                        
-                        # 使用分层学习率优化器（降低学习率）
-                        optimizer = self.build_optimizer_with_lr_groups(self.model, stage=2)
-                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                            optimizer, 
-                            num_training_steps=(self.args.epochs - 19) * total_batches,
-                            num_warmup_steps=warmup_steps
-                        )
-                        
-                        # 启用BatchNorm预热
-                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                        
-                        stage_changed = True
-                        global_step = 0
-                        
-                elif epoch == 41:  # Stage 3: 推迟到Epoch 41（原Epoch 31）
-                    print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 3 (Delayed)")
-                    if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 41-65: Unfreezing Vim last 12 layers")
-                    if self.monitor: self.monitor.logger.info("             + CLIP last 6 layers (layer 6-11)")
-                    if self.monitor: self.monitor.logger.info("Goal: Deep interaction tuning with stability")
-                    print("="*70 + "\n")
-                    
-                    # NaN检测
-                    nan_detected = False
-                    for name, param in self.model.named_parameters():
-                        if param.requires_grad and torch.isnan(param).any():
-                            if self.monitor:
-                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
-                            nan_detected = True
-                            break
-                    
-                    if not nan_detected:
-                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=6)
-                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=6)
-                        
-                        optimizer = self.build_optimizer_with_lr_groups(self.model, stage=3)
-                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                            optimizer,
-                            num_training_steps=(self.args.epochs - 40) * total_batches,
-                            num_warmup_steps=warmup_steps
-                        )
-                        
-                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                        
-                        stage_changed = True
-                        global_step = 0
-                        
-                elif epoch == 66:  # Stage 4: 推迟到Epoch 66（原Epoch 61）
-                    print("\n" + "="*70)
-                    if self.monitor: self.monitor.logger.info("🔓 Progressive Unfreezing: Stage 4 (Delayed)")
-                    if self.monitor: self.monitor.logger.info("=" * 70)
-                    if self.monitor: self.monitor.logger.info("Epoch 66-80: Unfreezing all CLIP and Vim layers")
-                    if self.monitor: self.monitor.logger.info("Goal: End-to-end fine-tuning")
-                    print("="*70 + "\n")
-                    
-                    # NaN检测
-                    nan_detected = False
-                    for name, param in self.model.named_parameters():
-                        if param.requires_grad and torch.isnan(param).any():
-                            if self.monitor:
-                                self.monitor.logger.error(f"❌ NaN detected in {name} before unfreezing! Aborting stage change.")
-                            nan_detected = True
-                            break
-                    
-                    if not nan_detected:
-                        self.runner.freeze_text_layers(self.model, unfreeze_from_layer=0)
-                        self.runner.freeze_vit_layers(self.model, unfreeze_from_layer=0)
-                        
-                        optimizer = self._build_default_optimizer(self.model)
-                        lr_scheduler = self.build_scheduler_with_cosine_warmup(
-                            optimizer,
-                            num_training_steps=(self.args.epochs - 65) * total_batches,
-                            num_warmup_steps=warmup_steps
-                        )
-                        
-                        self.enable_batch_norm_warmup(self.model, momentum=0.01)
-                        
-                        stage_changed = True
-                        global_step = 0
-            
-            if stage_changed and self.monitor:
-                self.monitor.logger.info(f"Stage changed at epoch {epoch}")
-                if self.monitor:
-                    self.monitor.logger.info(f"Learning rate warmup enabled for {warmup_steps} steps")
-            
-            # 显示上一个epoch的平均损失（仅记录到日志，不在终端显示以避免重复）
-            if epoch > 1:
-                avg_losses = self._format_loss_display(loss_meters)
-                if avg_losses:
-                    avg_loss_str = ', '.join(avg_losses)
-                    # 仅记录到日志，评估阶段会单独打印损失
-                    if self.monitor:
-                        self.monitor.logger.info(f"[Epoch {epoch-1} Avg Loss]: {avg_loss_str}")
-
-            # 重置损失记录器
-            for meter in loss_meters.values():
-                meter.reset()
-
-            progress_bar = tqdm(
-                train_loader, desc=f"[Epoch {epoch}/{self.args.epochs}] Training",
-                dynamic_ncols=True, leave=True, total=total_batches
-            )
-
-            # 记录Epoch初始状态 (LR & Loss Weights) -> 仅写入调试日志，不显示在终端
-            if self.monitor:
-                current_lrs = [pg['lr'] for pg in optimizer.param_groups]
-                lr_str = ", ".join([f"{lr:.2e}" for lr in current_lrs])
-                
-                # 获取当前Loss权重
-                weight_str = ", ".join([f"{k}={v:.2f}" for k, v in self.combined_loss.weights.items() if v > 0])
-                
-                self.monitor.debug_logger.info(f"Epoch {epoch} Start | LRs: [{lr_str}] | Active Weights: [{weight_str}]")
-
-            for i, inputs in enumerate(progress_bar):
-                # 【新增】学习率预热
-                if stage_changed and global_step < warmup_steps:
-                    for param_group in optimizer.param_groups:
-                        base_lr = param_group.get('initial_lr', param_group['lr'])
-                        warmup_lr = self._get_warmup_lr(base_lr, global_step, warmup_steps)
-                        param_group['lr'] = warmup_lr
-                
-                optimizer.zero_grad()
-                loss_dict = self.run(inputs, epoch, i, total_batches)
-                loss = loss_dict['total']
-                
-                # 【新增】NaN损失检测 - 提前终止batch
-                if torch.isnan(loss).any() or torch.isinf(loss).any():
-                    if self.monitor:
-                        self.monitor.logger.error(f"❌ NaN/Inf total loss detected at epoch {epoch} batch {i}! Skipping this batch.")
-                        self.monitor.debug_logger.error(f"Loss dict: {loss_dict}")
-                    continue  # 跳过这个batch
-
-                if self.scaler:
-                    self.scaler.scale(loss).backward()
-                    
-                    # [Fix] Check for gradients BEFORE unscale to prevent scaler errors
-                    has_grads = any(p.grad is not None for group in optimizer.param_groups for p in group['params'])
-                    
-                    if has_grads:
-                        # 【修改】使用分层梯度裁剪
-                        self.scaler.unscale_(optimizer)
-                        
-                        # 【新增】NaN梯度检测
-                        nan_grad_params = []
-                        for name, param in self.model.named_parameters():
-                            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                                nan_grad_params.append(name)
-                                # 将NaN梯度置零，防止传播
-                                param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=0.0, neginf=0.0)
-                        
-                        if nan_grad_params and self.monitor:
-                            if i % 100 == 0:  # 每100个batch报告一次
-                                self.monitor.logger.warning(f"⚠️  NaN gradients detected and reset to 0 in {len(nan_grad_params)} params at epoch {epoch} batch {i}")
-                                self.monitor.debug_logger.warning(f"NaN grad params: {nan_grad_params[:10]}")  # 只显示前10个
-                        
-                        self.clip_grad_norm_by_layer(self.model, max_norm=5.0)
-
-                        # 记录梯度信息（每100个batch）
-                        if self.monitor and i % 100 == 0:
-                            # log_gradients 现在包含了原来的 flow analysis 功能
-                            self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
-
-                        self.scaler.step(optimizer)
-                        self.scaler.update()
-                    else:
-                        if self.monitor: self.monitor.debug_logger.warning(f"⚠️  Skipping step at epoch {epoch} batch {i}: No gradients found (likely disconnected graph or unused params).")
-                        # Debug info for first occurrence
-                        if i == 0:
-                            trainable_params = [n for n, p in self.model.named_parameters() if p.requires_grad]
-                            if self.monitor: self.monitor.debug_logger.warning(f"Trainable params count: {len(trainable_params)}")
-                            if self.monitor: self.monitor.debug_logger.warning("Sample trainable params with None grad:")
-                            count = 0
-                            for n, p in self.model.named_parameters():
-                                if p.requires_grad and p.grad is None:
-                                    if self.monitor: self.monitor.debug_logger.warning(f"  - {n}")
-                                    count += 1
-                                    if count > 10: break
-                else:
-                    loss.backward()
-                    
-                    # 【修改】使用分层梯度裁剪
-                    self.clip_grad_norm_by_layer(self.model, max_norm=5.0)
-
-                    # 记录梯度信息（每100个batch）
-                    if self.monitor and i % 100 == 0:
-                        self.monitor.log_gradients(self.model, f"epoch_{epoch}_batch_{i}")
-
-                    optimizer.step()
-
-                # 更新损失记录
-                for key, val in loss_dict.items():
-                    if key in loss_meters:
-                        loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
-                
-                # 记录详细损失分解（每100个batch）
-                if self.monitor and i % 100 == 0:
-                    self.monitor.log_loss_breakdown(loss_dict, epoch, i)
-
-                # 记录批次信息
-                if self.monitor and i % 200 == 0:  # 每200个批次记录一次
-                    current_lr = optimizer.param_groups[0]['lr']
-                    self.monitor.log_batch_info(epoch, i, total_batches,
-                                              {k: v.avg for k, v in loss_meters.items()},
-                                              current_lr, print_to_console=False)
-                
-                global_step += 1
-
-            progress_bar.close()
-            
-            # 只在stage未改变时调用lr_scheduler.step()
-            if not stage_changed:
-                lr_scheduler.step()
-
-            # 记录epoch信息
-            if self.monitor:
-                epoch_metrics = {k: v.avg for k, v in loss_meters.items()}
-                self.monitor.log_epoch_info(epoch, self.args.epochs, epoch_metrics)
-
-            # === 清理显存，准备评估 ===
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            
-            # 每个epoch结束后进行评估
-            if query_loader and gallery_loader:
-                # 评估模型
-                evaluator = Evaluator(self.model, args=self.args)
-                metrics = evaluator.evaluate(
-                    query_loader, gallery_loader, query_loader.dataset.data,
-                    gallery_loader.dataset.data, checkpoint_path=None, epoch=epoch
-                )
-
-                current_mAP = metrics['mAP']
-
-                # 同时在终端和日志显示评估结果
-                print(f"\n{'='*60}")
-                print(f"Epoch {epoch} Evaluation Results:")
-                print(f"  mAP:    {metrics['mAP']:.4f}")
-                print(f"  Rank-1: {metrics['rank1']:.4f}")
-                print(f"  Rank-5: {metrics['rank5']:.4f}")
-                print(f"  Rank-10: {metrics['rank10']:.4f}")
-                print(f"{'='*60}\n")
-                
-                # 同时记录到日志文件
-                if self.monitor:
-                    self.monitor.logger.info(f"Epoch {epoch}: mAP={metrics['mAP']:.4f}, R1={metrics['rank1']:.4f}, R5={metrics['rank5']:.4f}, R10={metrics['rank10']:.4f}")
-
-                # 【新增】早停检查
-                early_stopping(current_mAP)
-                if early_stopping.early_stop:
-                    if self.monitor:
-                        self.monitor.logger.info(f"Training stopped early at epoch {epoch}")
-                    break
-
-                # 保存最优检查点
-                if current_mAP > best_mAP:
-                    best_mAP = current_mAP
-
-                    # 生成最佳检查点路径
-                    if checkpoint_dir:
-                        # 确保 checkpoint_dir 是 Path 对象
-                        ckpt_dir_path = Path(checkpoint_dir)
-                        
-                        # 创建 model 子目录
-                        model_dir = ckpt_dir_path / 'model'
-                        model_dir.mkdir(parents=True, exist_ok=True)
-
-                        # 获取数据集短名称用于文件名 (例如 cuhk, rstp, icfg)
-                        dataset_short_name = self._get_dataset_name()
-                        
-                        # 构建完整路径: log/dataset_name/model/best_dataset.pth
-                        new_best_checkpoint_path = str(model_dir / f"best_{dataset_short_name}.pth")
-
-                        # 删除旧的最佳检查点
-                        if best_checkpoint_path and Path(best_checkpoint_path).exists():
-                            try:
-                                Path(best_checkpoint_path).unlink()
-                                if self.monitor:
-                                    self.monitor.logger.info(f"Removed old best checkpoint: {best_checkpoint_path}")
-                            except OSError:
-                                if self.monitor:
-                                    self.monitor.logger.warning(f"Could not remove old best checkpoint: {best_checkpoint_path}")
-
-                        # 保存新的最佳检查点
-                        save_checkpoint({
-                            'model': self.model.state_dict(),
-                            'optimizer': optimizer.state_dict(),
-                            'lr_scheduler': lr_scheduler.state_dict(),
-                            'epoch': epoch,
-                            'mAP': current_mAP
-                        }, fpath=new_best_checkpoint_path)
-
-                        best_checkpoint_path = new_best_checkpoint_path
-
-                        if self.monitor:
-                            self.monitor.debug_logger.debug(f"New best checkpoint saved: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
-                    else:
-                        if self.monitor:
-                            self.monitor.logger.warning("checkpoint_dir not provided, cannot save best checkpoint")
-
-        # 显示训练完成信息（终端+日志）
-        print(f"\n{'='*60}")
-        print(f"🎉 Training Completed!")
-        print(f"   Best mAP: {best_mAP:.4f}")
-        if best_checkpoint_path:
-            print(f"   Best Model: {best_checkpoint_path}")
-        print(f"{'='*60}\n")
-        
-        if self.monitor:
-            self.monitor.logger.info(f"Training completed. Best mAP: {best_mAP:.4f}")
-
-        # 显示最终平均损失
-        avg_losses = self._format_loss_display(loss_meters)
-        if avg_losses:
-            avg_loss_str = ', '.join(avg_losses)
-            print(f"[Final Avg Loss]: {avg_loss_str}")
-            if self.monitor:
-                self.monitor.logger.info(f"[Final Avg Loss]: {avg_loss_str}")
-
-        if best_checkpoint_path:
-            if self.monitor: self.monitor.logger.info(f"Final best checkpoint: {best_checkpoint_path}, mAP: {best_mAP:.4f}")
+        return best_mAP, best_checkpoint_path
 
     def _get_dataset_name(self):
         """获取数据集名称用于模型文件命名"""

@@ -30,11 +30,15 @@ class Evaluator:
     def evaluate(self, query_loader, gallery_loader, query_data, gallery_data, 
                  checkpoint_path=None, epoch=None):
         """
-        执行评估
+        执行评估 - Text-to-Image ReID
+        
+        🔥 修复：正确的Text-to-Image ReID评估
+        - Query: 使用文本特征 (encode_text)
+        - Gallery: 使用图像特征 (encode_image)
         
         Args:
-            query_loader: Query数据加载器
-            gallery_loader: Gallery数据加载器
+            query_loader: Query数据加载器（文本）
+            gallery_loader: Gallery数据加载器（图像）
             query_data: Query数据集
             gallery_data: Gallery数据集
             checkpoint_path: 检查点路径（可选）
@@ -46,19 +50,18 @@ class Evaluator:
         self.model.eval()
         
         with torch.no_grad():
-            # 提取query特征
+            # 🔥 修复：Query使用文本特征
             query_features = []
             query_pids = []
             query_camids = []
             
-            for batch in tqdm(query_loader, desc="Extracting query features"):
+            for batch in tqdm(query_loader, desc="Extracting query text features"):
                 images, _, captions, pids, cam_ids, _ = batch
-                images = images.to(self.device)
                 
-                # 获取图像特征
-                image_embeds = self.model.encode_image(images)
+                # 🔥 使用文本编码器而不是图像编码器
+                text_embeds = self.model.encode_text(captions)
                 
-                query_features.append(image_embeds.cpu())
+                query_features.append(text_embeds.cpu())
                 query_pids.append(pids)
                 query_camids.append(cam_ids)
             
@@ -66,16 +69,16 @@ class Evaluator:
             query_pids = torch.cat(query_pids, dim=0).numpy()
             query_camids = torch.cat(query_camids, dim=0).numpy()
             
-            # 提取gallery特征
+            # Gallery使用图像特征（这部分是正确的）
             gallery_features = []
             gallery_pids = []
             gallery_camids = []
             
-            for batch in tqdm(gallery_loader, desc="Extracting gallery features"):
+            for batch in tqdm(gallery_loader, desc="Extracting gallery image features"):
                 images, _, captions, pids, cam_ids, _ = batch
                 images = images.to(self.device)
                 
-                # 获取图像特征
+                # 使用图像编码器
                 image_embeds = self.model.encode_image(images)
                 
                 gallery_features.append(image_embeds.cpu())
@@ -86,7 +89,7 @@ class Evaluator:
             gallery_pids = torch.cat(gallery_pids, dim=0).numpy()
             gallery_camids = torch.cat(gallery_camids, dim=0).numpy()
         
-        # 计算相似度矩阵
+        # 计算相似度矩阵（文本 x 图像）
         query_features = query_features / query_features.norm(dim=1, keepdim=True)
         gallery_features = gallery_features / gallery_features.norm(dim=1, keepdim=True)
         

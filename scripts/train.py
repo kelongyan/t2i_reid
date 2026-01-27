@@ -30,9 +30,9 @@ def configuration():
     parser.add_argument('-j', '--workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--height', type=int, default=224, help='Image height')
     parser.add_argument('--width', type=int, default=224, help='Image width')
-    parser.add_argument('--lr', type=float, default=0.00003, help='Learning rate (reduced for stability)')
+    parser.add_argument('--lr', type=float, default=0.0001, help='🔥 Learning rate (从3e-5提升到1e-4)')
     parser.add_argument('--weight-decay', type=float, default=0.001, help='Weight decay')
-    parser.add_argument('--warmup-step', type=int, default=500, help='Warmup steps')
+    parser.add_argument('--warmup-step', type=int, default=1000, help='🔥 Warmup steps (从500提升到1000)')
     parser.add_argument('--milestones', nargs='+', type=int, default=[40, 60], help='Milestones for LR scheduler')
     parser.add_argument('--epochs', type=int, default=80, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
@@ -85,15 +85,22 @@ def configuration():
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14],
                        help='Image patch grid size (h, w) for FSHD frequency splitting')
 
-    # Loss weights (AH-Net Configuration + 方案书 Phase 3)
+    # Loss weights (AH-Net Configuration + Curriculum Learning)
+    # 🔥 修复后的损失权重（与 curriculum.py 保持一致）
     parser.add_argument('--loss-info-nce', type=float, default=1.0, help='InfoNCE loss weight')
-    parser.add_argument('--loss-id-triplet', type=float, default=1.0, help='ID Triplet loss weight')
-    parser.add_argument('--loss-cloth-semantic', type=float, default=0.5, help='Cloth semantic loss weight')
-    parser.add_argument('--loss-reconstruction', type=float, default=0.5, help='Reconstruction loss weight')
-    parser.add_argument('--loss-spatial-orthogonal', type=float, default=0.1, help='Spatial Orthogonal loss weight')
-    parser.add_argument('--loss-semantic-alignment', type=float, default=0.1, help='Semantic Alignment loss weight (方案书 Phase 3)')
-    
-    # [Deprecated Losses are removed from CLI]
+    parser.add_argument('--loss-id-triplet', type=float, default=2.0, help='🔥 ID Triplet loss weight (Phase 1: 2.0, 从10.0修复)')
+    parser.add_argument('--loss-cloth-semantic', type=float, default=0.1, help='🔥 Cloth semantic loss weight (Phase 1: 0.1, 从0.01修复)')
+    parser.add_argument('--loss-spatial-orthogonal', type=float, default=0.0, help='Spatial Orthogonal loss weight (Phase 1: 0.0)')
+    parser.add_argument('--loss-semantic-alignment', type=float, default=0.0, help='Semantic Alignment loss weight (Phase 1: 0.0)')
+    parser.add_argument('--loss-ortho-reg', type=float, default=0.0, help='Query Orthogonality Regularization weight (Phase 1: 0.0)')
+
+    # 🔥 对抗式解耦损失权重（Curriculum Learning动态调整）
+    parser.add_argument('--loss-adversarial-attr', type=float, default=0.0, help='Adversarial Attribute loss weight (Phase 1: 0.0)')
+    parser.add_argument('--loss-adversarial-domain', type=float, default=0.0, help='Adversarial Domain loss weight (Phase 1: 0.0)')
+    parser.add_argument('--loss-discriminator-attr', type=float, default=0.0, help='Discriminator Attribute loss weight (Phase 1: 0.0)')
+    parser.add_argument('--loss-discriminator-domain', type=float, default=0.0, help='Discriminator Domain loss weight (Phase 1: 0.0)')
+
+    # [Deprecated] Reconstruction loss 已移除，不再使用
 
     # [New] Visualization parameters
     parser.add_argument('--visualization-enabled', action='store_true', help='Enable FSHD visualization')
@@ -116,14 +123,19 @@ def configuration():
     if args.loss_weights:
         args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
     else:
-        # AH-Net 损失权重配置 + 方案书 Phase 3
+        # 🔥 完整的损失权重配置（包含对抗式解耦）
+        # 注意：这些是Phase 1的初始值，后续会被CurriculumScheduler动态调整
         args.disentangle['loss_weights'] = {
             'info_nce': args.loss_info_nce,
             'cloth_semantic': args.loss_cloth_semantic,
             'id_triplet': args.loss_id_triplet,
-            'reconstruction': args.loss_reconstruction,
             'spatial_orthogonal': args.loss_spatial_orthogonal,
-            'semantic_alignment': args.loss_semantic_alignment  # 🔥 方案书 Phase 3
+            'semantic_alignment': args.loss_semantic_alignment,
+            'ortho_reg': args.loss_ortho_reg,
+            'adversarial_attr': args.loss_adversarial_attr,
+            'adversarial_domain': args.loss_adversarial_domain,
+            'discriminator_attr': args.loss_discriminator_attr,
+            'discriminator_domain': args.loss_discriminator_domain
         }
     
     # 初始化可视化配置
@@ -415,49 +427,40 @@ class Runner:
             else:
                 task_params.append(param)
         
-        # --- Stage Logic ---
+        # --- Stage Logic (🔥 Optimized for Full Training) ---
         
-        # Common settings
-        clip_lr_ratio = 0.1  # CLIP needs lower LR
+        # 🔥 全量训练模式：使用分层学习率
+        clip_lr_ratio = 0.05  # 🔥 降低到0.05（原0.1），CLIP更敏感
         
         groups = []
         
-        # Always add task and adapter params with full LR
+        # 1. Task modules: 全速学习率
         groups.append({'params': task_params, 'lr': base_lr, 'name': 'task_modules'})
         groups.append({'params': text_adapter_params, 'lr': base_lr, 'name': 'text_adapter'})
         
-        if stage == 1: 
-            # Stage 1: ViT High (0.3x)
+        # 2. 🔥 改进：分层学习率（无论stage如何）
+        # Vim/ViT: 浅层更慢，深层更快
+        if vit_embed_params:
+            groups.append({'params': vit_embed_params, 'lr': base_lr * 0.01, 'name': 'vit_embed'})
+        if vit_low_params:
+            groups.append({'params': vit_low_params, 'lr': base_lr * 0.05, 'name': 'vit_low'})
+        if vit_mid_params:
+            groups.append({'params': vit_mid_params, 'lr': base_lr * 0.1, 'name': 'vit_mid'})
+        if vit_high_params:
+            groups.append({'params': vit_high_params, 'lr': base_lr * 0.2, 'name': 'vit_high'})
+        
+        # 3. CLIP: 非常低的学习率
+        if clip_params:
+            groups.append({'params': clip_params, 'lr': base_lr * clip_lr_ratio, 'name': 'clip_encoder'})
+
+        elif stage == 4:
+            # 🔥 Stage 4: All (降低Vim学习率)
+            groups.append({'params': vit_embed_params, 'lr': base_lr * 0.02, 'name': 'vit_embed'})
+            groups.append({'params': vit_low_params, 'lr': base_lr * 0.1, 'name': 'vit_low'})
+            groups.append({'params': vit_mid_params, 'lr': base_lr * 0.2, 'name': 'vit_mid'})
             groups.append({'params': vit_high_params, 'lr': base_lr * 0.3, 'name': 'vit_high'})
-            # CLIP is frozen in Stage 1 usually, but if not, give it very low LR
-            if clip_params:
-                groups.append({'params': clip_params, 'lr': base_lr * clip_lr_ratio * 0.5, 'name': 'clip_encoder'})
-
-        elif stage == 2: 
-            # Stage 2: ViT High (0.5x) + CLIP High (if unfrozen)
-            groups.append({'params': vit_high_params, 'lr': base_lr * 0.5, 'name': 'vit_high'})
-            if clip_params:
-                groups.append({'params': clip_params, 'lr': base_lr * clip_lr_ratio, 'name': 'clip_encoder'})
-
-        elif stage == 3: 
-            # Stage 3: ViT Mid+High (0.6x)
-            groups.append({'params': vit_mid_params + vit_high_params, 'lr': base_lr * 0.6, 'name': 'vit_mid_high'})
-            if clip_params:
-                groups.append({'params': clip_params, 'lr': base_lr * clip_lr_ratio, 'name': 'clip_encoder'})
-
-        elif stage == 4: 
-            # Stage 4: All
-            groups.append({'params': vit_embed_params, 'lr': base_lr * 0.05, 'name': 'vit_embed'})
-            groups.append({'params': vit_low_params, 'lr': base_lr * 0.2, 'name': 'vit_low'})
-            groups.append({'params': vit_mid_params, 'lr': base_lr * 0.4, 'name': 'vit_mid'})
-            groups.append({'params': vit_high_params, 'lr': base_lr * 0.6, 'name': 'vit_high'})
-            
-            if clip_params:
-                groups.append({'params': clip_params, 'lr': base_lr * clip_lr_ratio, 'name': 'clip_encoder'})
-                
-        else:
-            raise ValueError(f"Invalid stage: {stage}")
-            
+        
+        # 🔥 移除stage 4及else分支的错误
         return groups
 
     def build_optimizer(self, model, stage=1):
@@ -579,20 +582,19 @@ class Runner:
         if args.finetune_from:
             self.load_param(model, args.finetune_from)
 
-        # === Stage 1 Initialization ===
+        # === 🔥 新策略：Warmup Freeze (防止梯度冲击) ===
         console_logger.info("=" * 60)
         console_logger.info("🚀 Training Start: CLIP + Vim Architecture")
-        console_logger.info("   Stage 1: Freeze CLIP / Unfreeze Vim Last 4")
-        console_logger.info("   ⚠️  Emergency Fix Mode:")
-        console_logger.info("      - Frequency losses DISABLED (Stage 1)")
-        console_logger.info("      - Semantic alignment DISABLED (Stage 1)")
-        console_logger.info("      - Progressive unfreezing DELAYED (Epoch 20+)")
-        console_logger.info("      - Learning rate REDUCED (3e-5)")
+        console_logger.info("   ❄️  STRATEGY: Backbone Frozen for Warmup (Epoch 0-5)")
+        console_logger.info("   🔒 CLIP Text Encoder: FROZEN")
+        console_logger.info("   🔒 Vim Visual Encoder: FROZEN")
+        console_logger.info("   📊 Optimized Loss Weights: id_triplet=1.0 (Stabilized)")
         console_logger.info("=" * 60)
         
-        # Initial Freeze State
-        self.freeze_text_layers(model, unfreeze_from_layer=None) # Freeze CLIP
-        self.freeze_vit_layers(model, unfreeze_from_layer=8)     # Unfreeze Vim Last 4
+        # 🔥 关键修改：初始阶段冻结骨干网络，只训练 Heads 和 AH-Net
+        self.freeze_text_layers(model, unfreeze_from_layer=None)  # 冻结全部CLIP
+        self.freeze_vit_layers(model, unfreeze_from_layer=None)   # 冻结全部Vim
+
 
         console_logger.info("Building optimizer...")
         optimizer = self.build_optimizer(model, stage=1)

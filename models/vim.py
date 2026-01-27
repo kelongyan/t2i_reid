@@ -121,6 +121,10 @@ class VimMamba(nn.Module):
         """
         batch, seqlen, dim = hidden_states.shape
 
+        # 🔥 NaN检测：输入检查
+        if torch.isnan(hidden_states).any():
+            hidden_states = torch.nan_to_num(hidden_states, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # 1. Project and Split
         xz = self.in_proj(hidden_states).transpose(1, 2) # [B, 2*d_inner, L]
         x, z = xz.chunk(2, dim=1)
@@ -130,15 +134,19 @@ class VimMamba(nn.Module):
         x_fwd = x
         if self.d_conv > 1:
             x_fwd = self.conv1d(x)[:, :, :seqlen]
-        
+
         x_fwd = x_fwd.transpose(1, 2) # [B, L, d_inner]
-        
+
         # SSM Forward
         A = -torch.exp(self.A_log.float())
         x_dbl = self.x_proj(x_fwd) # [B, L, dt_rank + 2*d_state]
         dt, B_fwd, C_fwd = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt = self.dt_proj(dt) # [B, L, d_inner]
-        
+
+        # 🔥 梯度裁剪：防止数值爆炸
+        x_fwd = torch.clamp(x_fwd, min=-10.0, max=10.0)
+        dt = torch.clamp(dt, min=1e-5, max=1.0)  # 限制delta范围
+
         # [Fix] Force ALL inputs to float32 for selective_scan_fn numerical stability & type matching
         x_fwd = x_fwd.float()
         dt = dt.float()
@@ -147,31 +155,39 @@ class VimMamba(nn.Module):
         C_fwd = C_fwd.transpose(1, 2).float() # [B, N, L]
         D_fwd = self.D.float()
         delta_bias_fwd = self.dt_proj.bias.float()
-        
+
         # selective_scan_fn requires [B, D, L] for u and delta
         y_fwd = selective_scan_fn(
             x_fwd.transpose(1, 2), # [B, D, L]
             dt.transpose(1, 2),    # [B, D, L]
             A,
-            B_fwd, 
-            C_fwd, 
+            B_fwd,
+            C_fwd,
             D_fwd,
             z=None, delta_bias=delta_bias_fwd, delta_softplus=True, return_last_state=False
         )
-        
+
+        # 🔥 NaN检测：Forward输出
+        if torch.isnan(y_fwd).any():
+            y_fwd = torch.nan_to_num(y_fwd, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # 3. Backward Path
         x_bwd = x.flip([-1]) # Reverse along sequence dimension
         if self.d_conv > 1:
             x_bwd = self.conv1d_b(x_bwd)[:, :, :seqlen]
-            
+
         x_bwd = x_bwd.transpose(1, 2) # [B, L, d_inner]
-        
+
         # SSM Backward
         A_b = -torch.exp(self.A_b_log.float())
         x_dbl_b = self.x_proj_b(x_bwd)
         dt_b, B_bwd, C_bwd = torch.split(x_dbl_b, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         dt_b = self.dt_proj_b(dt_b)
-        
+
+        # 🔥 梯度裁剪：backward分支
+        x_bwd = torch.clamp(x_bwd, min=-10.0, max=10.0)
+        dt_b = torch.clamp(dt_b, min=1e-5, max=1.0)
+
         # [Fix] Force ALL inputs to float32 for backward branch
         x_bwd = x_bwd.float()
         dt_b = dt_b.float()
@@ -180,7 +196,7 @@ class VimMamba(nn.Module):
         C_bwd = C_bwd.transpose(1, 2).float()
         D_bwd = self.D_b.float()
         delta_bias_bwd = self.dt_proj_b.bias.float()
-        
+
         y_bwd = selective_scan_fn(
             x_bwd.transpose(1, 2), # [B, D, L]
             dt_b.transpose(1, 2),  # [B, D, L]
@@ -190,16 +206,29 @@ class VimMamba(nn.Module):
             D_bwd,
             z=None, delta_bias=delta_bias_bwd, delta_softplus=True, return_last_state=False
         )
-        
+
+        # 🔥 NaN检测：Backward输出
+        if torch.isnan(y_bwd).any():
+            y_bwd = torch.nan_to_num(y_bwd, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # Flip backward output back
         y_bwd = y_bwd.flip([2]) # Flip along length dim (last dim)
-        
+
         # 4. Gate and Combine
         y = y_fwd + y_bwd
         y = y * F.silu(z) # z is already [B, D, L]
-        
+
+        # 🔥 NaN检测：最终输出
+        if torch.isnan(y).any():
+            y = torch.nan_to_num(y, nan=0.0, posinf=1.0, neginf=-1.0)
+
         # 5. Output Project
         out = self.out_proj(y.transpose(1, 2))
+
+        # 🔥 最终NaN检测
+        if torch.isnan(out).any():
+            out = torch.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0)
+
         return out
 
 
