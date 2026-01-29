@@ -37,10 +37,17 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
         progress = (epoch - 1) / trainer.args.epochs
         trainer.model.adversarial_decoupler.update_lambda(progress)
     
-    # 动态调整进度条宽度
+    # 动态调整进度条宽度：优先尝试从 STDIN (fd=0) 获取宽度，以绕过 pipe/tee 的限制
     import shutil
-    term_width = shutil.get_terminal_size((80, 20)).columns
-    tqdm_width = min(term_width, 120) if term_width > 10 else 80
+    import os
+    try:
+        # 尝试从 stdin 获取真实的 TTY 宽度
+        term_width = os.get_terminal_size(0).columns
+    except OSError:
+        # 如果失败（例如后台运行），回退到 shutil 检测
+        term_width = shutil.get_terminal_size((80, 20)).columns
+    
+    tqdm_width = term_width
 
     for key in weights.keys():
         if key not in loss_meters:
@@ -50,7 +57,7 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
     
     progress_bar = tqdm(
         train_loader, 
-        desc=f"[阶段 {phase}] [Epoch {epoch}/{trainer.args.epochs}]",
+        desc=f"[Phase {phase}] [Epoch {epoch}/{trainer.args.epochs}]",
         ncols=tqdm_width, 
         leave=True,
         total=total_batches
@@ -62,7 +69,7 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
         
         # 计算特征提取损失
         loss_dict = trainer.run(inputs, epoch, batch_idx, total_batches, training_phase='feature')
-        loss = loss_dict.get('internal_real_total', loss_dict['total'])
+        loss = loss_dict['total']
         
         # 异常检测与反向传播
         if torch.isnan(loss).any() or torch.isinf(loss).any():
@@ -88,7 +95,7 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
             if trainer.curriculum.should_train_discriminator(epoch, batch_idx, total_batches):
                 optimizer_disc.zero_grad()
                 loss_dict_disc = trainer.run(inputs, epoch, batch_idx, total_batches, training_phase='discriminator')
-                loss_disc = loss_dict_disc.get('internal_real_total', loss_dict_disc['total'])
+                loss_disc = loss_dict_disc['total']
                 
                 if not (torch.isnan(loss_disc).any() or torch.isinf(loss_disc).any()):
                     loss_disc.backward()
@@ -102,7 +109,7 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
             if key in loss_meters:
                 loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
         
-        display_loss = loss_dict.get('curriculum_weighted_loss', loss).item()
+        display_loss = loss.item()
         progress_bar.set_postfix_str(f"损失: {display_loss:.4f}")
     
     progress_bar.close()

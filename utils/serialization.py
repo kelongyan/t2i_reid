@@ -3,13 +3,11 @@ import json
 import os
 import os.path as osp
 import shutil
+import errno
 from pathlib import Path
 
 import torch
 from torch.nn import Parameter
-
-import os
-import errno
 
 def mkdir_if_missing(dir_path):
     try:
@@ -20,25 +18,18 @@ def mkdir_if_missing(dir_path):
 
 
 def read_json(fpath):
-    # 项目根目录定位
-    ROOT_DIR = Path(__file__).parent.parent.parent  # 从 src/utils/ 到 TextGuidedReID/
-    fpath = os.path.join(ROOT_DIR, fpath) if not os.path.isabs(fpath) else fpath
     with open(fpath, 'r') as f:
         obj = json.load(f)
     return obj
 
 
 def write_json(obj, fpath):
-    ROOT_DIR = Path(__file__).parent.parent.parent
-    fpath = os.path.join(ROOT_DIR, fpath) if not os.path.isabs(fpath) else fpath
     mkdir_if_missing(osp.dirname(fpath))
     with open(fpath, 'w') as f:
         json.dump(obj, f, indent=4, separators=(',', ': '))
 
 
 def save_checkpoint(state, is_best=False, fpath='checkpoint.pth.tar'):
-    ROOT_DIR = Path(__file__).parent.parent.parent
-    fpath = os.path.join(ROOT_DIR, fpath) if not os.path.isabs(fpath) else fpath
     mkdir_if_missing(osp.dirname(fpath))
     torch.save(state, fpath)
     if is_best:
@@ -46,8 +37,6 @@ def save_checkpoint(state, is_best=False, fpath='checkpoint.pth.tar'):
 
 
 def load_checkpoint(fpath):
-    ROOT_DIR = Path(__file__).parent.parent.parent
-    fpath = os.path.join(ROOT_DIR, fpath) if not os.path.isabs(fpath) else fpath
     if os.path.isfile(fpath):
         checkpoint = torch.load(fpath, map_location=torch.device('cpu'), weights_only=True)
         print("=> Loaded checkpoint '{}'".format(fpath))

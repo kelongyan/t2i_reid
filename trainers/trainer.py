@@ -75,38 +75,6 @@ class Trainer:
         # 混合精度训练配置
         self.scaler = torch.amp.GradScaler('cuda', enabled=args.fp16) if self.device.type == 'cuda' else None
 
-    def reinit_clip_bias_layers(self, model, logger=None):
-        # 针对 CLIP 文本编码器的 bias 层执行重新初始化，用于加速特定阶段的收敛
-        reinitialized_count = 0
-        for name, param in model.named_parameters():
-            if 'text_encoder' in name and 'bias' in name and param.requires_grad:
-                nn.init.normal_(param, std=0.02)
-                reinitialized_count += 1
-        if logger:
-            logger.debug_logger.info(f"已重置 {reinitialized_count} 个 CLIP bias 参数")
-    
-    def build_optimizer_with_lr_groups(self, model, stage):
-        # 为模型不同部分（如骨干网络与解耦模块）创建具有差异化学习率的优化器组
-        if stage >= 2:
-            clip_params, other_params = [], []
-            for name, param in model.named_parameters():
-                if param.requires_grad:
-                    if 'text_encoder.text_model.encoder' in name:
-                        try:
-                            layer_num = int(name.split('.')[4])
-                            if layer_num >= 11:
-                                clip_params.append(param)
-                                continue
-                        except: pass
-                    other_params.append(param)
-            
-            if clip_params:
-                param_groups = [
-                    {'params': clip_params, 'lr': self.args.lr * 0.5, 'name': 'clip_finetune'},
-                    {'params': other_params, 'lr': self.args.lr, 'name': 'task_modules'}
-                ]
-                return torch.optim.AdamW(param_groups, weight_decay=self.args.weight_decay)
-        return torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=self.args.lr, weight_decay=self.args.weight_decay)
     
     def clip_grad_norm_by_layer(self, model, max_norm=1.0):
         # 实现分层梯度裁剪，针对 Vision Mamba 等数值敏感模块应用更严格的约束以防止梯度爆炸

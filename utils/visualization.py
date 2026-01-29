@@ -64,12 +64,7 @@ class FSHDVisualizer:
         if attn.max() > attn.min():
             attn = (attn - attn.min()) / (attn.max() - attn.min())
         
-        # 2. Resize to Image Size
-        # For 'low' resolution (ID map), use INTER_NEAREST to show blocky structure?
-        # Or INTER_CUBIC for smooth looking?
-        # Academic standard usually prefers smooth for heatmaps, but let's try to preserve
-        # the "coarse" nature if possible. However, 12x4 is too coarse.
-        # Let's use smooth resize for better aesthetics.
+        # 2. Resize to Image Size using smooth interpolation for better aesthetics
         attn_resized = cv2.resize(attn, (W, H), interpolation=cv2.INTER_CUBIC)
         
         # 3. Colorize

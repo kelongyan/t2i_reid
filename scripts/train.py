@@ -66,9 +66,6 @@ def configuration():
     # 解耦模块（AH-Net/G-S3）相关参数
     parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
     parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
-    parser.add_argument('--disentangle-type', type=str, default='ahnet',
-                       choices=['ahnet', 'fshd', 'simple'],
-                       help='Type of disentangle module')
     parser.add_argument('--gs3-num-heads', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--gs3-d-state', type=int, default=16, help='State dimension for G-S3')
     parser.add_argument('--gs3-d-conv', type=int, default=4, help='Conv kernel size for G-S3')
@@ -396,7 +393,6 @@ class Runner:
             'vim_pretrained': args.vim_pretrained,
             'img_size': (args.height, args.width),
             'num_classes': args.num_classes,
-            'disentangle_type': args.disentangle_type,
             'gs3': {
                 'num_heads': args.gs3_num_heads,
                 'd_state': args.gs3_d_state,

@@ -125,15 +125,6 @@ class AHNetModule(nn.Module):
         self.id_attn = MultiHeadAttention2D(dim, num_heads=8)
         self.attr_attn = MultiHeadAttention2D(dim, num_heads=8)
         
-        # 4. 特征重构解码器
-        self.decoder = nn.Sequential(
-            nn.Linear(dim, dim),
-            nn.LayerNorm(dim),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(dim, dim)
-        )
-        
         self._init_weights()
 
     def _compute_conflict_score(self, map_id, map_attr):
@@ -172,8 +163,6 @@ class AHNetModule(nn.Module):
         ortho_reg = (q_id_norm * q_attr_norm).sum(dim=1).abs().mean()
 
         # 5. 特征重构：验证解耦特征是否完整保留了原始信息
-        recon_input = v_id + v_attr
-        recon_feat = self.decoder(recon_input)
         original_global = x_grid.mean(dim=(2, 3))
 
         if self.logger and hasattr(self, '_log_counter'):
@@ -187,7 +176,6 @@ class AHNetModule(nn.Module):
             'map_id': map_id_up,
             'map_attr': map_attr,
             'conflict_score': conflict_score,
-            'recon_feat': recon_feat,
             'target_feat': original_global,
             'ortho_reg': ortho_reg,
             'v_id': v_id,
@@ -198,14 +186,6 @@ class AHNetModule(nn.Module):
     
     def _init_weights(self):
         # 解码器权重初始化
-        for m in self.decoder.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_normal_(m.weight, gain=0.1)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.ones_(m.weight)
-                nn.init.zeros_(m.bias)
+        pass
 
-# 别名设置
-FSHDModule = AHNetModule
+

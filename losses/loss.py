@@ -81,28 +81,6 @@ class HardNegativeTripletLoss(nn.Module):
         return loss
 
 
-class ReconstructionLoss(nn.Module):
-    # 特征重构损失：用于引导属性分支捕捉底层细节
-    def __init__(self, use_cosine=True, l1_weight=0.01):
-        super().__init__()
-        self.use_cosine = use_cosine
-        self.l1_weight = l1_weight
-        self.mse_loss = nn.MSELoss()
-
-    def forward(self, recon_feat, target_feat):
-        # 计算重构特征与目标特征的差异
-        if self.use_cosine:
-            # 使用余弦相似度损失 + L1 正则化
-            recon_norm = F.normalize(recon_feat, dim=-1, eps=1e-8)
-            target_norm = F.normalize(target_feat, dim=-1, eps=1e-8)
-            cosine_loss = 1.0 - (recon_norm * target_norm).sum(dim=-1).mean()
-            
-            l1_reg = torch.abs(recon_feat).mean()
-            return cosine_loss + self.l1_weight * l1_reg
-        else:
-            return self.mse_loss(recon_feat, target_feat)
-
-
 class SpatialOrthogonalLoss(nn.Module):
     # 空间互斥损失：最小化 ID 注意力图与 Attr 注意力图在空间上的重叠
     def __init__(self, temperature=5.0):
@@ -167,15 +145,6 @@ class Loss(nn.Module):
 
         self.loss_logger = LossLogger(logger.debug_logger) if logger else None
         
-        # 可选：初始化收敛预测器用于损失可视化校准
-        try:
-            from utils.convergence_analyzer import ConvergenceProjector
-            self.simulator = ConvergenceProjector(seed=42, dataset_name='cuhk')
-            self._enable_projection = True
-        except ImportError:
-            self.simulator = None
-            self._enable_projection = False
-
         # 默认损失权重配置（初始阶段侧重 ID 一致性）
         self.weights = weights if weights is not None else {
             'info_nce': 1.0,
@@ -307,18 +276,6 @@ class Loss(nn.Module):
                     total_loss += self.weights.get(key, 0.0) * value
 
         losses['total'] = total_loss
-
-        # 7. 可选：对损失组件进行全局同态缩放校准，以对齐可视化基准
-        if self._enable_projection and epoch is not None and self.simulator:
-            target_total = self.simulator.calibrate_loss_projection(epoch, total_epochs=60, learning_rate=self.base_lr)
-            scale_factor = target_total / max(1e-4, total_loss.item())
-            
-            losses['internal_real_total'] = total_loss
-            for key in losses:
-                if key == 'internal_real_total' or not isinstance(losses[key], torch.Tensor): continue
-                losses[key] = losses[key].detach() * scale_factor
-            
-            losses['curriculum_weighted_loss'] = torch.tensor(target_total, device=self._get_device())
 
         if self.logger and self.loss_logger and self._batch_counter % 100 == 0:
             self._batch_counter += 1

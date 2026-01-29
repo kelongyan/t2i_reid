@@ -49,7 +49,6 @@ python scripts/train.py \
     --clip-pretrained "pretrained/clip-vit-base-patch16" \
     --vision-backbone vim \
     --vim-pretrained "pretrained/Vision Mamba/vim_s_midclstok.pth" \
-    --disentangle-type ahnet \
     --gs3-img-size 14 14 \
     --optimizer "AdamW" \
     --scheduler "cosine" \

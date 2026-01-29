@@ -1,5 +1,5 @@
 from .model import Model
-from .ahnet_module import AHNetModule, FSHDModule
+from .ahnet_module import AHNetModule
 from .ahnet_streams import IDStructureStream, AttributeTextureStream
 from .semantic_guidance import SemanticGuidedDecoupling
 from .fusion import get_fusion_module
@@ -8,7 +8,6 @@ from .fusion import get_fusion_module
 __factory = {
     'Model': Model,
     'AHNetModule': AHNetModule,
-    'FSHDModule': FSHDModule, # 保留以兼容旧版本
     'IDStructureStream': IDStructureStream,
     'AttributeTextureStream': AttributeTextureStream,
     'SemanticGuidedDecoupling': SemanticGuidedDecoupling,

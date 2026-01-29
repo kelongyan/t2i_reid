@@ -32,11 +32,11 @@ class CurriculumScheduler:
         
         if logger:
             logger.debug_logger.info("=" * 70)
-            logger.debug_logger.info("📚 课程学习调度器已初始化")
+            logger.debug_logger.info("📚 Curriculum Scheduler Initialized")
             logger.debug_logger.info("=" * 70)
-            logger.debug_logger.info(f"阶段 1 (Epoch 1-{self.phase1_end}): 基础 ID 判别训练")
-            logger.debug_logger.info(f"阶段 2 (Epoch {self.phase1_end+1}-{self.phase2_end}): 对抗式特征解耦")
-            logger.debug_logger.info(f"阶段 3 (Epoch {self.phase2_end+1}+): 全局精细化微调")
+            logger.debug_logger.info(f"Phase 1 (Epoch 1-{self.phase1_end}): Base ID Discriminative Training")
+            logger.debug_logger.info(f"Phase 2 (Epoch {self.phase1_end+1}-{self.phase2_end}): Adversarial Feature Disentanglement")
+            logger.debug_logger.info(f"Phase 3 (Epoch {self.phase2_end+1}+): Global Fine-grained Refinement")
             logger.debug_logger.info("=" * 70)
     
     def get_current_phase(self, epoch):
@@ -72,7 +72,7 @@ class CurriculumScheduler:
                 latest_rank1 = performance_history[-1].get('rank1', 0.0)
                 if latest_rank1 > 0.30 and epoch >= 10:
                     if self.logger:
-                        self.logger.logger.info(f"🎯 性能触发提前过渡: Rank-1={latest_rank1:.1%} > 30%, 提前进入阶段 2")
+                        self.logger.logger.info(f"🎯 Performance triggered early transition: Rank-1={latest_rank1:.1%} > 30%, entering Phase 2 early")
                     return self.get_loss_weights(self.phase1_end + 1, performance_history)
 
         elif phase == 2:
@@ -97,7 +97,7 @@ class CurriculumScheduler:
                 recent_maps = [h.get('mAP', 0.0) for h in performance_history[-5:]]
                 if max(recent_maps) - min(recent_maps) < 0.01:
                     if self.logger:
-                        self.logger.logger.warning(f"⚠️ 检测到性能平台，动态调整权重以跳出局部最优")
+                        self.logger.logger.warning(f"⚠️ Performance plateau detected, dynamically adjusting weights to escape local optimum")
                     weights['id_triplet'] *= 1.2
                     weights['adversarial_attr'] *= 0.5
 
@@ -162,28 +162,28 @@ class CurriculumScheduler:
         width = min(max(term_width, 80), 100)
         
         phase_descriptions = {
-            1: "骨干网络适配与特征对齐阶段",
-            2: "基于对抗正则化的特征流形解耦阶段",
-            3: "双流语义融合与全局精细微调阶段"
+            1: "Backbone Adaptation & Feature Alignment",
+            2: "Adversarial Disentanglement on Feature Manifold",
+            3: "Dual-stream Fusion & Global Refinement"
         }
         
         phase_strategies = {
-            1: "带预热的标准 SGD | 解耦约束：已禁用",
-            2: "梯度反转层 (GRL) | 对抗权重线性平滑爬升",
-            3: "全模块联合优化 | 融合机制精细调优"
+            1: "Warmup + Standard SGD | Disentanglement: Disabled",
+            2: "GRL (Gradient Reversal) | Linear Weight Ramping",
+            3: "Joint Optimization | Fusion Mechanism Fine-tuning"
         }
         
         if self.logger:
             self.logger.logger.info(f"{'='*width}")
-            title = f"🚀 课程学习调度 | Epoch {epoch} | 阶段 {phase}"
+            title = f"🚀 Curriculum Schedule | Epoch {epoch} | Phase {phase}"
             self.logger.logger.info(f"{title}")
             self.logger.logger.info(f"{'-'*width}")
-            self.logger.logger.info(f"  📌 阶段目标:        {phase_descriptions.get(phase, '未知阶段')}")
-            self.logger.logger.info(f"  ⚙️  优化策略:        {phase_strategies.get(phase, '标准模式')}")
-            self.logger.logger.info(f"  📉 学习率缩放:      {lr_mult:.4f}x")
+            self.logger.logger.info(f"  📌 Phase Goal:       {phase_descriptions.get(phase, 'Unknown')}")
+            self.logger.logger.info(f"  ⚙️  Optimization:       {phase_strategies.get(phase, 'Standard')}")
+            self.logger.logger.info(f"  📉 LR Scaling:       {lr_mult:.4f}x")
             
             active_weights = [f"{k}={v:.4g}" for k, v in weights.items() if v > 1e-6]
-            self.logger.logger.info(f"  ⚖️  动态损失权重:")
+            self.logger.logger.info(f"  ⚖️  Dynamic Loss Weights:")
             for i in range(0, len(active_weights), 3):
                 line = " | ".join(active_weights[i:i+3])
                 self.logger.logger.info(f"      [{line}]")

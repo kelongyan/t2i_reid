@@ -363,11 +363,8 @@ class Model(nn.Module):
         text_embeds = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
         text_embeds = self.text_proj(text_embeds)
 
-        if self.text_encoder_v2:
-            out_v2 = self.text_encoder_v2(text_embeds)
-            text_embeds = out_v2['feat_id']
-        else:
-            text_embeds = text_embeds.mean(dim=1) 
+        out_v2 = self.text_encoder_v2(text_embeds)
+        text_embeds = out_v2['feat_id']
 
         text_embeds = self.shared_mlp(text_embeds)
         text_embeds = self.text_mlp(text_embeds)
@@ -417,7 +414,7 @@ class Model(nn.Module):
         main_instruction = id_instruction if id_instruction else cloth_instruction
         feat_attr_raw, feat_id_raw = None, None
         
-        if self.text_encoder_v2 and main_instruction:
+        if main_instruction:
             texts = main_instruction if isinstance(main_instruction, list) else [main_instruction]
             cache_key = tuple(texts)
             if len(self.text_cache) > 10000: self.text_cache.clear()
@@ -445,29 +442,6 @@ class Model(nn.Module):
             id_text_embeds = self.shared_mlp(feat_id_raw)
             id_text_embeds = self.text_mlp(id_text_embeds)
             id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
-        else:
-            # 处理无 V2 编码器的兜底逻辑
-            if cloth_instruction:
-                cloth_texts = [cloth_instruction] if isinstance(cloth_instruction, str) else cloth_instruction
-                cloth_tokens = self.tokenizer(cloth_texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
-                cloth_tokens = {k: v.to(device) for k, v in cloth_tokens.items()}
-                cloth_seq = self.text_encoder(**cloth_tokens).last_hidden_state
-                feat_attr_raw = self.text_proj(cloth_seq).mean(dim=1)
-            
-            if id_instruction:
-                id_texts = [id_instruction] if isinstance(id_instruction, str) else id_instruction
-                id_tokens = self.tokenizer(id_texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
-                id_tokens = {k: v.to(device) for k, v in id_tokens.items()}
-                id_seq = self.text_encoder(**id_tokens).last_hidden_state
-                feat_id_raw = self.text_proj(id_seq).mean(dim=1)
-            
-            cloth_text_embeds = None
-            if feat_attr_raw is not None:
-                cloth_text_embeds = torch.nn.functional.normalize(self.text_mlp(self.cloth_norm(self.shared_mlp(feat_attr_raw))), dim=-1, eps=1e-8)
-            
-            id_text_embeds = None
-            if feat_id_raw is not None:
-                id_text_embeds = torch.nn.functional.normalize(self.text_mlp(self.shared_mlp(feat_id_raw)), dim=-1, eps=1e-8)
 
         # === 特征融合处理 ===
         fused_embeds, gate_weights = None, None
