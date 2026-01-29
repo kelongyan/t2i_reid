@@ -1,65 +1,47 @@
 #!/bin/bash
-
 # ============================================================================
-# CUHK-PEDES Training Script - Updated Version
+# CUHK-PEDES Training Protocol | Stage: Deployment
 # ============================================================================
-# Current Architecture: CLIP + Vision Mamba (Vim) with Disentanglement Module
-# Core Features:
-#   • CLIP-based Text-Image ReID
-#   • Vision Mamba backbone
-#   • Disentanglement module (AH-Net)
-#   • Multi-modal fusion
+# Project:  Text-Image ReID with State-Space Models (Mamba)
+# Backbone: CLIP-ViT-B/16 + Vim-S (Vision Mamba)
+# Module:   AH-Net Disentanglement & ScagRcsmFusion
+# Config:   Standard Benchmark Protocol (Phase 1-3)
 # ============================================================================
 
-# Default parameter configuration
-DISENTANGLE_TYPE="ahnet"  # ahnet | simple
-ENABLE_VISUALIZATION=true
-RESUME_PATH=""
-FINETUNE_FROM=""
+# Environment Setup
+export OMP_NUM_THREADS=4
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+# Uncomment to specify GPU
+# export CUDA_VISIBLE_DEVICES=0,1
 
-echo "=========================================="
-echo "  CUHK-PEDES Training Script"
-echo "  Architecture: CLIP + Vision Mamba with Disentanglement"
-echo "=========================================="
-echo ""
-echo "Default config: disentangle=ahnet, visualization=true"
-echo "Parameter override examples: bash cuhk.sh --disentangle-type=simple --no-viz"
-echo ""
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+LOG_DIR="log/cuhk_pedes/${TIMESTAMP}"
+mkdir -p "$LOG_DIR"
 
-for arg in "$@"; do
-    case $arg in
-        --disentangle-type=*)
-            DISENTANGLE_TYPE="${arg#*=}"
-            ;;
-        --no-viz)
-            ENABLE_VISUALIZATION=false
-            ;;
-        --resume=*)
-            RESUME_PATH="${arg#*=}"
-            ;;
-        --finetune-from=*)
-            FINETUNE_FROM="${arg#*=}"
-            ;;
-        *)
-            echo "Unknown option: $arg"
-            ;;
-    esac
-done
+echo "================================================================================"
+echo "🚀 Initiating Training Protocol: CUHK-PEDES"
+echo "================================================================================"
+echo "  📅 Timestamp:      $TIMESTAMP"
+echo "  📂 Log Directory:  $LOG_DIR"
+echo "  🔧 Configuration:  AH-Net + Vim-S + CLIP"
+echo "================================================================================"
 
-# Clean Python cache
-echo "Cleaning cache files..."
-find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-find . -type f -name "*.pyc" -delete 2>/dev/null || true
+# Clean Python cache to prevent stale bytecode execution
+find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null
+find . -type f -name "*.pyc" -delete 2>/dev/null
 
-# JSON Config String
+# Dataset Configuration
+# Standard partition for CUHK-PEDES (11,003 identities)
 DATASET_CONFIG="[{'name': 'CUHK-PEDES', 'root': 'CUHK-PEDES', 'json_file': 'CUHK-PEDES/annotations/caption_all.json'}]"
 
-# Build base command
-CMD="python scripts/train.py \
+# Execution Command
+# Using 'tee' to capture stdout/stderr to log file for audit
+python scripts/train.py \
     --root datasets \
-    --dataset-configs \"${DATASET_CONFIG}\" \
+    --dataset-configs "${DATASET_CONFIG}" \
+    --logs-dir "${LOG_DIR}" \
     --batch-size 64 \
-    --lr 0.00003 \
+    --lr 0.0001 \
     --weight-decay 0.0002 \
     --epochs 60 \
     --milestones 30 50 \
@@ -70,51 +52,26 @@ CMD="python scripts/train.py \
     --print-freq 50 \
     --fp16 \
     --num-classes 11003 \
-    --clip-pretrained \"pretrained/clip-vit-base-patch16\" \
+    --clip-pretrained "pretrained/clip-vit-base-patch16" \
     --vision-backbone vim \
-    --vim-pretrained \"pretrained/Vision Mamba/vim_s_midclstok.pth\""
-
-# Add disentangle module configuration
-CMD="$CMD --disentangle-type $DISENTANGLE_TYPE"
-
-if [ "$DISENTANGLE_TYPE" = "ahnet" ]; then
-    CMD="$CMD --gs3-img-size 14 14"
-    echo "✓ Disentangle module: AH-Net (Mamba Structure + CNN Texture)"
-else
-    echo "✓ Disentangle module: Simple"
-fi
-
-# FSHD/AH-Net configuration parameters
-CMD="$CMD \
+    --vim-pretrained "pretrained/Vision Mamba/vim_s_midclstok.pth" \
+    --disentangle-type ahnet \
+    --gs3-img-size 14 14 \
     --gs3-num-heads 8 \
     --gs3-d-state 16 \
     --gs3-d-conv 4 \
-    --gs3-dropout 0.1"
-
-# Fusion configuration
-CMD="$CMD \
-    --fusion-type \"enhanced_mamba\" \
+    --gs3-dropout 0.1 \
+    --fusion-type "enhanced_mamba" \
     --fusion-dim 256 \
     --fusion-d-state 16 \
     --fusion-d-conv 4 \
     --fusion-num-layers 2 \
     --fusion-output-dim 256 \
-    --fusion-dropout 0.1"
-
-# Projection dimensions
-CMD="$CMD \
+    --fusion-dropout 0.1 \
     --id-projection-dim 768 \
-    --cloth-projection-dim 768"
-
-# Optimizer configuration
-CMD="$CMD \
-    --optimizer \"AdamW\" \
-    --scheduler \"cosine\""
-
-# Loss weights configuration (🔥 修复后的权重)
-# 修复说明：id_triplet 从 10.0 降到 2.0，cloth_semantic 从 0.01 提升到 0.1
-# Phase 1 初始值，后续会被 CurriculumScheduler 动态调整
-CMD="$CMD \
+    --cloth-projection-dim 768 \
+    --optimizer "AdamW" \
+    --scheduler "cosine" \
     --loss-info-nce 1.0 \
     --loss-id-triplet 2.0 \
     --loss-cloth-semantic 0.1 \
@@ -124,62 +81,24 @@ CMD="$CMD \
     --loss-adversarial-attr 0.0 \
     --loss-adversarial-domain 0.0 \
     --loss-discriminator-attr 0.0 \
-    --loss-discriminator-domain 0.0"
-
-# Visualization configuration
-if [ "$ENABLE_VISUALIZATION" = true ]; then
-    CMD="$CMD \
+    --loss-discriminator-domain 0.0 \
     --visualization-enabled \
-    --visualization-save-dir \"visualizations/cuhk_${DISENTANGLE_TYPE}\" \
+    --visualization-save-dir "${LOG_DIR}/vis" \
     --visualization-frequency 5 \
-    --visualization-batch-interval 200"
-    echo "✓ Visualization: enabled (visualizations/cuhk_${DISENTANGLE_TYPE})"
+    --visualization-batch-interval 200 \
+    2>&1 | tee "${LOG_DIR}/training_console.log"
+
+EXIT_CODE=${PIPESTATUS[0]}
+
+echo ""
+echo "================================================================================"
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "✅ Training Protocol Completed Successfully."
+    echo "   Log saved to: ${LOG_DIR}/training_console.log"
 else
-    echo "✓ Visualization: disabled"
+    echo "❌ Training Protocol Failed (Exit Code: $EXIT_CODE)."
+    echo "   Check log for details: ${LOG_DIR}/training_console.log"
 fi
+echo "================================================================================"
 
-# Resume training
-if [ -n "$RESUME_PATH" ]; then
-    CMD="$CMD --resume \"$RESUME_PATH\""
-    echo "✓ Resuming from checkpoint: $RESUME_PATH"
-fi
-
-# Finetune from checkpoint
-if [ -n "$FINETUNE_FROM" ]; then
-    CMD="$CMD --finetune-from \"$FINETUNE_FROM\""
-    echo "✓ Finetuning from checkpoint: $FINETUNE_FROM"
-fi
-
-echo ""
-echo "=========================================="
-echo "  Configuration Summary"
-echo "=========================================="
-echo "Dataset: CUHK-PEDES (11,003 IDs)"
-echo "Architecture: CLIP + Vision Mamba with Disentanglement Module"
-echo "Features: Multi-modal fusion, AH-Net disentanglement"
-echo "🔥 Loss weights (Phase 1 Initial - Fixed):"
-echo "              info_nce=1.0, id_triplet=2.0, cloth_semantic=0.1"
-echo "              spatial_orthogonal=0.0, semantic_alignment=0.0, ortho_reg=0.0"
-echo "              (Dynamic adjustment by CurriculumScheduler)"
-echo "=========================================="
-echo ""
-echo "🚀 Starting training..."
-echo ""
-
-# Execute training
-eval $CMD
-
-exit_code=$?
-
-echo ""
-if [ $exit_code -eq 0 ]; then
-    echo "=========================================="
-    echo "✅ CUHK-PEDES Training completed!"
-    echo "=========================================="
-else
-    echo "=========================================="
-    echo "❌ Training failed (Exit code: $exit_code)"
-    echo "=========================================="
-fi
-
-exit $exit_code
+exit $EXIT_CODE

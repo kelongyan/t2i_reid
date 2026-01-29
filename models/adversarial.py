@@ -1,9 +1,4 @@
 # models/adversarial.py
-"""
-Adversarial Decoupling Module
-对抗式解耦：通过判别器强制ID特征无法预测服装属性
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,14 +6,7 @@ from torch.autograd import Function
 
 
 class GradientReversalFunction(Function):
-    """
-    梯度反转层 (Gradient Reversal Layer)
-    
-    前向传播：y = x
-    反向传播：dy/dx = -lambda * grad_output
-    
-    用于对抗训练，让特征提取器"欺骗"判别器
-    """
+    # 梯度反转函数：在前向传播时保持输入不变，在反向传播时将梯度乘以负的缩放因子
     @staticmethod
     def forward(ctx, x, lambda_):
         ctx.lambda_ = lambda_
@@ -30,7 +18,7 @@ class GradientReversalFunction(Function):
 
 
 class GradientReversalLayer(nn.Module):
-    """梯度反转层包装器"""
+    # 梯度反转层封装类，用于在网络中方便地调用梯度反转功能
     def __init__(self, lambda_=1.0):
         super().__init__()
         self.lambda_ = lambda_
@@ -39,26 +27,12 @@ class GradientReversalLayer(nn.Module):
         return GradientReversalFunction.apply(x, self.lambda_)
     
     def set_lambda(self, lambda_):
-        """动态调整反转强度"""
+        # 动态调整梯度反转的缩放强度
         self.lambda_ = lambda_
 
 
 class AttributeDiscriminator(nn.Module):
-    """
-    属性判别器
-    
-    目标：判断特征中是否包含服装属性信息
-    
-    训练策略：
-    - Discriminator Loss: 最大化分类准确率（让判别器学会识别属性）
-    - Feature Extractor Loss: 最小化分类准确率（通过GRL让特征无法被识别）
-    
-    Args:
-        dim: 输入特征维度
-        num_attributes: 属性类别数（动态计算，或使用虚拟标签）
-        hidden_dims: 隐藏层维度列表
-        dropout: Dropout比例
-    """
+    # 属性判别器：通过对抗训练强制身份特征（ID Feature）无法预测服装属性，实现特征解耦
     def __init__(self, dim=768, num_attributes=128, hidden_dims=[512, 256], dropout=0.3):
         super().__init__()
         self.dim = dim
@@ -67,7 +41,7 @@ class AttributeDiscriminator(nn.Module):
         # 梯度反转层
         self.grl = GradientReversalLayer(lambda_=1.0)
         
-        # 判别器网络 (Multi-layer MLP)
+        # 判别器网络：多层 MLP 结构
         layers = []
         in_dim = dim
         for hidden_dim in hidden_dims:
@@ -79,20 +53,17 @@ class AttributeDiscriminator(nn.Module):
             ])
             in_dim = hidden_dim
         
-        # 输出层
+        # 输出层：分类到指定的属性类别数
         layers.append(nn.Linear(in_dim, num_attributes))
         
         self.discriminator = nn.Sequential(*layers)
         
-        # 初始化权重
         self._init_weights()
     
     def _init_weights(self):
-        """🔥 改进的权重初始化，降低初始损失"""
+        # 权重初始化：使用较小的 gain 降低判别器初始强度，使对抗训练更平稳
         for m in self.discriminator.modules():
             if isinstance(m, nn.Linear):
-                # 🔥 使用更小的gain，降低判别器初始能力
-                # 让对抗训练从更平衡的状态开始
                 nn.init.xavier_normal_(m.weight, gain=0.1)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
@@ -101,14 +72,8 @@ class AttributeDiscriminator(nn.Module):
                 nn.init.zeros_(m.bias)
     
     def forward(self, features, reverse_grad=True):
-        """
-        Args:
-            features: [B, D] 输入特征（通常是ID特征）
-            reverse_grad: 是否反转梯度（训练特征提取器时True，训练判别器时False）
-        
-        Returns:
-            logits: [B, num_attributes] 属性分类logits
-        """
+        # features: 输入特征 [B, D]
+        # reverse_grad: 是否开启梯度反转（训练特征提取器时设为 True，训练判别器自身时设为 False）
         if reverse_grad:
             features = self.grl(features)
         
@@ -116,17 +81,11 @@ class AttributeDiscriminator(nn.Module):
         return logits
     
     def set_lambda(self, lambda_):
-        """动态调整梯度反转强度"""
         self.grl.set_lambda(lambda_)
 
 
 class DomainDiscriminator(nn.Module):
-    """
-    域判别器 (可选)
-    
-    判断特征来自ID分支还是Attr分支
-    用于强制两个分支学习不同的表征
-    """
+    # 域判别器：判断特征来自 ID 分支还是属性分支，强制两分支学习互斥的特征表征
     def __init__(self, dim=768, hidden_dim=512, dropout=0.3):
         super().__init__()
         self.grl = GradientReversalLayer(lambda_=1.0)
@@ -140,7 +99,7 @@ class DomainDiscriminator(nn.Module):
             nn.LayerNorm(256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, 2)  # Binary: ID or Attr
+            nn.Linear(256, 2)  # 二分类：ID 分支或属性分支
         )
         
         self._init_weights()
@@ -153,14 +112,6 @@ class DomainDiscriminator(nn.Module):
                     nn.init.constant_(m.bias, 0)
     
     def forward(self, features, reverse_grad=True):
-        """
-        Args:
-            features: [B, D]
-            reverse_grad: True表示训练特征提取器，False表示训练判别器
-        
-        Returns:
-            logits: [B, 2] (0=ID分支, 1=Attr分支)
-        """
         if reverse_grad:
             features = self.grl(features)
         
@@ -172,67 +123,40 @@ class DomainDiscriminator(nn.Module):
 
 
 def compute_attribute_pseudo_labels(cloth_embeds, num_clusters=128):
-    """
-    🔥 改进的伪标签生成方法
-
-    改进：
-    1. 使用多个维度的加权组合（而非简单哈希）
-    2. 添加随机扰动，避免伪标签过于固定
-    3. 确保每个batch有足够的类别多样性
-
-    Args:
-        cloth_embeds: [B, D] 服装特征
-        num_clusters: 聚类数量（伪属性类别数）
-
-    Returns:
-        pseudo_labels: [B] 伪标签
-    """
+    # 为服装特征生成伪标签，用于对抗性属性判别器的监督信号
     with torch.no_grad():
-        # 归一化
+        # L2 归一化
         cloth_embeds_norm = F.normalize(cloth_embeds, dim=-1, eps=1e-8)
 
-        # 🔥 改进1：使用更多维度，增加多样性
-        n_dims = min(16, cloth_embeds_norm.shape[1])  # 使用前16个维度
+        # 使用部分维度组合生成伪标签，增加多样性
+        n_dims = min(16, cloth_embeds_norm.shape[1])
 
-        # 🔥 改进2：加权组合，而非简单的二进制
-        # 使用质数作为权重，减少碰撞
+        # 使用质数权重进行加权组合，减少标签碰撞
         weights = torch.tensor([
             1, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53
         ], device=cloth_embeds.device)[:n_dims]
 
-        # 将特征值离散化为-1, 0, 1三个级别
+        # 离散化特征值并计算加权和
         discretized = torch.sign(cloth_embeds_norm[:, :n_dims])
-
-        # 加权求和
         pseudo_labels = (discretized * weights).sum(dim=1)
 
-        # 🔥 改进3：取模确保在有效范围内
+        # 取模确保标签在指定范围内，并转换为长整型
         pseudo_labels = pseudo_labels % num_clusters
-
-        # 🔥 修复：提前转换为 long 类型，避免后续类型不匹配
         pseudo_labels = pseudo_labels.long()
 
-        # 🔥 改进4：添加微小的随机扰动，增加训练动态性
-        # 仅在训练时添加（使用0.01的概率翻转5%的标签）
+        # 训练时以极小概率添加随机扰动，提升模型鲁棒性
         if torch.rand(1).item() < 0.01:
             flip_mask = torch.rand(pseudo_labels.shape[0], device=pseudo_labels.device) < 0.05
             if flip_mask.any():
-                # 随机翻转标签
                 pseudo_labels[flip_mask] = torch.randint(
                     0, num_clusters, (flip_mask.sum().item(),), device=pseudo_labels.device
                 )
 
-    return pseudo_labels  # 已经是 long 类型
+    return pseudo_labels
 
 
 class AdversarialDecoupler(nn.Module):
-    """
-    对抗式解耦模块（整合）
-    
-    包含：
-    1. Attribute Discriminator: 强制ID特征不包含服装信息
-    2. Domain Discriminator (可选): 强制ID/Attr特征来自不同分布
-    """
+    # 对抗式解耦集成模块：管理属性判别器、域判别器以及梯度反转强度的动态调度
     def __init__(self, dim=768, num_attributes=128, use_domain_disc=False, logger=None):
         super().__init__()
         self.logger = logger
@@ -246,22 +170,15 @@ class AdversarialDecoupler(nn.Module):
             dropout=0.3
         )
         
-        # 域判别器（可选）
+        # 域判别器
         if use_domain_disc:
             self.domain_disc = DomainDiscriminator(dim=dim, hidden_dim=512, dropout=0.3)
         
-        # 🔥 梯度反转强度调度器（更平缓的增长曲线）
-        # 从0.0缓慢增长到1.0，避免早期对抗过强
-        # 使用sigmoid函数，在训练中期达到0.5
+        # 梯度反转强度调度：随训练进度平滑增长
         self.lambda_schedule = lambda p: 1.0 / (1.0 + torch.exp(torch.tensor(-5.0 * (p - 0.5))))
     
     def update_lambda(self, progress):
-        """
-        更新梯度反转强度
-        
-        Args:
-            progress: 训练进度 [0, 1]
-        """
+        # 根据训练进度 [0, 1] 更新判别器的梯度反转强度
         lambda_ = self.lambda_schedule(progress).item()
         self.attr_disc.set_lambda(lambda_)
         if self.use_domain_disc:
@@ -273,41 +190,32 @@ class AdversarialDecoupler(nn.Module):
                 self.logger.debug_logger.debug(f"[Adversarial] Lambda updated: {lambda_:.4f}")
     
     def forward(self, id_feat, cloth_feat, training_phase='feature'):
-        """
-        Args:
-            id_feat: [B, D] ID特征
-            cloth_feat: [B, D] 服装特征
-            training_phase: 'feature' or 'discriminator'
-        
-        Returns:
-            losses: dict of adversarial losses
-        """
+        # id_feat: 身份特征, cloth_feat: 服装特征
+        # training_phase: 'feature' (训练提取器以解耦) 或 'discriminator' (训练判别器以提高辨别力)
         losses = {}
         
-        # 生成服装伪标签
+        # 为服装特征生成伪属性标签
         pseudo_labels = compute_attribute_pseudo_labels(cloth_feat, num_clusters=self.attr_disc.num_attributes)
         
-        # 1. 属性判别器损失
+        # 1. 属性判别器损失计算
         if training_phase == 'feature':
-            # 训练特征提取器：让ID特征"欺骗"判别器（梯度反转）
+            # 开启梯度反转，计算让 ID 特征无法识别属性的损失
             attr_logits = self.attr_disc(id_feat, reverse_grad=True)
-            # 交叉熵损失（但梯度被反转）
             loss_attr_adv = F.cross_entropy(attr_logits, pseudo_labels)
             losses['adversarial_attr'] = loss_attr_adv
         else:
-            # 训练判别器：让判别器正确预测服装属性（无梯度反转）
+            # 正常训练判别器，识别服装特征本身的属性
             attr_logits = self.attr_disc(cloth_feat, reverse_grad=False)
             loss_attr_disc = F.cross_entropy(attr_logits, pseudo_labels)
             losses['discriminator_attr'] = loss_attr_disc
         
-        # 2. 域判别器损失（可选）
+        # 2. 域判别器损失计算（如果启用）
         if self.use_domain_disc:
             if training_phase == 'feature':
-                # 让判别器无法区分ID/Attr特征
+                # 强制 ID 和属性特征分布趋于一致
                 domain_logits_id = self.domain_disc(id_feat, reverse_grad=True)
                 domain_logits_attr = self.domain_disc(cloth_feat, reverse_grad=True)
                 
-                # 目标：让判别器输出接近0.5（无法判断）
                 domain_labels = torch.cat([
                     torch.zeros(id_feat.size(0), dtype=torch.long, device=id_feat.device),
                     torch.ones(cloth_feat.size(0), dtype=torch.long, device=cloth_feat.device)
@@ -316,7 +224,7 @@ class AdversarialDecoupler(nn.Module):
                 loss_domain_adv = F.cross_entropy(domain_logits, domain_labels)
                 losses['adversarial_domain'] = loss_domain_adv
             else:
-                # 训练判别器：正确区分ID/Attr特征
+                # 训练判别器区分 ID 特征和属性特征
                 domain_logits_id = self.domain_disc(id_feat, reverse_grad=False)
                 domain_logits_attr = self.domain_disc(cloth_feat, reverse_grad=False)
                 

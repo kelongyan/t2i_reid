@@ -1,3 +1,4 @@
+# scripts/convert_clip_weights.py
 import torch
 from safetensors.torch import save_file, load_file
 import os
@@ -5,15 +6,16 @@ import logging
 import argparse
 from pathlib import Path
 
-# 配置日志
+# 配置基础日志格式
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 
 def convert(args):
+    # CLIP 权重格式转换器：将 PyTorch 的 .bin 格式转换为更安全、加载更快的 .safetensors 格式
     print("=" * 60)
     print("📦 CLIP 权重格式转换器 (.bin -> .safetensors)")
     print("=" * 60)
 
-    # 路径处理
+    # 确定输入和输出路径
     base_path = Path(args.model_path)
     bin_path = base_path / "pytorch_model.bin"
     safe_path = base_path / "model.safetensors"
@@ -32,8 +34,7 @@ def convert(args):
     print("   注意: 这可能需要几秒钟，并且会消耗内存...")
     
     try:
-        # 使用 CPU 加载以节省显存
-        # 强制允许 pickle 加载，因为这是我们自己的转换脚本
+        # 使用 CPU 加载以节省显存，并允许 pickle 加载原始权重
         state_dict = torch.load(bin_path, map_location="cpu", weights_only=False)
         print(f"   ✅ 加载成功，包含 {len(state_dict)} 个张量")
     except Exception as e:
@@ -49,11 +50,10 @@ def convert(args):
         print(f"❌ 保存失败: {e}")
         return
 
-    # 验证步骤
+    # 验证转换后的文件是否损坏，并检查张量数量是否匹配
     print("\n🔍 正在验证新文件...")
     try:
         loaded_dict = load_file(safe_path)
-        # 简单比对 key 数量
         if len(loaded_dict) == len(state_dict):
             print("   ✅ 验证通过！文件可读且 key 数量一致。")
         else:

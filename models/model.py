@@ -8,11 +8,11 @@ from transformers import CLIPTokenizer, CLIPTextModel, ViTModel
 from safetensors.torch import load_file
 from utils.serialization import copy_state_dict
 from .fusion import get_fusion_module, ScagRcsmFusion
-from .ahnet_module import AHNetModule  # 使用新的 AH-Net 模块
+from .ahnet_module import AHNetModule
 from .semantic_guidance import SemanticGuidedDecoupling
 from .vim import VisionMamba
 
-# 尝试导入 Mamba
+# 尝试导入 Mamba SSM
 try:
     from mamba_ssm import Mamba
     HAS_MAMBA = True
@@ -20,7 +20,6 @@ except ImportError:
     Mamba = None
     HAS_MAMBA = False
 
-# 设置transformers库日志级别
 import logging as _logging
 import warnings
 _logging.getLogger("transformers").setLevel(_logging.ERROR)
@@ -28,9 +27,7 @@ warnings.filterwarnings('ignore', category=UserWarning, module='transformers')
 
 
 def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, logger=None):
-    """
-    Rescale the grid of position embeddings when loading from state_dict. Adapted from DEIT/Vim.
-    """
+    # 动态调整位置编码的分辨率，以适应不同尺寸的输入图像
     ntok_new = posemb_new.shape[1]
     
     if num_tokens:
@@ -40,7 +37,6 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, 
             posemb_grid = torch.cat([posemb[:, :old_cls_idx], posemb[:, old_cls_idx+num_tokens:]], dim=1)
         else:
             posemb_tok, posemb_grid = posemb[:, :num_tokens], posemb[:, num_tokens:]
-            
         ntok_new -= num_tokens
     else:
         posemb_tok, posemb_grid = posemb[:, :0], posemb
@@ -66,10 +62,7 @@ def resize_pos_embed(posemb, posemb_new, num_tokens=1, gs_new=(), mid_cls=True, 
 
 
 class ResidualBottleneck1d(nn.Module):
-    """
-    Stage 1: 局部残差瓶颈模块 (Enhanced)
-    Upgrade: Uses Depthwise Separable Conv with Kernel=5 for broader context.
-    """
+    # 1D 残差瓶颈模块：使用深度可分离卷积提取局部文本特征，增加感受野
     def __init__(self, dim, reduction=4, kernel_size=5):
         super().__init__()
         hidden_dim = dim // reduction
@@ -80,14 +73,12 @@ class ResidualBottleneck1d(nn.Module):
             nn.BatchNorm1d(hidden_dim),
             nn.SiLU(inplace=True)
         )
-        # Depthwise Separable: Depthwise
         self.dw_conv = nn.Sequential(
             nn.Conv1d(hidden_dim, hidden_dim, kernel_size=kernel_size, 
                       padding=padding, groups=hidden_dim, bias=False),
             nn.BatchNorm1d(hidden_dim),
             nn.SiLU(inplace=True)
         )
-        # Depthwise Separable: Pointwise
         self.expand = nn.Sequential(
             nn.Conv1d(hidden_dim, dim, kernel_size=1, bias=False),
             nn.BatchNorm1d(dim)
@@ -101,9 +92,7 @@ class ResidualBottleneck1d(nn.Module):
         return identity + out
 
 class GatedMambaBlock(nn.Module):
-    """
-    Stage 2: 门控长程 Mamba 模块
-    """
+    # 门控 Mamba 模块：结合 SSM 的长程建模能力和门控机制，提取关键的身份描述特征
     def __init__(self, dim, d_state=16, d_conv=4, expand=2, dropout=0.1):
         super().__init__()
         if Mamba is None:
@@ -124,9 +113,7 @@ class GatedMambaBlock(nn.Module):
         return residual + out
 
 class PyramidTextEncoder(nn.Module):
-    """
-    串行渐进式金字塔文本编码器
-    """
+    # 渐进式金字塔文本编码器：分阶段提取属性特征（浅层 CNN）和身份特征（深层 Mamba）
     def __init__(self, dim=768):
         super().__init__()
         self.dim = dim
@@ -155,10 +142,12 @@ class PyramidTextEncoder(nn.Module):
         x_cnn_out = self.stage1_bottleneck(x_cnn_in)
         x_stage1 = x_cnn_out.transpose(1, 2)
         
+        # 提取属性相关特征（浅层）
         feat_attr = self.attr_norm(x_stage1)
         feat_attr = feat_attr.transpose(1, 2)
         feat_attr = F.adaptive_max_pool1d(feat_attr, 1).squeeze(2)
         
+        # 提取身份相关特征（深层）
         x_mamba_out = self.stage2_mamba(x_stage1)
         x_final = x_mamba_out + x_raw
         
@@ -175,6 +164,7 @@ class PyramidTextEncoder(nn.Module):
 
 
 class Model(nn.Module):
+    # T2I-ReID 主模型类：整合视觉编码器、文本编码器、解耦模块、语义引导及融合机制
     def __init__(self, net_config, logger=None):
         super().__init__()
         self.net_config = net_config
@@ -184,7 +174,7 @@ class Model(nn.Module):
         vit_base_path = Path(net_config.get('vit_pretrained', 'pretrained/vit-base-patch16-224'))
         fusion_config = net_config.get('fusion', {})
         
-        # 1. Text Encoder (CLIP)
+        # 1. 基础文本编码器 (CLIP)
         if not clip_base_path.exists():
              fallback = list(Path("pretrained").glob("**/clip-vit-base-patch16"))
              if fallback: clip_base_path = fallback[0]
@@ -210,7 +200,7 @@ class Model(nn.Module):
         else:
             self.text_proj = nn.Identity()
 
-        # 2. Visual Encoder (Vim / ViT)
+        # 2. 视觉骨干网络 (Vision Mamba 或 ViT)
         self.vision_backbone_type = net_config.get('vision_backbone', 'vit')
         self.img_size = net_config.get('img_size', (224, 224))
         if isinstance(self.img_size, int): self.img_size = (self.img_size, self.img_size)
@@ -234,43 +224,32 @@ class Model(nn.Module):
             self.visual_encoder = ViTModel.from_pretrained(str(vit_base_path), weights_only=False)
             self.visual_proj = nn.Identity()
 
-        # 3. Disentangle Module (AH-Net)
-        # 强制使用 AH-Net
+        # 3. 异步双流解耦模块 (AH-Net)
         gs3_config = net_config.get('gs3', {})
         self.disentangle = AHNetModule(
-            dim=self.text_width,
-            img_size=self.img_size,
-            patch_size=16,
-            d_state=gs3_config.get('d_state', 16),
-            d_conv=gs3_config.get('d_conv', 4),
+            dim=self.text_width, img_size=self.img_size, patch_size=16,
+            d_state=gs3_config.get('d_state', 16), d_conv=gs3_config.get('d_conv', 4),
             logger=self.logger
         )
         if self.logger:
             self.logger.debug_logger.info("🔥 Using AH-Net Module (Spatial-Structure Dual Stream)")
 
-        # 4. Semantic Guidance
+        # 4. 语义引导模块
         self.semantic_guidance = SemanticGuidedDecoupling(
-            text_encoder=self.text_encoder,
-            tokenizer=self.tokenizer,
-            dim=self.text_width,
-            logger=self.logger
+            text_encoder=self.text_encoder, tokenizer=self.tokenizer,
+            dim=self.text_width, logger=self.logger
         )
         
-        # 🔥 4.5 Adversarial Decoupler (新增)
+        # 5. 对抗解耦模块
         from .adversarial import AdversarialDecoupler
         self.adversarial_decoupler = AdversarialDecoupler(
-            dim=self.text_width,
-            num_attributes=128,  # 伪属性类别数
-            use_domain_disc=False,  # Phase 1不使用域判别器
-            logger=self.logger
+            dim=self.text_width, num_attributes=128, use_domain_disc=False, logger=self.logger
         )
         if self.logger:
-            self.logger.debug_logger.info("🔥 Adversarial Decoupler Initialized (Attribute Discriminator)")
+            self.logger.debug_logger.info("🔥 Adversarial Decoupler Initialized")
 
-        # 5. Retrieval Projection Heads
+        # 6. 检索投影头与正则化层
         self.shared_mlp = nn.Linear(self.text_width, 512)
-
-        # 🔥 修复：为clothing_embeds添加单独的LayerNorm，防止范数爆炸
         self.cloth_norm = nn.LayerNorm(512)
 
         self.image_mlp = nn.Sequential(
@@ -284,32 +263,28 @@ class Model(nn.Module):
             nn.Linear(256, 256)
         )
 
-        # 初始化MLP权重，防止梯度问题
         self._init_weights()
 
-        # 6. Text Encoder V2 (Pyramid Text Encoder)
+        # 7. 文本编码器 V2 (基于 Mamba)
         if HAS_MAMBA:
             self.text_encoder_v2 = PyramidTextEncoder(dim=self.text_width)
         else:
             raise ImportError("Mamba module is required. Please install mamba-ssm.")
 
-        # 7. Fusion
+        # 8. 融合模块与缩放参数
         self.fusion = get_fusion_module(fusion_config) if fusion_config else None
         self.scale = nn.Parameter(torch.ones(1), requires_grad=True)
         self.text_cache = {}
 
     def _init_weights(self):
-        """🔥 改进的权重初始化，防止NaN梯度"""
-        # 🔥 1. 共享MLP和投影层：使用更小的初始化
+        # 权重初始化：使用较小的 gain 防止梯度爆炸
         for module in [self.shared_mlp]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
-                    # 使用更小的标准差
                     nn.init.xavier_normal_(m.weight, gain=0.01)
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
         
-        # 🔥 2. 图像和文本MLP：使用更小的初始化
         for module in [self.image_mlp, self.text_mlp]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
@@ -317,57 +292,44 @@ class Model(nn.Module):
                     if m.bias is not None:
                         nn.init.constant_(m.bias, 0)
         
-        # 🔥 3. cloth_norm：初始化为单位矩阵
         if hasattr(self, 'cloth_norm'):
             if hasattr(self.cloth_norm, 'weight'):
                 nn.init.ones_(self.cloth_norm.weight)
             if hasattr(self.cloth_norm, 'bias'):
                 nn.init.zeros_(self.cloth_norm.bias)
         
-        # 🔥 4. scale参数：初始化为1.0
         if hasattr(self, 'scale'):
             nn.init.constant_(self.scale, 1.0)
 
     def _seq_to_grid(self, seq_feat):
-        """
-        Helper: Convert Sequence [B, L, D] to Grid [B, D, H, W]
-        Handling CLS removal.
-        """
+        # 辅助函数：将序列特征转换为网格特征，并处理 CLS Token
         B, L, D = seq_feat.shape
-        
-        # Calculate Grid Size
         patch_size = 16
         H, W = self.img_size
         h_grid, w_grid = H // patch_size, W // patch_size
-        
         expected_len = h_grid * w_grid
         
-        # Determine CLS position and Remove
         if L == expected_len + 1:
-            # Assume 1 CLS token
             if self.vision_backbone_type == 'vim':
-                # Mid-CLS
                 cls_idx = L // 2
                 seq_patches = torch.cat([seq_feat[:, :cls_idx], seq_feat[:, cls_idx+1:]], dim=1)
             else:
-                # ViT: First-CLS
                 seq_patches = seq_feat[:, 1:]
         elif L == expected_len:
             seq_patches = seq_feat
         else:
-            raise ValueError(f"Sequence length {L} does not match grid {h_grid}x{w_grid} ({expected_len})")
+            raise ValueError(f"Sequence length {L} does not match grid {h_grid}x{w_grid}")
             
-        # Reshape to Grid: [B, H*W, D] -> [B, D, H, W]
         grid_feat = seq_patches.transpose(1, 2).reshape(B, D, h_grid, w_grid)
         return grid_feat
 
     def encode_image(self, image):
+        # 编码图像特征，包含骨干网络处理和解耦
         if image is None: return None
         device = next(self.parameters()).device
         if image.dim() == 5: image = image.squeeze(-1)
         image = image.to(device)
         
-        # Visual Encoder
         if self.vision_backbone_type == 'vim':
             with torch.amp.autocast('cuda', enabled=False):
                 image_embeds_raw = self.visual_encoder(image.float())
@@ -375,26 +337,20 @@ class Model(nn.Module):
         else:
             image_embeds_raw = self.visual_encoder(image).last_hidden_state
         
-        image_embeds_raw = self.visual_proj(image_embeds_raw) # [B, L, D]
-        
-        # Seq -> Grid for AH-Net
-        image_grid = self._seq_to_grid(image_embeds_raw) # [B, D, H, W]
-        
-        # AH-Net Disentangle
+        image_embeds_raw = self.visual_proj(image_embeds_raw)
+        image_grid = self._seq_to_grid(image_embeds_raw)
         id_embeds, _, _ = self.disentangle(image_grid)
         
-        # Projection
         image_embeds = self.shared_mlp(id_embeds)
         image_embeds = self.image_mlp(image_embeds)
         image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
         return image_embeds
 
     def encode_text(self, instruction):
-        """Encode text instruction to embedding."""
+        # 编码文本指令特征
         if instruction is None: return None
         device = next(self.parameters()).device
-        if isinstance(instruction, (list, tuple)): texts = list(instruction)
-        else: texts = [instruction]
+        texts = instruction if isinstance(instruction, list) else [instruction]
 
         cache_key = tuple(texts)
         if cache_key in self.text_cache: tokenized = self.text_cache[cache_key]
@@ -420,58 +376,51 @@ class Model(nn.Module):
         return text_embeds
 
     def forward(self, image=None, cloth_instruction=None, id_instruction=None, return_attention=False):
+        # 前向传播：处理图像分支、文本分支，并进行特征解耦与多模态融合
         device = next(self.parameters()).device
         id_embeds, cloth_embeds = None, None
         aux_info = None
         
-        # === Image Branch ===
+        # === 图像分支处理 ===
         if image is not None:
             if image.dim() == 5: image = image.squeeze(-1)
             image = image.to(device)
             
-            # Encoder
             if self.vision_backbone_type == 'vim':
                 with torch.amp.autocast('cuda', enabled=False):
                     image_embeds_raw = self.visual_encoder(image.float())
             else:
                 image_embeds_raw = self.visual_encoder(image).last_hidden_state
             
-            # Proj & Reshape
             image_embeds_raw = self.visual_proj(image_embeds_raw)
-            image_grid = self._seq_to_grid(image_embeds_raw) # [B, D, H, W]
+            image_grid = self._seq_to_grid(image_embeds_raw)
             
-            # AH-Net Disentangle
+            # 使用 AH-Net 进行身份和服装特征的分离
             id_embeds, cloth_embeds, aux_info = self.disentangle(image_grid)
             
-            # 🔥 修复：立即归一化，防止 Triplet Loss 梯度爆炸
+            # 特征投影与归一化
             id_embeds = torch.nn.functional.normalize(id_embeds, dim=-1)
             cloth_embeds = torch.nn.functional.normalize(cloth_embeds, dim=-1)
             
-            # Projection
             image_embeds = self.shared_mlp(id_embeds)
             image_embeds = self.image_mlp(image_embeds)
             image_embeds = torch.nn.functional.normalize(image_embeds, dim=-1, eps=1e-8)
 
-            # 🔥 修复：为clothing_embeds添加LayerNorm，防止范数爆炸
             cloth_image_embeds = self.shared_mlp(cloth_embeds)
-            cloth_image_embeds = self.cloth_norm(cloth_image_embeds)  # 添加LayerNorm
+            cloth_image_embeds = self.cloth_norm(cloth_image_embeds)
             cloth_image_embeds = self.image_mlp(cloth_image_embeds)
             cloth_image_embeds = torch.nn.functional.normalize(cloth_image_embeds, dim=-1, eps=1e-8)
         else:
             image_embeds, cloth_image_embeds = None, None
 
-        # === Text Branch ===
+        # === 文本分支处理 ===
         main_instruction = id_instruction if id_instruction else cloth_instruction
         feat_attr_raw, feat_id_raw = None, None
         
         if self.text_encoder_v2 and main_instruction:
-            if isinstance(main_instruction, (list, tuple)): texts = list(main_instruction)
-            else: texts = [main_instruction]
-            
-            # 🔥 修复 Bug #1: 添加缓存大小限制防止内存泄漏
+            texts = main_instruction if isinstance(main_instruction, list) else [main_instruction]
             cache_key = tuple(texts)
-            if len(self.text_cache) > 10000:  # 限制缓存大小
-                self.text_cache.clear()
+            if len(self.text_cache) > 10000: self.text_cache.clear()
             
             if cache_key in self.text_cache: tokenized = self.text_cache[cache_key]
             else:
@@ -484,12 +433,12 @@ class Model(nn.Module):
             text_seq = self.text_encoder(input_ids, attention_mask=attention_mask).last_hidden_state
             text_seq = self.text_proj(text_seq)
             
+            # 使用金字塔编码器分离属性和身份文本特征
             out_v2 = self.text_encoder_v2(text_seq)
             feat_attr_raw, feat_id_raw = out_v2['feat_attr'], out_v2['feat_id']
 
-            # 🔥 修复：为cloth_text_embeds添加LayerNorm
             cloth_text_embeds = self.shared_mlp(feat_attr_raw)
-            cloth_text_embeds = self.cloth_norm(cloth_text_embeds)  # 添加LayerNorm
+            cloth_text_embeds = self.cloth_norm(cloth_text_embeds)
             cloth_text_embeds = self.text_mlp(cloth_text_embeds)
             cloth_text_embeds = torch.nn.functional.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
             
@@ -497,56 +446,39 @@ class Model(nn.Module):
             id_text_embeds = self.text_mlp(id_text_embeds)
             id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
         else:
-            # 🔥 修复 Bug #1: 在else分支中也计算feat_attr_raw和feat_id_raw,确保融合模块正常工作
+            # 处理无 V2 编码器的兜底逻辑
             if cloth_instruction:
                 cloth_texts = [cloth_instruction] if isinstance(cloth_instruction, str) else cloth_instruction
-                cloth_tokens = self.tokenizer(
-                    cloth_texts, padding='max_length', max_length=77, truncation=True, 
-                    return_tensors="pt", return_attention_mask=True
-                )
+                cloth_tokens = self.tokenizer(cloth_texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
                 cloth_tokens = {k: v.to(device) for k, v in cloth_tokens.items()}
                 cloth_seq = self.text_encoder(**cloth_tokens).last_hidden_state
-                cloth_seq = self.text_proj(cloth_seq)
-                feat_attr_raw = cloth_seq.mean(dim=1)
+                feat_attr_raw = self.text_proj(cloth_seq).mean(dim=1)
             
             if id_instruction:
                 id_texts = [id_instruction] if isinstance(id_instruction, str) else id_instruction
-                id_tokens = self.tokenizer(
-                    id_texts, padding='max_length', max_length=77, truncation=True,
-                    return_tensors="pt", return_attention_mask=True
-                )
+                id_tokens = self.tokenizer(id_texts, padding='max_length', max_length=77, truncation=True, return_tensors="pt", return_attention_mask=True)
                 id_tokens = {k: v.to(device) for k, v in id_tokens.items()}
                 id_seq = self.text_encoder(**id_tokens).last_hidden_state
-                id_seq = self.text_proj(id_seq)
-                feat_id_raw = id_seq.mean(dim=1)
+                feat_id_raw = self.text_proj(id_seq).mean(dim=1)
             
-            # 计算embeds用于损失
             cloth_text_embeds = None
             if feat_attr_raw is not None:
-                cloth_text_embeds = self.shared_mlp(feat_attr_raw)
-                cloth_text_embeds = self.cloth_norm(cloth_text_embeds)
-                cloth_text_embeds = self.text_mlp(cloth_text_embeds)
-                cloth_text_embeds = torch.nn.functional.normalize(cloth_text_embeds, dim=-1, eps=1e-8)
+                cloth_text_embeds = torch.nn.functional.normalize(self.text_mlp(self.cloth_norm(self.shared_mlp(feat_attr_raw))), dim=-1, eps=1e-8)
             
             id_text_embeds = None
             if feat_id_raw is not None:
-                id_text_embeds = self.shared_mlp(feat_id_raw)
-                id_text_embeds = self.text_mlp(id_text_embeds)
-                id_text_embeds = torch.nn.functional.normalize(id_text_embeds, dim=-1, eps=1e-8)
+                id_text_embeds = torch.nn.functional.normalize(self.text_mlp(self.shared_mlp(feat_id_raw)), dim=-1, eps=1e-8)
 
-        # === Fusion ===
+        # === 特征融合处理 ===
         fused_embeds, gate_weights = None, None
         if self.fusion and image_embeds is not None and id_text_embeds is not None:
             if isinstance(self.fusion, ScagRcsmFusion) and feat_id_raw is not None:
-                # 🔥 方案书核心实现：使用 conflict_score 替代 energy_ratio
-                # conflict_score 来自 aux_info，由 AH-Net Module 计算得出
-                conflict_score = aux_info.get('conflict_score',
-                                               torch.zeros(id_embeds.size(0), device=device))
-
+                # 使用 S-CAG 置信度感知门控融合
+                conflict_score = aux_info.get('conflict_score', torch.zeros(id_embeds.size(0), device=device))
                 fused_embeds, gate_weights = self.fusion(
                     img_id=id_embeds, img_attr=cloth_embeds,
                     txt_id=feat_id_raw, txt_attr=feat_attr_raw,
-                    conflict_score=conflict_score  # ← 传递冲突分数而非能量比
+                    conflict_score=conflict_score
                 )
             else:
                 fused_embeds, gate_weights = self.fusion(image_embeds, id_text_embeds)
@@ -554,10 +486,6 @@ class Model(nn.Module):
         elif image_embeds is not None:
             fused_embeds = image_embeds
 
-        # Returns
-        # aux_info (9th element) 包含 conflict_score, attention maps, reconstruction features
-        # gate_weights (10th element) 包含 confidence weights from S-CAG
-        # 🔥 修复 Bug #5: 移除未使用的id_logits,返回11个元素
         base_outputs = (image_embeds, id_text_embeds, fused_embeds, id_embeds,
                        cloth_embeds, cloth_text_embeds, cloth_image_embeds, aux_info, gate_weights,
                        None, None)
@@ -568,6 +496,7 @@ class Model(nn.Module):
             return base_outputs
 
     def load_param(self, trained_path):
+        # 从模型权重文件加载参数
         trained_path = Path(trained_path)
         checkpoint = torch.load(trained_path, map_location='cpu', weights_only=False)
         state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
