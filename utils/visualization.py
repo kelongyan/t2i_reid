@@ -32,7 +32,7 @@ class FSHDVisualizer:
         plt.rcParams['figure.dpi'] = 300
         
         if logger:
-            logger.debug_logger.info(f"✅ AH-Net Visualizer initialized at {self.save_dir}")
+            logger.logger.info(f"✅ AH-Net Visualizer initialized at {self.save_dir}")
 
     def _denormalize_image(self, tensor):
         """
@@ -40,8 +40,8 @@ class FSHDVisualizer:
         """
         mean = np.array([0.485, 0.456, 0.406])
         std = np.array([0.229, 0.224, 0.225])
-        
-        img = tensor.cpu().numpy().transpose(1, 2, 0)
+
+        img = tensor.detach().cpu().numpy().transpose(1, 2, 0)
         img = std * img + mean
         img = np.clip(img, 0, 1)
         img = (img * 255).astype(np.uint8)
@@ -56,9 +56,9 @@ class FSHDVisualizer:
             resolution_tag: 'low' or 'high'
         """
         H, W = image.shape[:2]
-        
-        # 1. Process Map
-        attn = map_tensor.squeeze().cpu().numpy()
+
+        # 1. Process Map (detach from computation graph before converting to numpy)
+        attn = map_tensor.squeeze().detach().cpu().numpy()
         
         # Normalize to 0-1 if not already
         if attn.max() > attn.min():
@@ -139,4 +139,4 @@ class FSHDVisualizer:
         plt.close()
         
         if self.logger:
-            self.logger.debug_logger.info(f"📊 Saved AH-Net maps to {save_path}")
+            self.logger.logger.info(f"📊 Saved AH-Net maps to {save_path}")

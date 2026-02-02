@@ -232,7 +232,7 @@ class Model(nn.Module):
             logger=self.logger
         )
         if self.logger:
-            self.logger.debug_logger.info("🔥 Using AH-Net Module (Spatial-Structure Dual Stream)")
+            self.logger.logger.info("🔥 Using AH-Net Module (Spatial-Structure Dual Stream)")
 
         # 4. 语义引导模块
         self.semantic_guidance = SemanticGuidedDecoupling(
@@ -246,7 +246,7 @@ class Model(nn.Module):
             dim=self.text_width, num_attributes=128, use_domain_disc=False, logger=self.logger
         )
         if self.logger:
-            self.logger.debug_logger.info("🔥 Adversarial Decoupler Initialized")
+            self.logger.logger.info("🔥 Adversarial Decoupler Initialized")
 
         # 6. 检索投影头与正则化层
         self.shared_mlp = nn.Linear(self.text_width, 512)
@@ -476,5 +476,5 @@ class Model(nn.Module):
         state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
         copy_state_dict(state_dict, self)
         if self.logger:
-            self.logger.debug_logger.info(f"Loaded checkpoint from {trained_path}")
+            self.logger.logger.info(f"Loaded checkpoint from {trained_path}")
         return self

@@ -110,7 +110,7 @@ def curriculum_train_epoch(trainer, train_loader, optimizer, optimizer_disc, epo
                 loss_meters[key].update(val.item() if isinstance(val, torch.Tensor) else val)
         
         display_loss = loss.item()
-        progress_bar.set_postfix_str(f"损失: {display_loss:.4f}")
+        progress_bar.set_postfix_str(f"loss: {display_loss:.4f}")
     
     progress_bar.close()
     return loss_meters
@@ -163,7 +163,7 @@ def train_with_curriculum(trainer, train_loader, query_loader, gallery_loader, c
             
             current_mAP, current_rank1 = metrics['mAP'], metrics['rank1']
             print(f"\n{'='*60}\n📊 Epoch {epoch} [阶段 {phase}] 评估结果:\n"
-                  f"  mAP: {metrics['mAP']:.4f} | Rank-1: {metrics['rank1']:.4f}\n{'='*60}\n")
+                  f"  Rank-1: {metrics['rank1']:.3f} | Rank-5: {metrics['rank5']:.3f} | Rank-10: {metrics['rank10']:.3f} | mAP: {metrics['mAP']:.3f}\n{'='*60}\n")
             
             trainer.performance_history.append({
                 'epoch': epoch, 'mAP': current_mAP, 'rank1': current_rank1,
@@ -196,7 +196,7 @@ def train_with_curriculum(trainer, train_loader, query_loader, gallery_loader, c
                     
                     best_checkpoint_path = new_best_path
                     if trainer.monitor:
-                        trainer.monitor.logger.info(f"✅ 刷新最佳记录: mAP={best_mAP:.4f}, 模型已保存至 {best_checkpoint_path}")
+                        trainer.monitor.logger.info(f"✅ 刷新最佳记录: mAP={best_mAP:.3f}, 模型已保存至 {best_checkpoint_path}")
         
         # 阶段自动过渡检测
         if trainer.curriculum.should_transition_phase(epoch, trainer.performance_history):

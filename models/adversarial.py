@@ -184,10 +184,7 @@ class AdversarialDecoupler(nn.Module):
         if self.use_domain_disc:
             self.domain_disc.set_lambda(lambda_)
         
-        if self.logger and hasattr(self, '_log_counter'):
-            self._log_counter = getattr(self, '_log_counter', 0) + 1
-            if self._log_counter % 500 == 0:
-                self.logger.debug_logger.debug(f"[Adversarial] Lambda updated: {lambda_:.4f}")
+
     
     def forward(self, id_feat, cloth_feat, training_phase='feature'):
         # id_feat: 身份特征, cloth_feat: 服装特征

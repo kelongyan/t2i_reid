@@ -75,7 +75,7 @@ class SemanticGuidedDecoupling(nn.Module):
         self._initialized = True
         
         if self.logger:
-            self.logger.debug_logger.info(
+            self.logger.logger.info(
                 f"✅ Semantic Guidance Initialized: "
                 f"{len(self.id_prompts)} ID Prompts, {len(self.attr_prompts)} Attr Prompts"
             )
@@ -110,13 +110,7 @@ class SemanticGuidedDecoupling(nn.Module):
         
         total_loss = loss_id + loss_attr
         
-        if self.logger and hasattr(self, '_log_counter'):
-            self._log_counter = getattr(self, '_log_counter', 0) + 1
-            if self._log_counter % 200 == 0:
-                self.logger.debug_logger.debug(
-                    f"Semantic Alignment: ID_sim={id_max_sim.mean():.4f}, "
-                    f"Attr_sim={attr_max_sim.mean():.4f}, Loss={total_loss.item():.6f}"
-                )
+
         
         return total_loss
     

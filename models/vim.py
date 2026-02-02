@@ -45,14 +45,8 @@ class VimMamba(nn.Module):
         d_conv=4,
         expand=2,
         dt_rank="auto",
-        dt_min=0.001,
-        dt_max=0.1,
-        dt_init="random",
-        dt_scale=1.0,
-        dt_init_floor=1e-4,
         conv_bias=True,
         bias=False,
-        use_fast_path=True,
     ):
         super().__init__()
         self.d_model = d_model
@@ -61,7 +55,6 @@ class VimMamba(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-        self.use_fast_path = use_fast_path
 
         # 1. 输入投影（前向与反向共享）
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=bias)
@@ -176,8 +169,8 @@ class VimBlock(nn.Module):
 
 class VisionMamba(nn.Module):
     # Vision Mamba (Vim) 主模型：采用 Mid-Cls-Token 策略处理图像序列
-    def __init__(self, img_size=224, patch_size=16, embed_dim=384, depth=24, 
-                 rms_norm=False, drop_path_rate=0., **kwargs):
+    def __init__(self, img_size=224, patch_size=16, embed_dim=384, depth=24,
+                 rms_norm=False, **kwargs):
         super().__init__()
         
         norm_layer = LayerNormNoBias if not rms_norm else nn.RMSNorm

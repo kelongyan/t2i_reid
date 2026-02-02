@@ -26,7 +26,7 @@ class EarlyStopping:
         elif mAP < self.best_score - self.min_delta:
             self.counter += 1
             if self.logger:
-                self.logger.debug_logger.info(
+                self.logger.logger.info(
                     f"早停检查: {self.counter}/{self.patience} (最佳={self.best_score:.4f}, 当前={mAP:.4f})"
                 )
             if self.counter >= self.patience:
@@ -56,8 +56,7 @@ class Trainer:
             weights=self.curriculum.base_weights,
             logger=monitor,
             semantic_guidance=model.semantic_guidance,
-            adversarial_decoupler=model.adversarial_decoupler,
-            base_lr=args.lr
+            adversarial_decoupler=model.adversarial_decoupler
         ).to(self.device)
         
         # 可视化器初始化
@@ -68,7 +67,7 @@ class Trainer:
             self.visualize_freq = visualize_config.get('frequency', 5)
             self.visualize_batch_interval = visualize_config.get('batch_interval', 200)
             if self.monitor:
-                self.monitor.debug_logger.info(f"✅ 可视化器已启动 (频率={self.visualize_freq} ep, 步长={self.visualize_batch_interval} batch)")
+                self.monitor.logger.info(f"✅ 可视化器已启动 (频率={self.visualize_freq} ep, 步长={self.visualize_batch_interval} batch)")
         else:
             self.visualizer = None
         
@@ -117,19 +116,6 @@ class Trainer:
             if aux_info is not None and isinstance(aux_info, dict):
                 self.visualizer.plot_attention_maps(aux_info, epoch, batch_idx, images=image)
         
-        # 监控指标记录
-        if self.monitor and batch_idx % 200 == 0:
-            self.monitor.log_feature_statistics(image_embeds, "image_feat")
-            self.monitor.log_feature_statistics(id_text_embeds, "text_feat")
-            if aux_info is not None and isinstance(aux_info, dict):
-                conflict_score = aux_info.get('conflict_score')
-                if conflict_score is not None:
-                    self.monitor.log_conflict_score(conflict_score, step_name=f"_E{epoch}_B{batch_idx}")
-            if gate_weights is not None:
-                self.monitor.log_gate_weights(gate_weights, "fusion_gate")
-            self.monitor.log_loss_components(loss_dict)
-            self.monitor.log_memory_usage()
-
         return loss_dict
 
     def train(self, train_loader, optimizer, lr_scheduler, query_loader=None, gallery_loader=None, checkpoint_dir=None):

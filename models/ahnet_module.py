@@ -107,7 +107,7 @@ class AHNetModule(nn.Module):
         self.grid_w = img_size[1] // patch_size
         
         if logger:
-            logger.debug_logger.info(f"🚀 AH-Net (Extreme): Grid=({self.grid_h}, {self.grid_w}), Dim={dim}, Heads=8")
+            logger.logger.info(f"🚀 AH-Net (Extreme): Grid=({self.grid_h}, {self.grid_w}), Dim={dim}, Heads=8")
         
         # 1. 不对称双流分支
         self.id_stream = IDStructureStream(
@@ -164,13 +164,6 @@ class AHNetModule(nn.Module):
 
         # 5. 特征重构：验证解耦特征是否完整保留了原始信息
         original_global = x_grid.mean(dim=(2, 3))
-
-        if self.logger and hasattr(self, '_log_counter'):
-            self._log_counter = getattr(self, '_log_counter', 0) + 1
-            if self._log_counter % 200 == 0:
-                self.logger.debug_logger.debug(
-                    f"[AH-Net Extreme] Conflict: {conflict_score.mean():.4f} | Ortho Reg: {ortho_reg.item():.4f}"
-                )
 
         aux_info = {
             'map_id': map_id_up,

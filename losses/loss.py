@@ -1,10 +1,6 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parent.parent))
-from utils.loss_logger import LossLogger
 
 
 class HardNegativeTripletLoss(nn.Module):
@@ -127,14 +123,13 @@ class SpatialOrthogonalLoss(nn.Module):
 class Loss(nn.Module):
     # 综合损失管理模块，支持课程学习下的动态权重更新
     def __init__(self, temperature=0.07, weights=None, num_classes=None, logger=None,
-                 semantic_guidance=None, adversarial_decoupler=None, base_lr=None):
+                 semantic_guidance=None, adversarial_decoupler=None):
         super().__init__()
         self.temperature = temperature
         self.num_classes = num_classes
         self.logger = logger
         self.semantic_guidance = semantic_guidance
         self.adversarial_decoupler = adversarial_decoupler
-        self.base_lr = base_lr
 
         # 使用带标签平滑的交叉熵损失
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=0.1)
@@ -143,8 +138,6 @@ class Loss(nn.Module):
         self._hard_triplet = HardNegativeTripletLoss(margin=0.3, hard_mining=True, hard_ratio=0.5)
         self._ortho_loss = SpatialOrthogonalLoss(temperature=5.0)
 
-        self.loss_logger = LossLogger(logger.debug_logger) if logger else None
-        
         # 默认损失权重配置（初始阶段侧重 ID 一致性）
         self.weights = weights if weights is not None else {
             'info_nce': 1.0,
@@ -161,13 +154,10 @@ class Loss(nn.Module):
 
         self.register_buffer('_dummy', torch.zeros(1))
         self._batch_counter = 0
-        if logger: self.debug_logger = logger.debug_logger
     
     def update_weights(self, new_weights):
         # 响应 CurriculumScheduler 的权重更新指令
         self.weights.update(new_weights)
-        if self.logger and self._batch_counter % 500 == 0:
-            self.logger.debug_logger.debug(f"[Loss] Weights updated: {new_weights}")
 
     def _get_device(self):
         return self._dummy.device
@@ -276,8 +266,6 @@ class Loss(nn.Module):
                     total_loss += self.weights.get(key, 0.0) * value
 
         losses['total'] = total_loss
-
-        if self.logger and self.loss_logger and self._batch_counter % 100 == 0:
-            self._batch_counter += 1
+        self._batch_counter += 1
 
         return losses

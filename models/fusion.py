@@ -50,8 +50,6 @@ class EnhancedMambaFusion(nn.Module):
     def forward(self, image_features, text_features):
         # NaN 检测与处理
         if torch.isnan(image_features).any() or torch.isnan(text_features).any():
-            if self.logger:
-                self.logger.debug_logger.warning("⚠️ EnhancedMambaFusion: Input contains NaN")
             batch_size = image_features.size(0)
             return torch.zeros(batch_size, self.fc.out_features, device=image_features.device), \
                    torch.ones(batch_size, 2, device=image_features.device) * 0.5

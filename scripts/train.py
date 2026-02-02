@@ -27,7 +27,6 @@ def configuration():
     parser.add_argument('--root', type=str, default=str(ROOT_DIR / 'datasets'),
                        help='Root directory of the dataset')
     parser.add_argument('--dataset-configs', nargs='+', type=str, help='List of dataset configurations in JSON format')
-    parser.add_argument('--loss-weights', type=str, help='Loss weights in JSON format')
     parser.add_argument('-b', '--batch-size', type=int, default=128, help='Batch size for training')
     parser.add_argument('-j', '--workers', type=int, default=4, help='Number of data loading workers')
     parser.add_argument('--height', type=int, default=224, help='Image height')
@@ -38,7 +37,6 @@ def configuration():
     parser.add_argument('--milestones', nargs='+', type=int, default=[40, 60], help='Milestones for LR scheduler')
     parser.add_argument('--epochs', type=int, default=80, help='Number of training epochs')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
-    parser.add_argument('--print-freq', type=int, default=50, help='Print frequency')
     parser.add_argument('--fp16', action='store_true', help='Use mixed precision training')
     
     # 预训练模型路径配置
@@ -64,9 +62,6 @@ def configuration():
     parser.add_argument('--fusion-dropout', type=float, default=0.1, help='Fusion module dropout')
 
     # 解耦模块（AH-Net/G-S3）相关参数
-    parser.add_argument('--id-projection-dim', type=int, default=768, help='ID projection dimension')
-    parser.add_argument('--cloth-projection-dim', type=int, default=768, help='Cloth projection dimension')
-    parser.add_argument('--gs3-num-heads', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--gs3-d-state', type=int, default=16, help='State dimension for G-S3')
     parser.add_argument('--gs3-d-conv', type=int, default=4, help='Conv kernel size for G-S3')
     parser.add_argument('--gs3-dropout', type=float, default=0.1, help='Dropout rate for G-S3')
@@ -101,21 +96,18 @@ def configuration():
 
     # 聚合损失权重到 disentangle 字典
     args.disentangle = {}
-    if args.loss_weights:
-        args.disentangle['loss_weights'] = ast.literal_eval(args.loss_weights)
-    else:
-        args.disentangle['loss_weights'] = {
-            'info_nce': args.loss_info_nce,
-            'cloth_semantic': args.loss_cloth_semantic,
-            'id_triplet': args.loss_id_triplet,
-            'spatial_orthogonal': args.loss_spatial_orthogonal,
-            'semantic_alignment': args.loss_semantic_alignment,
-            'ortho_reg': args.loss_ortho_reg,
-            'adversarial_attr': args.loss_adversarial_attr,
-            'adversarial_domain': args.loss_adversarial_domain,
-            'discriminator_attr': args.loss_discriminator_attr,
-            'discriminator_domain': args.loss_discriminator_domain
-        }
+    args.disentangle['loss_weights'] = {
+        'info_nce': args.loss_info_nce,
+        'cloth_semantic': args.loss_cloth_semantic,
+        'id_triplet': args.loss_id_triplet,
+        'spatial_orthogonal': args.loss_spatial_orthogonal,
+        'semantic_alignment': args.loss_semantic_alignment,
+        'ortho_reg': args.loss_ortho_reg,
+        'adversarial_attr': args.loss_adversarial_attr,
+        'adversarial_domain': args.loss_adversarial_domain,
+        'discriminator_attr': args.loss_discriminator_attr,
+        'discriminator_domain': args.loss_discriminator_domain
+    }
     
     # 聚合可视化配置
     args.visualization = {
@@ -353,29 +345,9 @@ class Runner:
             gc.collect()
 
         for handler in logging.root.handlers[:]: logging.root.removeHandler(handler)
-        dataset_log_dir = self.monitor.dataset_log_dir
-
-        # 1. 详细日志（文件）
-        detailed_logger = logging.getLogger('detailed')
-        detailed_logger.setLevel(logging.DEBUG)
-        detailed_logger.propagate = False
-        file_handler = logging.FileHandler(dataset_log_dir / 'log.txt', mode='a', encoding='utf-8')
-        file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        detailed_logger.addHandler(file_handler)
-
-        # 2. 调试日志（文件）
-        root_file_handler = logging.FileHandler(dataset_log_dir / 'debug.txt', mode='a', encoding='utf-8')
-        root_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-        logging.root.addHandler(root_file_handler)
-        logging.root.setLevel(logging.DEBUG)
-
-        # 3. 控制台日志（终端）
-        console_logger = logging.getLogger('console')
-        console_logger.setLevel(logging.INFO)
-        console_logger.propagate = False
-        console_handler = logging.StreamHandler(sys.stdout)
-        console_handler.setFormatter(logging.Formatter('%(message)s'))
-        console_logger.addHandler(console_handler)
+        
+        # 使用监控器的 logger 记录训练信息
+        console_logger = self.monitor.logger
 
         console_logger.info("正在构建数据集...")
         data_builder = DataBuilder(args, is_distributed=False)
@@ -394,10 +366,8 @@ class Runner:
             'img_size': (args.height, args.width),
             'num_classes': args.num_classes,
             'gs3': {
-                'num_heads': args.gs3_num_heads,
                 'd_state': args.gs3_d_state,
                 'd_conv': args.gs3_d_conv,
-                'dropout': args.gs3_dropout,
                 'img_size': tuple(args.gs3_img_size)
             },
             'fusion': {
@@ -430,7 +400,7 @@ class Runner:
 
         # 启动 Trainer 进行正式训练
         trainer = Trainer(model, args, self.monitor, runner=self)
-        trainer.train(train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=str(dataset_log_dir))
+        trainer.train(train_loader, optimizer, lr_scheduler, query_loader, gallery_loader, checkpoint_dir=str(self.monitor.dataset_log_dir))
 
 
 if __name__ == '__main__':

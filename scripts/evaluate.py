@@ -4,7 +4,6 @@ import ast
 import sys
 from pathlib import Path
 import torch
-import yaml
 import logging
 import random
 
@@ -36,8 +35,6 @@ class StreamToLogger:
 def parse_args():
     # 解析命令行参数：包括路径配置、超参数、模型结构选择等
     parser = argparse.ArgumentParser(description="Evaluate T2I-ReID model")
-    parser.add_argument('--config', default=str(ROOT_DIR / 'configs' / 'config_cuhk_pedes.yaml'),
-                        help='Path to config file')
     parser.add_argument('--root', type=str, default=str(ROOT_DIR / 'data'),
                         help='Root directory of the dataset')
     parser.add_argument('--dataset-configs', nargs='+', type=str, required=True,
@@ -53,13 +50,9 @@ def parse_args():
                        help='Path to Vision Mamba model')
 
     # AH-Net/G-S3 解耦模块相关参数
-    parser.add_argument('--disentangle-type', type=str, default='fshd',
-                       choices=['fshd', 'simple'], help='Type of disentangle module')
-    parser.add_argument('--gs3-num-heads', type=int, default=8, help='Number of attention heads')
     parser.add_argument('--gs3-d-state', type=int, default=16, help='State dimension for G-S3')
     parser.add_argument('--gs3-d-conv', type=int, default=4, help='Conv kernel size for G-S3')
     parser.add_argument('--gs3-dropout', type=float, default=0.1, help='Dropout rate for G-S3')
-    parser.add_argument('--gs3-use-multi-scale-cnn', type=str, default='true', help='Use multi-scale CNN')
     parser.add_argument('--gs3-img-size', nargs=2, type=int, default=[14, 14], help='Image patch grid size')
 
     # 融合模块相关参数（RCSM + S-CAG）
@@ -77,21 +70,11 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # 如果存在配置文件，则从 YAML 中加载参数
-    if args.config:
-        config_path = Path(args.config)
-        if config_path.exists():
-            with open(config_path, encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-            pass 
-    
     # 路径格式规范化
     args.logs_dir = str(Path(args.logs_dir))
     args.root = str(Path(args.root))
     args.checkpoint = str(Path(args.checkpoint))
     args.clip_pretrained = str(Path(args.clip_pretrained))
-    
-    args.gs3_use_multi_scale_cnn = args.gs3_use_multi_scale_cnn.lower() == 'true'
 
     if not Path(args.checkpoint).exists():
         raise FileNotFoundError(f"Checkpoint file not found at: {args.checkpoint}")
@@ -135,13 +118,9 @@ def main():
         'vim_pretrained': args.vim_pretrained,
         'img_size': (getattr(args, 'height', 224), getattr(args, 'width', 224)),
         'num_classes': args.num_classes,
-        'disentangle_type': args.disentangle_type,
         'gs3': {
-            'num_heads': args.gs3_num_heads,
             'd_state': args.gs3_d_state,
             'd_conv': args.gs3_d_conv,
-            'dropout': args.gs3_dropout,
-            'use_multi_scale_cnn': args.gs3_use_multi_scale_cnn,
             'img_size': tuple(args.gs3_img_size)
         },
         'fusion': {
